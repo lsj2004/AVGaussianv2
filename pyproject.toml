@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "avgaussianv2"
+version = "0.1.0"
+description = "RGBD-conditioned fusion of independent visual and acoustic Gaussian fields"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "PyYAML>=6.0",
+  "soundfile>=0.12",
+  "torch>=2.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["avgaussianv2"]
