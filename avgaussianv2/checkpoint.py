@@ -109,7 +109,9 @@ def save_checkpoint(path: str | Path, state: CheckpointState) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_version": SCHEMA_VERSION,
-        **asdict(state),
+        # Avoid dataclasses.asdict here: it deep-copies every tensor and can
+        # double peak memory for real Gaussian checkpoints.
+        **vars(state),
     }
     temporary_path: Path | None = None
     try:

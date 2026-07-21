@@ -21,6 +21,7 @@ class AVGaussianFusionV2(nn.Module):
         self.visual = visual
         self.condition_encoder = condition_encoder
         self.audio = audio
+        self.condition_enabled = True
 
     def forward(self, sample: AlignedAVSample) -> FusionOutput:
         rgbd = self.visual.render_rgbd(
@@ -33,7 +34,7 @@ class AVGaussianFusionV2(nn.Module):
         predicted_audio = self.audio.render(
             sample.audio_cam_pose,
             sample.source_audio,
-            condition=condition,
+            condition=condition if self.condition_enabled else None,
         )
         return FusionOutput(
             rgbd=rgbd,

@@ -170,6 +170,7 @@ def run_joint_finetune(
     steps: int,
     config: TrainConfig,
     audio_loss_fn: AudioLoss,
+    require_audio_visual_gradient: bool = True,
 ) -> list[TrainStepStats]:
     if steps <= 0:
         return []
@@ -198,7 +199,7 @@ def run_joint_finetune(
             audio_loss_fn,
             anchor,
         )
-        if (step + 1) % config.gradient_probe_interval == 0:
+        if require_audio_visual_gradient and (step + 1) % config.gradient_probe_interval == 0:
             consecutive_zero = consecutive_zero + 1 if stats.audio_to_visual_grad_norm == 0 else 0
             if consecutive_zero >= config.max_zero_audio_visual_grad_steps:
                 raise DisconnectedAudioVisualGradient(

@@ -14,7 +14,7 @@ paths:
 model:
   embedding_dim: 128
   alpha_threshold: 0.001
-  audio_model_class: Audio3DGS
+  audio_model_class: Audio3DGSMonoDiffGSOnly
   n_fft: 512
   hop_length: 160
   win_length: 400

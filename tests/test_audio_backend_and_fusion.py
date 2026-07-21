@@ -1,11 +1,16 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from avgaussianv2.backends.audio_audiogs import AudioCheckpointError, AudioGSBackend
+from avgaussianv2.backends.audio_audiogs import (
+    AudioCheckpointError,
+    AudioGSBackend,
+    _upstream_model_factory,
+)
 from avgaussianv2.contracts import AlignedAVSample, RGBDRender
 from avgaussianv2.models.film_unet import FiLMConditionedAudioUNet
 from avgaussianv2.models.fusion import AVGaussianFusionV2
@@ -76,12 +81,66 @@ class TinyAudioModel(nn.Module):
         return source_audio * (gain + self.acoustic_gain)
 
 
+class TinyGSOnlyAudioModel(TinyAudioModel):
+    def forward(self, cam_pose, source_audio):
+        del cam_pose
+        return source_audio * self.acoustic_gain
+
+    def inherited_unet_forward(self, cam_pose, source_audio):
+        return super().forward(cam_pose, source_audio)
+
+
 def test_audio_backend_rejects_checkpoint_without_model_state(tmp_path: Path) -> None:
     path = tmp_path / "bad.pth"
     torch.save({"optimizer_state_dict": {}}, path)
 
     with pytest.raises(AudioCheckpointError, match="model_state_dict"):
         AudioGSBackend.load(path, model_factory=lambda _: TinyAudioModel(), embedding_dim=8)
+
+
+def test_upstream_model_import_skips_heavy_scene_package_init(tmp_path: Path) -> None:
+    for relative in ("libs", "libs/models", "libs/datasets"):
+        package = tmp_path / relative
+        package.mkdir(parents=True, exist_ok=True)
+        (package / "__init__.py").write_text("")
+    scene = tmp_path / "libs/datasets/scene"
+    scene.mkdir()
+    (scene / "__init__.py").write_text("raise RuntimeError('heavy optional dependencies')\n")
+    (scene / "colmap_loader.py").write_text("VALUE = 7\n")
+    (tmp_path / "libs/models/audio_3dgs.py").write_text(
+        "from torch import nn\n"
+        "from libs.datasets.scene.colmap_loader import VALUE\n"
+        "class Audio3DGS(nn.Module):\n"
+        "    def __init__(self, cfg):\n"
+        "        raise RuntimeError('factory must use build_model')\n"
+        "class Built(nn.Module):\n"
+        "    def __init__(self):\n"
+        "        super().__init__()\n"
+        "        self.value = VALUE\n"
+        "def build_model(cfg):\n"
+        "    return Built()\n"
+    )
+
+    model = _upstream_model_factory(tmp_path, "Audio3DGS")(object())
+
+    assert model.value == 7
+
+
+def test_audio_backend_strict_load_reinitializes_only_static_stft_caches(tmp_path: Path) -> None:
+    original = TinyAudioModel()
+    original.register_buffer("static_source_mag", torch.ones(1, 257, 3))
+    path = tmp_path / "audio-static.pth"
+    torch.save({"model_state_dict": original.state_dict(), "cfg": {}}, path)
+
+    def factory(_):
+        model = TinyAudioModel()
+        model.register_buffer("static_source_mag", torch.zeros(1, 257, 1))
+        return model
+
+    backend = AudioGSBackend.load(path, model_factory=factory, embedding_dim=8)
+
+    assert backend.model.static_source_mag.shape == (1, 257, 1)
+    assert torch.count_nonzero(backend.model.static_source_mag) == 0
 
 
 def test_audio_backend_loads_original_weights_before_wrapping(tmp_path: Path) -> None:
@@ -100,6 +159,66 @@ def test_audio_backend_loads_original_weights_before_wrapping(tmp_path: Path) ->
     torch.testing.assert_close(backend.model.acoustic_gain, torch.tensor(0.75))
 
 
+@pytest.mark.parametrize(
+    ("model_file", "expected_module", "expected_class"),
+    [
+        ("audio_3dgs", "libs.criterions.Criterion_2", "Criterion"),
+        (
+            "audio_3dgs_mono_diff",
+            "libs.criterions.MonoDiffMSECriterion",
+            "MonoDiffMSECriterion",
+        ),
+    ],
+)
+def test_audio_backend_builds_the_same_criterion_as_upstream_trainer(
+    monkeypatch, model_file, expected_module, expected_class
+) -> None:
+    config = SimpleNamespace(model=SimpleNamespace(file=model_file))
+    model = TinyAudioModel()
+    model.renderer = FiLMConditionedAudioUNet(model.renderer, embedding_dim=8)
+    backend = AudioGSBackend(
+        model,
+        source_path=Path("audio.pth"),
+        checkpoint_config=config,
+        upstream_root=Path("/upstream"),
+    )
+    imported = []
+
+    class FakeCriterion(nn.Module):
+        def __init__(self, cfg):
+            super().__init__()
+            self.cfg = cfg
+
+    def fake_import(name):
+        imported.append(name)
+        return SimpleNamespace(**{expected_class: FakeCriterion})
+
+    monkeypatch.setattr("avgaussianv2.backends.audio_audiogs.importlib.import_module", fake_import)
+
+    criterion = backend.build_criterion()
+
+    assert imported == [expected_module]
+    assert criterion.cfg is config
+
+
+def test_audio_backend_rejects_unimplemented_enhanced_criterion() -> None:
+    config = SimpleNamespace(
+        model=SimpleNamespace(file="audio_3dgs"),
+        train=SimpleNamespace(enhanced_weight=0.5),
+    )
+    model = TinyAudioModel()
+    model.renderer = FiLMConditionedAudioUNet(model.renderer, embedding_dim=8)
+    backend = AudioGSBackend(
+        model,
+        source_path=Path("audio.pth"),
+        checkpoint_config=config,
+        upstream_root=Path("/upstream"),
+    )
+
+    with pytest.raises(AudioCheckpointError, match="enhanced_weight"):
+        backend.build_criterion()
+
+
 def test_audio_backend_applies_condition_only_inside_render_scope() -> None:
     model = TinyAudioModel()
     model.renderer = FiLMConditionedAudioUNet(model.renderer, embedding_dim=8)
@@ -114,6 +233,31 @@ def test_audio_backend_applies_condition_only_inside_render_scope() -> None:
 
     assert not torch.allclose(conditioned, plain)
     assert backend.conditioned_renderer.active_condition is None
+
+
+def test_gs_only_bridge_forces_inherited_unet_forward() -> None:
+    model = TinyGSOnlyAudioModel()
+    model.renderer = FiLMConditionedAudioUNet(model.renderer, embedding_dim=8)
+    backend = AudioGSBackend(
+        model,
+        source_path=Path("audio.pth"),
+        forward_override=TinyGSOnlyAudioModel.inherited_unet_forward,
+    )
+    source = torch.randn(1, 2, 32)
+    pose = torch.zeros(1, 12)
+
+    native_gs_only = model(pose, source)
+    plain = backend.render(pose, source)
+    zero_init_conditioned = backend.render(pose, source, condition=torch.ones(1, 8))
+    torch.testing.assert_close(plain, native_gs_only)
+    torch.testing.assert_close(zero_init_conditioned, native_gs_only)
+
+    with torch.no_grad():
+        backend.conditioned_renderer.film["e1"].to_scale_shift.weight.fill_(0.02)
+    conditioned_unet = backend.render(pose, source, condition=torch.ones(1, 8))
+
+    torch.testing.assert_close(backend.render(pose, source), native_gs_only)
+    assert not torch.allclose(conditioned_unet, native_gs_only)
 
 
 class FakeVisualBackend(nn.Module):
@@ -183,6 +327,25 @@ def test_fusion_audio_loss_reaches_visual_parameter() -> None:
 
     assert visual.gaussian_parameter.grad is not None
     assert visual.gaussian_parameter.grad.abs().sum() > 0
+
+
+def test_fusion_condition_off_ablation_bypasses_rgbd_embedding() -> None:
+    model = AVGaussianFusionV2(
+        FakeVisualBackend(),
+        RGBDConditionEncoder(8),
+        FakeAudioBackend(),
+    )
+    aligned = sample()
+    conditioned = model(aligned).predicted_audio
+
+    model.condition_enabled = False
+    unconditioned = model(aligned).predicted_audio
+
+    assert not torch.allclose(conditioned, unconditioned)
+    torch.testing.assert_close(
+        unconditioned,
+        aligned.source_audio * (1.0 + model.audio.acoustic_parameter),
+    )
 
 
 def test_fusion_freeze_policy_keeps_only_condition_and_film_trainable() -> None:
