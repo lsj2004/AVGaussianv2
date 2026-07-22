@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import math
 import os
@@ -219,12 +220,12 @@ def _publish_metric_pair(
 def _write_metric_pair(output_dir: Path, rows: tuple[dict[str, object], ...], summary: dict[str, dict[str, float]]) -> None:
     """Publish a staged metric pair, rolling back ordinary replacement failures.
 
-    The caller must give each system an exclusive output directory. A lock file
-    enforces that single-writer contract across processes. Canonical paths remain
-    present while durable backups are created, and each individual file
-    replacement is atomic. Ordinary replacement failures are rolled back. No
-    filesystem API can make two filenames crash-atomic as one transaction, so a
-    crash between replacements can expose mixed versions.
+    The caller must give each system an exclusive output directory. A persistent
+    lock file carries a kernel advisory lock during publication; file presence
+    alone never blocks a later process after a crash. Canonical paths remain
+    present while durable backups are created, and each individual replacement is
+    atomic. Ordinary replacement failures are rolled back. No filesystem API can
+    make two filenames crash-atomic, so a crash can expose mixed versions.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     destinations = (
@@ -242,12 +243,16 @@ def _write_metric_pair(output_dir: Path, rows: tuple[dict[str, object], ...], su
     lock_descriptor: int | None = None
     primary: BaseException | None = None
     try:
+        lock_descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            lock_descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError as error:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            os.close(lock_descriptor)
+            lock_descriptor = None
             raise RuntimeError(
                 f"metric output directory already has an active writer: {output_dir}"
             ) from error
+        os.ftruncate(lock_descriptor, 0)
         os.write(lock_descriptor, f"pid={os.getpid()}\n".encode())
         os.fsync(lock_descriptor)
         _fsync_directory(output_dir)
@@ -259,12 +264,11 @@ def _write_metric_pair(output_dir: Path, rows: tuple[dict[str, object], ...], su
         release_errors: list[BaseException] = []
         if lock_descriptor is not None:
             try:
-                os.close(lock_descriptor)
+                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
             except BaseException as error:
                 release_errors.append(error)
             try:
-                lock_path.unlink(missing_ok=True)
-                _fsync_directory(output_dir)
+                os.close(lock_descriptor)
             except BaseException as error:
                 release_errors.append(error)
         if release_errors:

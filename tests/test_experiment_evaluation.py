@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import torch
@@ -256,7 +258,7 @@ def test_rollback_replace_failure_retains_recovery_backups(monkeypatch, tmp_path
     assert backups
     assert any(path.read_text() == "old rows\n" for path in backups)
     assert summary_path.read_text() == "old summary\n"
-    assert not (tmp_path / ".metrics-publication.lock").exists()
+    assert (tmp_path / ".metrics-publication.lock").exists()
 
 
 def test_rollback_fsync_failure_retains_backups_and_primary_error(monkeypatch, tmp_path) -> None:
@@ -298,12 +300,66 @@ def test_rollback_fsync_failure_retains_backups_and_primary_error(monkeypatch, t
     assert summary_path.read_text() == "old summary\n"
 
 
-def test_existing_writer_lock_is_rejected(tmp_path) -> None:
+def test_preexisting_unlocked_writer_file_does_not_block(tmp_path) -> None:
     (tmp_path / ".metrics-publication.lock").write_text("other worker\n")
-    with pytest.raises(RuntimeError, match="active writer"):
-        Evaluator(TinyModel(), audio_loss, "cpu").evaluate(
-            [sample(0)], [0], "x", True, tmp_path
-        )
+    result = Evaluator(TinyModel(), audio_loss, "cpu").evaluate(
+        [sample(0)], [0], "x", True, tmp_path
+    )
+    assert result.count == 1
+
+
+def test_genuinely_held_writer_lock_is_rejected(tmp_path) -> None:
+    lock_path = tmp_path / ".metrics-publication.lock"
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        with pytest.raises(RuntimeError, match="active writer"):
+            Evaluator(TinyModel(), audio_loss, "cpu").evaluate(
+                [sample(0)], [0], "x", True, tmp_path
+            )
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def test_backup_falls_back_to_durable_copy_when_hardlinks_are_unavailable(
+    monkeypatch, tmp_path
+) -> None:
+    source = tmp_path / "metrics.json"
+    source.write_text("original\n")
+
+    def unsupported_hardlink(source, target):
+        raise OSError("unsupported")
+
+    monkeypatch.setattr(os, "link", unsupported_hardlink)
+
+    backup = evaluation_module._snapshot_without_removing(source)
+
+    assert source.read_text() == "original\n"
+    assert backup.read_text() == "original\n"
+    backup.unlink()
+
+
+def test_failed_backup_copy_cleans_partial_artifact(monkeypatch, tmp_path) -> None:
+    source = tmp_path / "metrics.json"
+    source.write_text("original\n")
+    real_open = Path.open
+
+    def fail_backup_target(path, mode="r", *args, **kwargs):
+        if path.suffix == ".backup" and "x" in mode:
+            raise OSError("copy failed")
+        return real_open(path, mode, *args, **kwargs)
+
+    def unsupported_hardlink(source, target):
+        raise OSError("unsupported")
+
+    monkeypatch.setattr(os, "link", unsupported_hardlink)
+    monkeypatch.setattr(Path, "open", fail_backup_target)
+    with pytest.raises(OSError, match="copy failed"):
+        evaluation_module._snapshot_without_removing(source)
+
+    assert source.read_text() == "original\n"
+    assert not list(tmp_path.glob(".*.backup"))
 
 
 @pytest.mark.parametrize("failure", ["dtype", "layout"])
