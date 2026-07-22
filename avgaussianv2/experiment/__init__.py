@@ -8,6 +8,7 @@ from avgaussianv2.experiment.contracts import (
     VariantIndices,
 )
 from avgaussianv2.experiment.sampling import build_shared_indices, evenly_spaced_indices
+from avgaussianv2.experiment.selection import BestSelector, EarlyStopper, visual_feasible
 
 __all__ = [
     "EvaluationResult",
@@ -15,6 +16,9 @@ __all__ = [
     "SharedIndices",
     "Variant",
     "VariantIndices",
+    "BestSelector",
+    "EarlyStopper",
     "build_shared_indices",
     "evenly_spaced_indices",
+    "visual_feasible",
 ]
