@@ -1,0 +1,6 @@
+"""Adapters for the independent upstream Gaussian implementations."""
+
+from avgaussianv2.backends.audio_audiogs import AudioGSBackend
+from avgaussianv2.backends.visual_ftgspp import FTGSVisualBackend
+
+__all__ = ["AudioGSBackend", "FTGSVisualBackend"]
