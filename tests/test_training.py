@@ -7,6 +7,9 @@ from avgaussianv2.contracts import AlignedAVSample, FusionOutput, RGBDRender
 from avgaussianv2.losses import JointLossWeights, capture_visual_anchor, compute_joint_loss
 from avgaussianv2.train import (
     NonFiniteTrainingError,
+    build_joint_optimizer,
+    build_warmup_optimizer,
+    condition_warmup_step,
     joint_train_step,
     run_condition_warmup,
 )
@@ -173,3 +176,64 @@ def test_nonfinite_training_error_contains_sample_identity() -> None:
             audio_loss_fn=audio_loss,
             visual_anchor=capture_visual_anchor(model.visual),
         )
+
+
+def test_reusable_optimizers_only_include_trainable_nonempty_groups() -> None:
+    model = TinyTrainFusion()
+    model.freeze_pretrained()
+
+    warmup = build_warmup_optimizer(model, 0.01)
+    assert len(warmup.param_groups) == 1
+    assert {id(parameter) for parameter in warmup.param_groups[0]["params"]} == {
+        id(model.condition_encoder.value),
+        id(model.film.value),
+    }
+
+    model.unfreeze_all()
+    model.visual.requires_grad_(False)
+    joint = build_joint_optimizer(model, TrainConfig())
+    assert len(joint.param_groups) == 4
+    assert all(group["params"] for group in joint.param_groups)
+
+
+def test_condition_warmup_step_accepts_scalar_criterion() -> None:
+    model = TinyTrainFusion()
+    model.freeze_pretrained()
+    optimizer = build_warmup_optimizer(model, 0.01)
+
+    stats = condition_warmup_step(
+        model,
+        make_sample(),
+        optimizer,
+        lambda predicted, target: torch.nn.functional.mse_loss(predicted, target),
+    )
+
+    assert stats.total > 0
+    assert stats.losses == {"audio": stats.total}
+    assert stats.gradient_norms["condition_encoder"] > 0
+    assert stats.audio_to_visual_grad_norm == 0
+
+
+def test_joint_step_can_skip_audio_visual_gradient_probe(monkeypatch) -> None:
+    model = TinyTrainFusion()
+    model.visual.requires_grad_(False)
+    optimizer = torch.optim.SGD(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=0.01,
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("autograd.grad must not be called")
+
+    monkeypatch.setattr(torch.autograd, "grad", forbidden)
+    stats = joint_train_step(
+        model,
+        make_sample(),
+        optimizer,
+        TrainConfig(),
+        audio_loss,
+        capture_visual_anchor(model.visual),
+        probe_audio_visual_gradient=False,
+    )
+    assert stats.audio_to_visual_grad_norm == 0
+    assert not model.visual.value.requires_grad

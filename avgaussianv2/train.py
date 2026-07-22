@@ -71,6 +71,93 @@ def _weights(config: TrainConfig) -> JointLossWeights:
     )
 
 
+def _trainable(parameters: Iterable[nn.Parameter]) -> list[nn.Parameter]:
+    return [parameter for parameter in parameters if parameter.requires_grad]
+
+
+def build_warmup_optimizer(
+    model: nn.Module, learning_rate: float
+) -> torch.optim.Optimizer:
+    """Build the single optimizer used throughout condition warmup."""
+    groups = model.named_parameter_groups()
+    parameters = _trainable(
+        [*groups["condition_encoder"], *groups["film"]]
+    )
+    if not parameters:
+        raise ValueError("warmup has no trainable condition encoder or FiLM parameters")
+    return torch.optim.Adam(parameters, lr=learning_rate)
+
+
+def build_joint_optimizer(
+    model: nn.Module, config: TrainConfig
+) -> torch.optim.Optimizer:
+    """Build a joint optimizer without passing empty or frozen groups to torch."""
+    groups = model.named_parameter_groups()
+    learning_rates = {
+        "visual": config.visual_lr,
+        "acoustic": config.audio_lr,
+        "audio_unet": config.audio_lr,
+        "condition_encoder": config.condition_lr,
+        "film": config.condition_lr,
+    }
+    optimizer_groups = []
+    for name, learning_rate in learning_rates.items():
+        parameters = _trainable(groups[name])
+        if parameters:
+            optimizer_groups.append(
+                {"params": parameters, "lr": learning_rate, "name": name}
+            )
+    if not optimizer_groups:
+        raise ValueError("joint training has no trainable parameters")
+    return torch.optim.Adam(optimizer_groups)
+
+
+def _audio_loss_tensor(
+    criterion_result: Tensor | Mapping[str, Tensor], sample: AlignedAVSample
+) -> Tensor:
+    if isinstance(criterion_result, Mapping):
+        if "total_loss" not in criterion_result:
+            raise KeyError("audio loss mapping is missing 'total_loss'")
+        loss = criterion_result["total_loss"]
+    else:
+        loss = criterion_result
+    if not isinstance(loss, Tensor):
+        raise TypeError("audio loss must be a scalar tensor or mapping containing one")
+    if loss.ndim != 0:
+        raise ValueError("audio loss must be a scalar tensor")
+    _require_finite_tensor("warmup audio loss", loss, sample)
+    return loss
+
+
+def condition_warmup_step(
+    model: nn.Module,
+    sample: AlignedAVSample,
+    optimizer: torch.optim.Optimizer,
+    audio_loss_fn: AudioLoss,
+) -> TrainStepStats:
+    optimizer.zero_grad(set_to_none=True)
+    output = model(sample)
+    _require_finite_tensor("predicted audio", output.predicted_audio, sample)
+    audio = _audio_loss_tensor(
+        audio_loss_fn(output.predicted_audio, sample.target_audio), sample
+    )
+    audio.backward()
+    groups = model.named_parameter_groups()
+    gradient_norms = {
+        name: _gradient_norm(parameters) for name, parameters in groups.items()
+    }
+    if not all(math.isfinite(value) for value in gradient_norms.values()):
+        raise NonFiniteTrainingError(f"non-finite gradients at {_sample_identity(sample)}")
+    optimizer.step()
+    value = float(audio.detach().cpu())
+    return TrainStepStats(
+        total=value,
+        losses={"audio": value},
+        gradient_norms=gradient_norms,
+        audio_to_visual_grad_norm=0.0,
+    )
+
+
 def joint_train_step(
     model: nn.Module,
     sample: AlignedAVSample,
@@ -78,8 +165,8 @@ def joint_train_step(
     config: TrainConfig,
     audio_loss_fn: AudioLoss,
     visual_anchor: Mapping[str, Tensor],
+    probe_audio_visual_gradient: bool = True,
 ) -> TrainStepStats:
-    model.unfreeze_all()
     optimizer.zero_grad(set_to_none=True)
     output = model(sample)
     _require_finite_tensor("predicted audio", output.predicted_audio, sample)
@@ -96,14 +183,18 @@ def joint_train_step(
     )
     _require_finite_tensor("total loss", total, sample)
     groups = model.named_parameter_groups()
-    visual_parameters = [parameter for parameter in groups["visual"] if parameter.requires_grad]
-    audio_visual_gradients = torch.autograd.grad(
-        parts["audio"],
-        visual_parameters,
-        retain_graph=True,
-        allow_unused=True,
-    )
-    audio_to_visual = _explicit_gradient_norm(audio_visual_gradients)
+    audio_to_visual = 0.0
+    if probe_audio_visual_gradient:
+        visual_parameters = _trainable(groups["visual"])
+        if not visual_parameters:
+            raise ValueError("audio-to-visual gradient probe has no trainable visual parameters")
+        audio_visual_gradients = torch.autograd.grad(
+            parts["audio"],
+            visual_parameters,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        audio_to_visual = _explicit_gradient_norm(audio_visual_gradients)
     total.backward()
     gradient_norms = {
         name: _gradient_norm(parameters)
@@ -134,33 +225,11 @@ def run_condition_warmup(
     if not samples:
         raise ValueError("warmup samples must not be empty")
     model.freeze_pretrained()
-    groups = model.named_parameter_groups()
-    trainable = [*groups["condition_encoder"], *groups["film"]]
-    optimizer = torch.optim.Adam(trainable, lr=learning_rate)
+    optimizer = build_warmup_optimizer(model, learning_rate)
     history = []
     for step in range(steps):
         sample = samples[step % len(samples)]
-        optimizer.zero_grad(set_to_none=True)
-        output = model(sample)
-        _require_finite_tensor("predicted audio", output.predicted_audio, sample)
-        audio = audio_loss_fn(output.predicted_audio, sample.target_audio)
-        if isinstance(audio, Mapping):
-            audio = audio["total_loss"]
-        _require_finite_tensor("warmup audio loss", audio, sample)
-        audio.backward()
-        gradient_norms = {
-            name: _gradient_norm(parameters)
-            for name, parameters in groups.items()
-        }
-        optimizer.step()
-        history.append(
-            TrainStepStats(
-                total=float(audio.detach().cpu()),
-                losses={"audio": float(audio.detach().cpu())},
-                gradient_norms=gradient_norms,
-                audio_to_visual_grad_norm=0.0,
-            )
-        )
+        history.append(condition_warmup_step(model, sample, optimizer, audio_loss_fn))
     return history
 
 
@@ -177,16 +246,7 @@ def run_joint_finetune(
     if not samples:
         raise ValueError("joint samples must not be empty")
     model.unfreeze_all()
-    groups = model.named_parameter_groups()
-    optimizer = torch.optim.Adam(
-        [
-            {"params": groups["visual"], "lr": config.visual_lr},
-            {"params": groups["acoustic"], "lr": config.audio_lr},
-            {"params": groups["audio_unet"], "lr": config.audio_lr},
-            {"params": groups["condition_encoder"], "lr": config.condition_lr},
-            {"params": groups["film"], "lr": config.condition_lr},
-        ]
-    )
+    optimizer = build_joint_optimizer(model, config)
     anchor = capture_visual_anchor(model.visual)
     history = []
     consecutive_zero = 0
