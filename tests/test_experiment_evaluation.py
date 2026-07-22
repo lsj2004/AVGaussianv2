@@ -194,6 +194,10 @@ def test_publish_failure_rolls_back_existing_metric_pair(monkeypatch, tmp_path) 
 
     def fail_second_publish(source, destination):
         nonlocal publish_calls
+        # Existing canonical paths must never be renamed out of the way while
+        # preparing backups or installing either staged file.
+        assert rows_path.exists()
+        assert summary_path.exists()
         if str(source).endswith(".tmp"):
             publish_calls += 1
             if publish_calls == 2:

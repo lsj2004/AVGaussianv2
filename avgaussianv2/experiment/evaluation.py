@@ -107,12 +107,35 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
+def _backup_without_removing(destination: Path) -> Path:
+    descriptor, backup_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".backup", dir=destination.parent
+    )
+    os.close(descriptor)
+    backup = Path(backup_name)
+    backup.unlink()
+    try:
+        os.link(destination, backup)
+    except OSError:
+        try:
+            with destination.open("rb") as source, backup.open("xb") as target:
+                while chunk := source.read(1024 * 1024):
+                    target.write(chunk)
+                target.flush()
+                os.fsync(target.fileno())
+        except BaseException:
+            backup.unlink(missing_ok=True)
+            raise
+    return backup
+
+
 def _write_metric_pair(output_dir: Path, rows: tuple[dict[str, object], ...], summary: dict[str, dict[str, float]]) -> None:
     """Publish a staged metric pair, rolling back ordinary replacement failures.
 
-    Each individual file is atomic and replacement failures are rolled back. No
-    filesystem API can make two filenames crash-atomic as one transaction, so a
-    process or machine crash between the two replacements remains a narrow limit.
+    Canonical paths remain present while durable backups are created, and each
+    individual file replacement is atomic. Ordinary replacement failures are
+    rolled back. No filesystem API can make two filenames crash-atomic as one
+    transaction, so a crash between replacements can expose mixed versions.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     destinations = (
@@ -136,21 +159,17 @@ def _write_metric_pair(output_dir: Path, rows: tuple[dict[str, object], ...], su
         staged.append(_stage_text(destinations[1], summary_text))
         for destination in destinations:
             if destination.exists():
-                descriptor, backup_name = tempfile.mkstemp(
-                    prefix=f".{destination.name}.", suffix=".backup", dir=output_dir
-                )
-                os.close(descriptor)
-                backup = Path(backup_name)
-                backup.unlink()
-                os.replace(destination, backup)
-                backups[destination] = backup
+                backups[destination] = _backup_without_removing(destination)
+        # Make backup directory entries durable before changing canonical names.
+        _fsync_directory(output_dir)
         for temporary, destination in zip(staged, destinations):
             os.replace(temporary, destination)
             installed.append(destination)
         _fsync_directory(output_dir)
     except BaseException:
         for destination in installed:
-            destination.unlink(missing_ok=True)
+            if destination not in backups:
+                destination.unlink(missing_ok=True)
         for destination, backup in backups.items():
             if backup.exists():
                 os.replace(backup, destination)
@@ -161,6 +180,7 @@ def _write_metric_pair(output_dir: Path, rows: tuple[dict[str, object], ...], su
             temporary.unlink(missing_ok=True)
         for backup in backups.values():
             backup.unlink(missing_ok=True)
+        _fsync_directory(output_dir)
 
 
 class Evaluator:
