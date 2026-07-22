@@ -4,6 +4,7 @@ import json
 import math
 import os
 import tempfile
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from numbers import Integral, Real
@@ -107,9 +108,9 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
-def _backup_without_removing(destination: Path) -> Path:
+def _snapshot_without_removing(destination: Path, suffix: str = ".backup") -> Path:
     descriptor, backup_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".backup", dir=destination.parent
+        prefix=f".{destination.name}.", suffix=suffix, dir=destination.parent
     )
     os.close(descriptor)
     backup = Path(backup_name)
@@ -129,13 +130,101 @@ def _backup_without_removing(destination: Path) -> Path:
     return backup
 
 
+def _record_recovery_errors(primary: BaseException, errors: list[BaseException]) -> None:
+    if not errors:
+        return
+    details = "; ".join(f"{type(error).__name__}: {error}" for error in errors)
+    existing = getattr(primary, "publication_recovery_errors", ())
+    setattr(primary, "publication_recovery_errors", (*existing, *errors))
+    if hasattr(primary, "add_note"):
+        primary.add_note(f"metric publication recovery errors: {details}")
+    else:  # pragma: no cover - Python 3.10 compatibility
+        warnings.warn(f"metric publication recovery errors: {details}", RuntimeWarning)
+
+
+def _remove_paths(paths: Sequence[Path]) -> list[BaseException]:
+    errors: list[BaseException] = []
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except BaseException as error:
+            errors.append(error)
+    return errors
+
+
+def _publish_metric_pair(
+    output_dir: Path,
+    destinations: tuple[Path, Path],
+    contents: tuple[str, str],
+) -> None:
+    staged: list[Path] = []
+    backups: dict[Path, Path] = {}
+    installed: list[Path] = []
+    try:
+        for destination, content in zip(destinations, contents):
+            staged.append(_stage_text(destination, content))
+        for destination in destinations:
+            if destination.exists():
+                backups[destination] = _snapshot_without_removing(destination)
+        _fsync_directory(output_dir)
+        for temporary, destination in zip(staged, destinations):
+            os.replace(temporary, destination)
+            installed.append(destination)
+        _fsync_directory(output_dir)
+    except BaseException as primary:
+        recovery_errors: list[BaseException] = []
+        restoration_temps: list[Path] = []
+        for destination in installed:
+            backup = backups.get(destination)
+            try:
+                if backup is None:
+                    destination.unlink(missing_ok=True)
+                else:
+                    restoration = _snapshot_without_removing(backup, suffix=".restore")
+                    restoration_temps.append(restoration)
+                    os.replace(restoration, destination)
+            except BaseException as error:
+                recovery_errors.append(error)
+        if installed:
+            try:
+                _fsync_directory(output_dir)
+            except BaseException as error:
+                recovery_errors.append(error)
+
+        recovery_errors.extend(_remove_paths(staged))
+        recovery_errors.extend(_remove_paths(restoration_temps))
+        # Backups are expendable only when no canonical file changed, or after
+        # every changed destination was restored and made directory-durable.
+        if not recovery_errors:
+            recovery_errors.extend(_remove_paths(list(backups.values())))
+            try:
+                _fsync_directory(output_dir)
+            except BaseException as error:
+                recovery_errors.append(error)
+        _record_recovery_errors(primary, recovery_errors)
+        raise
+    else:
+        cleanup_errors = _remove_paths(staged)
+        cleanup_errors.extend(_remove_paths(list(backups.values())))
+        try:
+            _fsync_directory(output_dir)
+        except BaseException as error:
+            cleanup_errors.append(error)
+        if cleanup_errors:
+            failure = RuntimeError("metric publication succeeded but cleanup failed")
+            _record_recovery_errors(failure, cleanup_errors)
+            raise failure from cleanup_errors[0]
+
+
 def _write_metric_pair(output_dir: Path, rows: tuple[dict[str, object], ...], summary: dict[str, dict[str, float]]) -> None:
     """Publish a staged metric pair, rolling back ordinary replacement failures.
 
-    Canonical paths remain present while durable backups are created, and each
-    individual file replacement is atomic. Ordinary replacement failures are
-    rolled back. No filesystem API can make two filenames crash-atomic as one
-    transaction, so a crash between replacements can expose mixed versions.
+    The caller must give each system an exclusive output directory. A lock file
+    enforces that single-writer contract across processes. Canonical paths remain
+    present while durable backups are created, and each individual file
+    replacement is atomic. Ordinary replacement failures are rolled back. No
+    filesystem API can make two filenames crash-atomic as one transaction, so a
+    crash between replacements can expose mixed versions.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     destinations = (
@@ -149,38 +238,42 @@ def _write_metric_pair(output_dir: Path, rows: tuple[dict[str, object], ...], su
     summary_text = json.dumps(
         summary, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False
     ) + "\n"
-    staged: list[Path] = []
-    backups: dict[Path, Path] = {}
-    installed: list[Path] = []
+    lock_path = output_dir / ".metrics-publication.lock"
+    lock_descriptor: int | None = None
+    primary: BaseException | None = None
     try:
-        # Append immediately so the first stage is still known and cleaned if
-        # constructing the second stage fails.
-        staged.append(_stage_text(destinations[0], row_text))
-        staged.append(_stage_text(destinations[1], summary_text))
-        for destination in destinations:
-            if destination.exists():
-                backups[destination] = _backup_without_removing(destination)
-        # Make backup directory entries durable before changing canonical names.
+        try:
+            lock_descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as error:
+            raise RuntimeError(
+                f"metric output directory already has an active writer: {output_dir}"
+            ) from error
+        os.write(lock_descriptor, f"pid={os.getpid()}\n".encode())
+        os.fsync(lock_descriptor)
         _fsync_directory(output_dir)
-        for temporary, destination in zip(staged, destinations):
-            os.replace(temporary, destination)
-            installed.append(destination)
-        _fsync_directory(output_dir)
-    except BaseException:
-        for destination in installed:
-            if destination not in backups:
-                destination.unlink(missing_ok=True)
-        for destination, backup in backups.items():
-            if backup.exists():
-                os.replace(backup, destination)
-        _fsync_directory(output_dir)
+        _publish_metric_pair(output_dir, destinations, (row_text, summary_text))
+    except BaseException as error:
+        primary = error
         raise
     finally:
-        for temporary in staged:
-            temporary.unlink(missing_ok=True)
-        for backup in backups.values():
-            backup.unlink(missing_ok=True)
-        _fsync_directory(output_dir)
+        release_errors: list[BaseException] = []
+        if lock_descriptor is not None:
+            try:
+                os.close(lock_descriptor)
+            except BaseException as error:
+                release_errors.append(error)
+            try:
+                lock_path.unlink(missing_ok=True)
+                _fsync_directory(output_dir)
+            except BaseException as error:
+                release_errors.append(error)
+        if release_errors:
+            if primary is not None:
+                _record_recovery_errors(primary, release_errors)
+            else:
+                failure = RuntimeError("metric publication lock cleanup failed")
+                _record_recovery_errors(failure, release_errors)
+                raise failure from release_errors[0]
 
 
 class Evaluator:
@@ -202,6 +295,11 @@ class Evaluator:
         condition_enabled: bool,
         output_dir: Path | str,
     ) -> EvaluationResult:
+        """Evaluate selected samples and publish into a system-exclusive directory.
+
+        Concurrent writers to one directory are rejected across processes. Pilot
+        callers must use a distinct output directory for every evaluated system.
+        """
         selected = tuple(indices)
         if not selected:
             raise ValueError("evaluation indices must be nonempty")
@@ -215,7 +313,9 @@ class Evaluator:
         if not hasattr(self.model, "condition_enabled"):
             raise ValueError("evaluated model must expose condition_enabled")
 
-        original_training = self.model.training
+        original_training = tuple(
+            (module, module.training) for module in self.model.modules()
+        )
         original_condition = self.model.condition_enabled
         rows: list[dict[str, object]] = []
         sample_ids: set[str] = set()
@@ -277,7 +377,8 @@ class Evaluator:
                     )
         finally:
             self.model.condition_enabled = original_condition
-            self.model.train(original_training)
+            for module, training in original_training:
+                module.training = training
 
         metric_rows = [{name: float(row[name]) for name in METRIC_NAMES} for row in rows]
         summary = aggregate_metrics(metric_rows)
