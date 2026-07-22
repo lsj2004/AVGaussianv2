@@ -86,10 +86,66 @@ def test_invalid_lsd_component_and_stereo_shape_are_rejected() -> None:
         log_spectral_distance(torch.zeros(1, 1, 640), torch.zeros(1, 1, 640), "mono")
 
 
+@pytest.mark.parametrize("shape", [(2, 640), (1, 1, 640), (1, 2, 640, 1)])
+@pytest.mark.parametrize(
+    "metric",
+    [
+        waveform_l1,
+        lre_error_db,
+        lambda predicted, target: log_spectral_distance(predicted, target, "mono"),
+    ],
+)
+def test_audio_metrics_require_batched_stereo_layout(metric, shape) -> None:
+    audio = torch.zeros(shape)
+
+    with pytest.raises(ValueError, match=r"\[B, 2, samples\]"):
+        metric(audio, audio)
+
+
+@pytest.mark.parametrize(
+    "metric,inputs",
+    [
+        (waveform_l1, (torch.empty(0, 2, 8), torch.empty(0, 2, 8))),
+        (lre_error_db, (torch.empty(1, 2, 0), torch.empty(1, 2, 0))),
+        (rgb_l1, (torch.empty(0, 2, 2, 3), torch.empty(0, 2, 2, 3))),
+    ],
+)
+def test_metrics_reject_empty_tensors(metric, inputs) -> None:
+    with pytest.raises(ValueError, match="nonempty"):
+        metric(*inputs)
+
+
+def test_metrics_reject_nonfloating_tensors() -> None:
+    with pytest.raises(ValueError, match="floating"):
+        waveform_l1(
+            torch.zeros(1, 2, 8, dtype=torch.int64),
+            torch.zeros(1, 2, 8, dtype=torch.int64),
+        )
+    with pytest.raises(ValueError, match="floating"):
+        rgb_l1(
+            torch.zeros(1, 2, 2, 3, dtype=torch.int64),
+            torch.zeros(1, 2, 2, 3, dtype=torch.int64),
+        )
+
+
+def test_rgb_metrics_require_matching_bhwc_rgb_layout() -> None:
+    for metric in (rgb_l1, psnr, ssim):
+        with pytest.raises(ValueError, match="BHWC"):
+            metric(torch.zeros(1, 3, 4, 4), torch.zeros(1, 3, 4, 4))
+        with pytest.raises(ValueError, match="equal shapes"):
+            metric(torch.zeros(1, 4, 4, 3), torch.zeros(1, 4, 5, 3))
+
+
+def test_lsd_supports_short_cpu_float16_audio_via_constant_padding() -> None:
+    audio = torch.rand(1, 2, 16, dtype=torch.float16)
+
+    assert log_spectral_distance(audio, audio, "mono") == pytest.approx(0.0)
+
+
 @pytest.mark.parametrize(
     "metric,args",
     [
-        (waveform_l1, (torch.tensor([float("nan")]), torch.zeros(1))),
+        (waveform_l1, (torch.full((1, 2, 8), float("nan")), torch.zeros(1, 2, 8))),
         (lre_error_db, (torch.full((1, 2, 8), float("inf")), torch.zeros(1, 2, 8))),
         (rgb_l1, (torch.full((1, 2, 2, 3), float("nan")), torch.zeros(1, 2, 2, 3))),
         (psnr, (torch.zeros(1, 2, 2, 3), torch.full((1, 2, 2, 3), float("inf")))),
@@ -114,3 +170,5 @@ def test_aggregate_metrics_validates_rows() -> None:
         aggregate_metrics([{"a": 1.0}, {"b": 1.0}])
     with pytest.raises(ValueError, match="finite"):
         aggregate_metrics([{"a": 1.0}, {"a": float("nan")}])
+    with pytest.raises(ValueError, match="scalar"):
+        aggregate_metrics([{"a": [1.0, 2.0]}])
