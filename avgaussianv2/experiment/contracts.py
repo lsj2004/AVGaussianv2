@@ -55,3 +55,11 @@ class SharedIndices:
     def for_variant(self, variant: Variant) -> VariantIndices:
         warmup = () if variant == Variant.CONDITION_OFF else self.warmup
         return VariantIndices(warmup=warmup, joint=self.joint)
+
+
+@dataclass(frozen=True)
+class EvaluationResult:
+    system_name: str
+    count: int
+    rows: tuple[dict[str, object], ...]
+    summary: dict[str, dict[str, float]]

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -18,6 +18,7 @@ from avgaussianv2.checkpoint import build_checkpoint_state, save_checkpoint
 from avgaussianv2.config import ProjectConfig, load_project_config
 from avgaussianv2.contracts import AlignedAVSample
 from avgaussianv2.data.aligned import AlignedAVDataset
+from avgaussianv2.experiment.evaluation import move_sample
 from avgaussianv2.losses import AudioLoss
 from avgaussianv2.models.fusion import AVGaussianFusionV2
 from avgaussianv2.models.rgbd import RGBDConditionEncoder
@@ -60,8 +61,8 @@ class _DeviceSampleSequence(Sequence[AlignedAVSample]):
 
     def __getitem__(self, index):
         if isinstance(index, slice):
-            return [_move_sample(sample, self.device) for sample in self.samples[index]]
-        return _move_sample(self.samples[index], self.device)
+            return [move_sample(sample, self.device) for sample in self.samples[index]]
+        return move_sample(self.samples[index], self.device)
 
 
 def seed_everything(seed: int) -> None:
@@ -85,15 +86,6 @@ def _json_safe(value):
 def _write_json(path: Path, value) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(_json_safe(value), indent=2, sort_keys=True) + "\n")
-
-
-def _move_sample(sample: AlignedAVSample, device: torch.device) -> AlignedAVSample:
-    changes = {
-        name: value.to(device)
-        for name, value in vars(sample).items()
-        if isinstance(value, Tensor)
-    }
-    return replace(sample, **changes)
 
 
 def _stats_rows(stats: Sequence[TrainStepStats], stage: str) -> list[dict]:
