@@ -1,11 +1,14 @@
 from dataclasses import FrozenInstanceError
 
-import numpy as np
 import pytest
 
-from avgaussianv2.experiment.contracts import PilotConfig, Variant
+from avgaussianv2.experiment.contracts import (
+    PilotConfig,
+    SharedIndices,
+    Variant,
+    VariantIndices,
+)
 from avgaussianv2.experiment.sampling import (
-    _draw_epochs,
     build_shared_indices,
     evenly_spaced_indices,
 )
@@ -36,6 +39,7 @@ def test_variants_have_exact_approved_values() -> None:
         "frozen_visual",
         "condition_off",
     )
+    assert str(Variant.CONDITION_OFF) == "condition_off"
 
 
 def test_pilot_config_is_frozen() -> None:
@@ -43,6 +47,16 @@ def test_pilot_config_is_frozen() -> None:
 
     with pytest.raises(FrozenInstanceError):
         config.joint_steps = 1  # type: ignore[misc]
+
+
+def test_index_contracts_are_frozen() -> None:
+    shared = SharedIndices(warmup=(0,), joint=(1,))
+    variant = VariantIndices(warmup=(0,), joint=(1,))
+
+    with pytest.raises(FrozenInstanceError):
+        shared.warmup = ()  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        variant.joint = ()  # type: ignore[misc]
 
 
 @pytest.mark.parametrize(
@@ -76,38 +90,53 @@ def test_shared_indices_are_identical_where_variants_share_phases() -> None:
     assert conditioned.joint == frozen.joint == condition_off.joint == shared.joint
 
 
-def test_build_shared_indices_is_deterministic_and_draws_separate_phases() -> None:
-    first = build_shared_indices(dataset_size=7, warmup_steps=7, joint_steps=7, seed=123)
-    second = build_shared_indices(dataset_size=7, warmup_steps=7, joint_steps=7, seed=123)
+def test_build_shared_indices_is_deterministic_across_seeds() -> None:
+    first = build_shared_indices(dataset_size=7, warmup_steps=14, joint_steps=14, seed=123)
+    second = build_shared_indices(dataset_size=7, warmup_steps=14, joint_steps=14, seed=123)
+    different = build_shared_indices(
+        dataset_size=7, warmup_steps=14, joint_steps=14, seed=124
+    )
 
     assert first == second
-    assert sorted(first.warmup) == list(range(7))
-    assert sorted(first.joint) == list(range(7))
-    expected_rng = np.random.default_rng(123)
-    assert first.warmup == tuple(int(index) for index in expected_rng.permutation(7))
-    assert first.joint == tuple(int(index) for index in expected_rng.permutation(7))
+    assert first != different
 
 
-def test_draw_epochs_uses_complete_permutations_before_repeating() -> None:
-    indices = _draw_epochs(size=4, count=10, rng=np.random.default_rng(4))
+def test_build_shared_indices_uses_complete_permutations_before_repeating() -> None:
+    shared = build_shared_indices(
+        dataset_size=4, warmup_steps=10, joint_steps=10, seed=4
+    )
 
-    assert sorted(indices[:4]) == [0, 1, 2, 3]
-    assert sorted(indices[4:8]) == [0, 1, 2, 3]
-    assert len(indices) == 10
+    for indices in (shared.warmup, shared.joint):
+        assert sorted(indices[:4]) == [0, 1, 2, 3]
+        assert sorted(indices[4:8]) == [0, 1, 2, 3]
+        assert len(indices) == 10
 
 
 @pytest.mark.parametrize("size", [0, -1])
-def test_draw_epochs_rejects_nonpositive_dataset_size(size: int) -> None:
+def test_build_shared_indices_rejects_nonpositive_dataset_size(size: int) -> None:
     with pytest.raises(ValueError, match="size"):
-        _draw_epochs(size=size, count=1, rng=np.random.default_rng(0))
+        build_shared_indices(dataset_size=size, warmup_steps=1, joint_steps=1, seed=0)
 
 
-def test_draw_epochs_allows_zero_count_and_rejects_negative_count() -> None:
-    rng = np.random.default_rng(0)
+def test_build_shared_indices_allows_zero_counts() -> None:
+    shared = build_shared_indices(
+        dataset_size=3, warmup_steps=0, joint_steps=0, seed=0
+    )
 
-    assert _draw_epochs(size=3, count=0, rng=rng) == ()
+    assert shared == SharedIndices(warmup=(), joint=())
+
+
+@pytest.mark.parametrize(("warmup_steps", "joint_steps"), [(-1, 1), (1, -1)])
+def test_build_shared_indices_rejects_negative_counts(
+    warmup_steps: int, joint_steps: int
+) -> None:
     with pytest.raises(ValueError, match="count"):
-        _draw_epochs(size=3, count=-1, rng=rng)
+        build_shared_indices(
+            dataset_size=3,
+            warmup_steps=warmup_steps,
+            joint_steps=joint_steps,
+            seed=0,
+        )
 
 
 def test_evenly_spaced_indices_matches_acceptance_example() -> None:

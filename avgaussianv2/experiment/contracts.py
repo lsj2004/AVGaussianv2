@@ -8,7 +8,8 @@ except ImportError:  # pragma: no cover - compatibility with Python 3.10
     from enum import Enum
 
     class StrEnum(str, Enum):
-        pass
+        __str__ = str.__str__
+        __format__ = str.__format__
 
 
 class Variant(StrEnum):
