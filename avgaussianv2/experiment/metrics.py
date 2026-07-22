@@ -82,7 +82,10 @@ def rgb_l1(predicted: Tensor, target: Tensor) -> float:
 def psnr(predicted: Tensor, target: Tensor) -> float:
     """Return PSNR for nonempty floating BHWC RGB tensors."""
     _rgb("PSNR", predicted, target)
-    mse = F.mse_loss(predicted, target)
+    reduction_dtype = torch.promote_types(predicted.dtype, target.dtype)
+    if reduction_dtype in {torch.float16, torch.bfloat16}:
+        reduction_dtype = torch.float32
+    mse = F.mse_loss(predicted.to(reduction_dtype), target.to(reduction_dtype))
     if mse.item() == 0.0:
         return float("inf")
     return float((-10.0 * torch.log10(mse)).item())

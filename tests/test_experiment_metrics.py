@@ -46,6 +46,25 @@ def test_basic_l1_and_psnr_values() -> None:
     assert psnr(zeros, halves) == pytest.approx(-10.0 * math.log10(0.25))
 
 
+def test_psnr_promotes_cpu_bfloat16_for_mse() -> None:
+    target = torch.zeros(1, 2, 2, 3, dtype=torch.bfloat16)
+    predicted = torch.ones_like(target)
+
+    assert psnr(predicted, target) == pytest.approx(0.0)
+
+
+def test_psnr_preserves_small_nonzero_float16_error() -> None:
+    target = torch.zeros(1, 2, 2, 3, dtype=torch.float16)
+    predicted = torch.full_like(target, 1e-4)
+
+    value = psnr(predicted, target)
+    assert math.isfinite(value)
+    assert value == pytest.approx(
+        -10.0 * math.log10(float(predicted.flatten()[0]) ** 2),
+        rel=1e-6,
+    )
+
+
 def test_lre_measures_left_right_energy_ratio_in_db() -> None:
     target = torch.ones(1, 2, 32)
     predicted = target.clone()
