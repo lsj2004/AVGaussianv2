@@ -252,6 +252,7 @@ class PilotTrainer:
                     checkpoint_store.latest_path,
                     expected_compatibility=checkpoint_store.compatibility,
                     indices=indices,
+                    model=model,
                 )
                 expected_selector = BestSelector(
                     visual_baseline,
@@ -283,10 +284,20 @@ class PilotTrainer:
                             f"actual={actual_stopper[name]!r}, "
                             f"expected={expected_stopper[name]!r}"
                         )
-        output.mkdir(parents=True, exist_ok=True)
-        # A failed replacement run must not leave an older success declaration.
-        (output / "worker_summary.json").unlink(missing_ok=True)
-        (output / "training_curve.csv").unlink(missing_ok=True)
+        output_ready = False
+
+        def prepare_output() -> None:
+            nonlocal output_ready
+            if output_ready:
+                return
+            output.mkdir(parents=True, exist_ok=True)
+            # A failed replacement run must not leave an older success declaration.
+            (output / "worker_summary.json").unlink(missing_ok=True)
+            (output / "training_curve.csv").unlink(missing_ok=True)
+            output_ready = True
+
+        if resume_state is None:
+            prepare_output()
 
         selector = (
             resume_state.selector
@@ -321,6 +332,12 @@ class PilotTrainer:
             if resume_state is None
             else resume_state.maximum_positive_audio_visual_gradient
         )
+        latest_validation_summary = (
+            None if resume_state is None else resume_state.validation_summary
+        )
+        best_evaluation_summary = (
+            None if resume_state is None else resume_state.best_evaluation_summary
+        )
 
         def save_latest(
             *,
@@ -328,7 +345,6 @@ class PilotTrainer:
             optimizer: Any | None,
             optimizer_stage: str | None,
             stop_reason: str | None = None,
-            evaluation_summary: Mapping[str, object] | None = None,
         ) -> None:
             if checkpoint_store is None:
                 return
@@ -336,6 +352,7 @@ class PilotTrainer:
                 checkpoint_store.latest_path,
                 model=model,
                 compatibility=checkpoint_store.compatibility,
+                checkpoint_kind="latest",
                 stage=stage,
                 next_warmup_position=warmup_position,
                 next_joint_position=joint_position,
@@ -347,23 +364,47 @@ class PilotTrainer:
                 validation_history=validation_history,
                 maximum_positive_audio_visual_gradient=maximum_positive_probe,
                 stop_reason=stop_reason,
-                evaluation_summary=evaluation_summary,
+                validation_summary=latest_validation_summary,
+                best_evaluation_summary=best_evaluation_summary,
             )
 
         if expected_warmup and (
             resume_state is None or resume_state.stage == "warmup"
         ):
-            configure_variant(model, resolved_variant, "warmup")
-            optimizer = self.warmup_optimizer_factory(
-                model, self.train_config.condition_lr
-            )
-            if resume_state is not None:
-                restore_pilot_checkpoint(
-                    resume_state,
-                    model=model,
-                    optimizer=optimizer,
-                    optimizer_stage="warmup",
+            if resume_state is None:
+                configure_variant(model, resolved_variant, "warmup")
+                optimizer = self.warmup_optimizer_factory(
+                    model, self.train_config.condition_lr
                 )
+            else:
+                original_model_state = {
+                    name: value.detach().clone()
+                    for name, value in model.state_dict().items()
+                }
+                original_flags = {
+                    name: parameter.requires_grad
+                    for name, parameter in model.named_parameters()
+                }
+                original_condition = getattr(model, "condition_enabled", None)
+                try:
+                    configure_variant(model, resolved_variant, "warmup")
+                    optimizer = self.warmup_optimizer_factory(
+                        model, self.train_config.condition_lr
+                    )
+                    restore_pilot_checkpoint(
+                        resume_state,
+                        model=model,
+                        optimizer=optimizer,
+                        optimizer_stage="warmup",
+                    )
+                except BaseException:
+                    model.load_state_dict(original_model_state, strict=True)
+                    for name, parameter in model.named_parameters():
+                        parameter.requires_grad_(original_flags[name])
+                    if hasattr(model, "condition_enabled"):
+                        model.condition_enabled = original_condition
+                    raise
+            prepare_output()
             for step, index in enumerate(
                 indices.warmup[warmup_position:], start=warmup_position + 1
             ):
@@ -378,22 +419,124 @@ class PilotTrainer:
                     optimizer_stage="warmup",
                 )
 
-        configure_variant(model, resolved_variant, "joint")
-        joint_optimizer = self.joint_optimizer_factory(model, self.train_config)
-        if resume_state is not None and resume_state.stage == "joint":
-            restore_pilot_checkpoint(
-                resume_state,
-                model=model,
-                optimizer=joint_optimizer,
-                optimizer_stage="joint",
-            )
+        if resume_state is None or resume_state.stage != "joint":
+            configure_variant(model, resolved_variant, "joint")
+            joint_optimizer = self.joint_optimizer_factory(model, self.train_config)
+        else:
+            original_model_state = {
+                name: value.detach().clone()
+                for name, value in model.state_dict().items()
+            }
+            original_flags = {
+                name: parameter.requires_grad
+                for name, parameter in model.named_parameters()
+            }
+            original_condition = getattr(model, "condition_enabled", None)
+            try:
+                configure_variant(model, resolved_variant, "joint")
+                joint_optimizer = self.joint_optimizer_factory(
+                    model, self.train_config
+                )
+                restore_pilot_checkpoint(
+                    resume_state,
+                    model=model,
+                    optimizer=joint_optimizer,
+                    optimizer_stage="joint",
+                )
+            except BaseException:
+                model.load_state_dict(original_model_state, strict=True)
+                for name, parameter in model.named_parameters():
+                    parameter.requires_grad_(original_flags[name])
+                if hasattr(model, "condition_enabled"):
+                    model.condition_enabled = original_condition
+                raise
+        prepare_output()
         visual_anchor = capture_visual_anchor(model.visual)
         positive_probe_seen = maximum_positive_probe > 0
         stop_reason = "max_steps"
         completed_joint_steps = joint_position
+
+        def validate_joint(step: int, row: Mapping[str, object]) -> bool:
+            nonlocal latest_validation_summary, best_evaluation_summary
+            validation_dir = output / "validation" / f"step_{step:06d}"
+            validation_dir.mkdir(parents=True, exist_ok=True)
+            evaluation = self.evaluator.evaluate(
+                heldout_samples,
+                heldout_indices,
+                system_name=f"{resolved_variant.value}_step_{step:06d}",
+                condition_enabled=bool(model.condition_enabled),
+                output_dir=validation_dir,
+            )
+            summary = json.loads(_strict_json(evaluation.summary))
+            selected = selector.consider(step, summary)
+            latest_validation_summary = summary
+            if selected:
+                best_evaluation_summary = summary
+            audio_total = summary["audio_total"]["mean"]
+            should_stop = stopper.update(step, audio_total)
+            validation_history.append({"step": step, "summary": summary})
+            event = ValidationEvent(
+                variant=resolved_variant,
+                step=step,
+                summary=summary,
+                evaluation=evaluation,
+                completed_warmup_steps=expected_warmup,
+                completed_joint_steps=step,
+                latest_training_row=dict(row),
+                selector_state=selector.state_dict(),
+                stopper_state=stopper.state_dict(),
+                is_best=selected,
+                should_stop=should_stop,
+                optimizer=joint_optimizer,
+            )
+            save_latest(
+                stage="joint",
+                optimizer=joint_optimizer,
+                optimizer_stage="joint",
+            )
+            if selected and checkpoint_store is not None:
+                save_pilot_checkpoint(
+                    checkpoint_store.best_path,
+                    model=model,
+                    compatibility=checkpoint_store.compatibility,
+                    checkpoint_kind="best",
+                    stage="joint",
+                    next_warmup_position=warmup_position,
+                    next_joint_position=joint_position,
+                    optimizer=None,
+                    optimizer_stage=None,
+                    selector=selector,
+                    stopper=stopper,
+                    training_history=history,
+                    validation_history=validation_history,
+                    maximum_positive_audio_visual_gradient=maximum_positive_probe,
+                    validation_summary=summary,
+                    best_evaluation_summary=best_evaluation_summary,
+                )
+            if on_validation is not None:
+                on_validation(event)
+            if selected and on_best_candidate is not None:
+                on_best_candidate(event)
+            return should_stop
+
+        last_validation_step = (
+            None if not validation_history else validation_history[-1]["step"]
+        )
+        pending_validation = joint_position > 0 and (
+            joint_position % self.config.validation_interval == 0
+            or joint_position == len(indices.joint)
+        ) and last_validation_step != joint_position
+        stop_requested = False
+        if pending_validation:
+            stop_requested = validate_joint(joint_position, history[-1])
+            if stop_requested:
+                stop_reason = "early_stop"
+
         for step, index in enumerate(
             indices.joint[joint_position:], start=joint_position + 1
         ):
+            if stop_requested:
+                break
             should_probe = resolved_variant == Variant.JOINT_CONDITIONED
             stats = self.joint_step_fn(
                 model,
@@ -413,6 +556,11 @@ class PilotTrainer:
                 maximum_positive_probe = max(
                     maximum_positive_probe, float(stats.audio_to_visual_grad_norm)
                 )
+            save_latest(
+                stage="joint",
+                optimizer=joint_optimizer,
+                optimizer_stage="joint",
+            )
 
             validate_now = (
                 step % self.config.validation_interval == 0
@@ -420,63 +568,7 @@ class PilotTrainer:
             )
             if not validate_now:
                 continue
-            validation_dir = output / "validation" / f"step_{step:06d}"
-            validation_dir.mkdir(parents=True, exist_ok=True)
-            evaluation = self.evaluator.evaluate(
-                heldout_samples,
-                heldout_indices,
-                system_name=f"{resolved_variant.value}_step_{step:06d}",
-                condition_enabled=bool(model.condition_enabled),
-                output_dir=validation_dir,
-            )
-            summary = json.loads(_strict_json(evaluation.summary))
-            selected = selector.consider(step, summary)
-            audio_total = summary["audio_total"]["mean"]
-            should_stop = stopper.update(step, audio_total)
-            validation_row = {"step": step, "summary": summary}
-            validation_history.append(validation_row)
-            event = ValidationEvent(
-                variant=resolved_variant,
-                step=step,
-                summary=summary,
-                evaluation=evaluation,
-                completed_warmup_steps=expected_warmup,
-                completed_joint_steps=step,
-                latest_training_row=dict(row),
-                selector_state=selector.state_dict(),
-                stopper_state=stopper.state_dict(),
-                is_best=selected,
-                should_stop=should_stop,
-                optimizer=joint_optimizer,
-            )
-            save_latest(
-                stage="joint",
-                optimizer=joint_optimizer,
-                optimizer_stage="joint",
-                evaluation_summary=summary,
-            )
-            if selected and checkpoint_store is not None:
-                save_pilot_checkpoint(
-                    checkpoint_store.best_path,
-                    model=model,
-                    compatibility=checkpoint_store.compatibility,
-                    stage="joint",
-                    next_warmup_position=warmup_position,
-                    next_joint_position=joint_position,
-                    optimizer=None,
-                    optimizer_stage=None,
-                    selector=selector,
-                    stopper=stopper,
-                    training_history=history,
-                    validation_history=validation_history,
-                    maximum_positive_audio_visual_gradient=maximum_positive_probe,
-                    evaluation_summary=summary,
-                )
-            if on_validation is not None:
-                on_validation(event)
-            if selected and on_best_candidate is not None:
-                on_best_candidate(event)
-            if should_stop:
+            if validate_joint(step, row):
                 stop_reason = "early_stop"
                 break
 
@@ -516,15 +608,6 @@ class PilotTrainer:
             optimizer=None,
             optimizer_stage=None,
             stop_reason=stop_reason,
-            evaluation_summary=(
-                None
-                if selector.best_step is None
-                else next(
-                    row["summary"]
-                    for row in reversed(validation_history)
-                    if row["step"] == selector.best_step
-                )
-            ),
         )
         return result
 

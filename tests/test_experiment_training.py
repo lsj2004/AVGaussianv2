@@ -19,9 +19,14 @@ from avgaussianv2.experiment.evaluation import Evaluator
 from avgaussianv2.experiment.checkpoint import (
     PilotCheckpointStore,
     PilotCompatibility,
+    PilotResumeError,
 )
 from avgaussianv2.experiment.training import PilotTrainer, configure_variant
-from avgaussianv2.train import DisconnectedAudioVisualGradient, TrainStepStats
+from avgaussianv2.train import (
+    DisconnectedAudioVisualGradient,
+    TrainStepStats,
+    build_joint_optimizer,
+)
 
 
 class ScalarModule(nn.Module):
@@ -252,7 +257,7 @@ def test_checkpoint_resume_after_validation_does_not_replay_joint_step(tmp_path)
     assert (tmp_path / "best.pt").is_file()
     assert torch.load(tmp_path / "latest.pt", weights_only=False)["stage"] == "complete"
     best = torch.load(tmp_path / "best.pt", weights_only=False)
-    assert best["evaluation_summary"]["audio_total"]["mean"] == 0.8
+    assert best["best_evaluation_summary"]["audio_total"]["mean"] == 0.8
     assert best["optimizer_state_dict"] is None
     for name, value in resumed.state_dict().items():
         assert torch.equal(best["model_state_dict"][name], value)
@@ -357,6 +362,240 @@ def test_checkpoint_resume_after_warmup_save_does_not_replay_step(
         ),
     )
     assert seen == [10, 11]
+
+
+def test_checkpoint_resume_after_nonvalidation_joint_step_does_not_replay(
+    tmp_path, monkeypatch
+) -> None:
+    import avgaussianv2.experiment.training as training_module
+
+    seen = []
+    real_save = training_module.save_pilot_checkpoint
+
+    def interrupt_after_first_joint(*args, **kwargs):
+        real_save(*args, **kwargs)
+        if kwargs["stage"] == "joint" and kwargs["next_joint_position"] == 1:
+            raise RuntimeError("interrupt nonvalidation")
+
+    def joint_step(model, sample, optimizer, *args, **kwargs):
+        seen.append(sample.frame_index)
+        with torch.no_grad():
+            next(model.parameters()).add_(1)
+        return _stats(0.1)
+
+    config = PilotConfig(
+        warmup_steps=0,
+        joint_steps=3,
+        validation_interval=2,
+        minimum_joint_steps=3,
+    )
+    monkeypatch.setattr(training_module, "save_pilot_checkpoint", interrupt_after_first_joint)
+    model = TinyTrainFusion()
+    model.condition_enabled = True
+    with pytest.raises(RuntimeError, match="nonvalidation"):
+        PilotTrainer(
+            config, FakeEvaluator((1.0, 0.9)), joint_step_fn=joint_step
+        ).run(
+            model=model,
+            train_samples=[_sample_with_frame(i) for i in range(3)],
+            heldout_samples=[make_sample()],
+            indices=VariantIndices((), (0, 1, 2)),
+            heldout_indices=(0,),
+            variant=Variant.JOINT_CONDITIONED,
+            visual_baseline=_baseline(),
+            audio_loss_fn=audio_loss,
+            output_dir=tmp_path,
+            checkpoint_store=PilotCheckpointStore(tmp_path, _pilot_compatibility()),
+        )
+
+    monkeypatch.setattr(training_module, "save_pilot_checkpoint", real_save)
+    resumed = TinyTrainFusion()
+    resumed.condition_enabled = True
+    PilotTrainer(config, FakeEvaluator((1.0, 0.9)), joint_step_fn=joint_step).run(
+        model=resumed,
+        train_samples=[_sample_with_frame(i) for i in range(3)],
+        heldout_samples=[make_sample()],
+        indices=VariantIndices((), (0, 1, 2)),
+        heldout_indices=(0,),
+        variant=Variant.JOINT_CONDITIONED,
+        visual_baseline=_baseline(),
+        audio_loss_fn=audio_loss,
+        output_dir=tmp_path,
+        checkpoint_store=PilotCheckpointStore(
+            tmp_path, _pilot_compatibility(), resume=True
+        ),
+    )
+    assert seen == [0, 1, 2]
+
+
+def test_resume_finishes_pending_validation_without_replaying_joint_step(
+    tmp_path, monkeypatch
+) -> None:
+    import avgaussianv2.experiment.training as training_module
+
+    seen = []
+    real_save = training_module.save_pilot_checkpoint
+
+    def interrupt_before_validation(*args, **kwargs):
+        real_save(*args, **kwargs)
+        if kwargs["stage"] == "joint" and kwargs["next_joint_position"] == 2:
+            raise RuntimeError("interrupt before validation")
+
+    def joint_step(model, sample, optimizer, *args, **kwargs):
+        seen.append(sample.frame_index)
+        return _stats(0.1)
+
+    config = PilotConfig(
+        warmup_steps=0,
+        joint_steps=3,
+        validation_interval=2,
+        minimum_joint_steps=3,
+    )
+    first_evaluator = FakeEvaluator((1.0,))
+    monkeypatch.setattr(training_module, "save_pilot_checkpoint", interrupt_before_validation)
+    model = TinyTrainFusion()
+    model.condition_enabled = True
+    with pytest.raises(RuntimeError, match="before validation"):
+        PilotTrainer(config, first_evaluator, joint_step_fn=joint_step).run(
+            model=model,
+            train_samples=[_sample_with_frame(i) for i in range(3)],
+            heldout_samples=[make_sample()],
+            indices=VariantIndices((), (0, 1, 2)),
+            heldout_indices=(0,),
+            variant=Variant.JOINT_CONDITIONED,
+            visual_baseline=_baseline(),
+            audio_loss_fn=audio_loss,
+            output_dir=tmp_path,
+            checkpoint_store=PilotCheckpointStore(tmp_path, _pilot_compatibility()),
+        )
+    assert first_evaluator.calls == []
+
+    monkeypatch.setattr(training_module, "save_pilot_checkpoint", real_save)
+    resumed_evaluator = FakeEvaluator((1.0, 0.9))
+    resumed = TinyTrainFusion()
+    resumed.condition_enabled = True
+    PilotTrainer(config, resumed_evaluator, joint_step_fn=joint_step).run(
+        model=resumed,
+        train_samples=[_sample_with_frame(i) for i in range(3)],
+        heldout_samples=[make_sample()],
+        indices=VariantIndices((), (0, 1, 2)),
+        heldout_indices=(0,),
+        variant=Variant.JOINT_CONDITIONED,
+        visual_baseline=_baseline(),
+        audio_loss_fn=audio_loss,
+        output_dir=tmp_path,
+        checkpoint_store=PilotCheckpointStore(
+            tmp_path, _pilot_compatibility(), resume=True
+        ),
+    )
+    assert seen == [0, 1, 2]
+    assert [call[2] for call in resumed_evaluator.calls] == [
+        "joint_conditioned_step_000002",
+        "joint_conditioned_step_000003",
+    ]
+
+
+def test_latest_preserves_earlier_best_evaluation_summary(tmp_path) -> None:
+    model = TinyTrainFusion()
+    model.condition_enabled = True
+    PilotTrainer(
+        PilotConfig(
+            warmup_steps=0,
+            joint_steps=2,
+            validation_interval=1,
+            minimum_joint_steps=2,
+        ),
+        FakeEvaluator((1.0, 1.1)),
+        joint_step_fn=lambda *args, **kwargs: _stats(0.1),
+    ).run(
+        model=model,
+        train_samples=[make_sample()],
+        heldout_samples=[make_sample()],
+        indices=VariantIndices((), (0, 0)),
+        heldout_indices=(0,),
+        variant=Variant.JOINT_CONDITIONED,
+        visual_baseline=_baseline(),
+        audio_loss_fn=audio_loss,
+        output_dir=tmp_path,
+        checkpoint_store=PilotCheckpointStore(tmp_path, _pilot_compatibility()),
+    )
+    latest = torch.load(tmp_path / "latest.pt", weights_only=True)
+    assert latest["best_evaluation_summary"]["audio_total"]["mean"] == 1.0
+
+
+def test_failed_optimizer_restore_rolls_back_model_and_preserves_reports(
+    tmp_path
+) -> None:
+    config = PilotConfig(
+        warmup_steps=0,
+        joint_steps=2,
+        validation_interval=1,
+        minimum_joint_steps=2,
+    )
+    source = TinyTrainFusion()
+    source.condition_enabled = True
+    with pytest.raises(RuntimeError, match="interrupt"):
+        PilotTrainer(
+            config,
+            FakeEvaluator((1.0,)),
+            joint_step_fn=lambda *args, **kwargs: _stats(0.1),
+        ).run(
+            model=source,
+            train_samples=[make_sample()],
+            heldout_samples=[make_sample()],
+            indices=VariantIndices((), (0, 0)),
+            heldout_indices=(0,),
+            variant=Variant.JOINT_CONDITIONED,
+            visual_baseline=_baseline(),
+            audio_loss_fn=audio_loss,
+            output_dir=tmp_path,
+            checkpoint_store=PilotCheckpointStore(tmp_path, _pilot_compatibility()),
+            on_validation=lambda event: (_ for _ in ()).throw(RuntimeError("interrupt")),
+        )
+    report = tmp_path / "worker_summary.json"
+    report.write_text("preserve me")
+
+    class FailingOptimizer(torch.optim.Adam):
+        def load_state_dict(self, state_dict):
+            with torch.no_grad():
+                self.param_groups[0]["params"][0].add_(99)
+            raise RuntimeError("injected optimizer failure")
+
+    resumed = TinyTrainFusion()
+    resumed.condition_enabled = False
+    before = {name: value.detach().clone() for name, value in resumed.state_dict().items()}
+    before_flags = {
+        name: parameter.requires_grad for name, parameter in resumed.named_parameters()
+    }
+    with pytest.raises(PilotResumeError, match="injected optimizer failure"):
+        PilotTrainer(
+            config,
+            FakeEvaluator((0.9,)),
+            joint_optimizer_factory=lambda model, config: FailingOptimizer(
+                build_joint_optimizer(model, config).param_groups
+            ),
+            joint_step_fn=lambda *args, **kwargs: _stats(0.1),
+        ).run(
+            model=resumed,
+            train_samples=[make_sample()],
+            heldout_samples=[make_sample()],
+            indices=VariantIndices((), (0, 0)),
+            heldout_indices=(0,),
+            variant=Variant.JOINT_CONDITIONED,
+            visual_baseline=_baseline(),
+            audio_loss_fn=audio_loss,
+            output_dir=tmp_path,
+            checkpoint_store=PilotCheckpointStore(
+                tmp_path, _pilot_compatibility(), resume=True
+            ),
+        )
+    assert resumed.condition_enabled is False
+    for name, value in resumed.state_dict().items():
+        assert torch.equal(value, before[name])
+    assert {
+        name: parameter.requires_grad for name, parameter in resumed.named_parameters()
+    } == before_flags
+    assert report.read_text() == "preserve me"
 
 
 def test_pilot_rejects_evaluator_bound_to_different_model_before_mutation(tmp_path) -> None:

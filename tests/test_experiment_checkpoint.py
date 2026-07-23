@@ -22,6 +22,10 @@ from avgaussianv2.experiment.contracts import VariantIndices
 from avgaussianv2.experiment.selection import BestSelector, EarlyStopper
 
 
+class Dangerous:
+    pass
+
+
 def compatibility() -> PilotCompatibility:
     return PilotCompatibility(
         scene_id="scene1_opera",
@@ -165,7 +169,8 @@ def _checkpoint_kwargs(model, optimizer):
         ],
         validation_history=[{"step": 1, "summary": {"audio_total": {"mean": 1.0}}}],
         maximum_positive_audio_visual_gradient=0.25,
-        evaluation_summary={"audio_total": {"mean": 1.0}},
+        validation_summary={"audio_total": {"mean": 1.0}},
+        best_evaluation_summary={"audio_total": {"mean": 1.0}},
     )
 
 
@@ -252,6 +257,14 @@ def test_store_enforces_fresh_resume_output_policy(tmp_path: Path) -> None:
         PilotCheckpointStore(tmp_path / "missing", compatibility(), resume=True).prepare()
 
 
+def test_fresh_store_rejects_any_nonempty_output_directory(tmp_path: Path) -> None:
+    (tmp_path / "unrelated.txt").write_text("occupied")
+    with pytest.raises(FileExistsError, match="nonempty"):
+        PilotCheckpointStore(tmp_path, compatibility()).prepare()
+    PilotCheckpointStore(tmp_path, compatibility(), overwrite=True).prepare()
+    assert (tmp_path / "unrelated.txt").read_text() == "occupied"
+
+
 @pytest.mark.parametrize(
     ("corrupt", "message"),
     [
@@ -329,3 +342,76 @@ def test_bad_model_shape_is_rejected_before_any_model_mutation(tmp_path: Path) -
         )
     for name, value in target.state_dict().items():
         assert torch.equal(value, before[name])
+
+
+def test_condition_off_warmup_checkpoint_is_rejected_at_inspection(tmp_path: Path) -> None:
+    model = nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    condition_off = replace(compatibility(), variant="condition_off")
+    path = tmp_path / "latest.pt"
+    kwargs = _checkpoint_kwargs(model, optimizer)
+    kwargs.update(
+        compatibility=condition_off,
+        stage="warmup",
+        next_warmup_position=0,
+        next_joint_position=0,
+        training_history=[],
+        validation_history=[],
+        optimizer_stage="warmup",
+    )
+    save_pilot_checkpoint(path, **kwargs)
+    with pytest.raises(PilotResumeError, match="condition_off.*warmup"):
+        inspect_pilot_checkpoint(
+            path,
+            expected_compatibility=condition_off,
+            indices=VariantIndices((), (4, 5, 6)),
+        )
+
+
+def test_malicious_custom_object_checkpoint_is_not_loaded(tmp_path: Path) -> None:
+    path = tmp_path / "malicious.pt"
+    torch.save({"payload": Dangerous()}, path)
+    with pytest.raises(PilotResumeError, match="cannot read"):
+        inspect_pilot_checkpoint(
+            path,
+            expected_compatibility=compatibility(),
+            indices=VariantIndices((0, 1), (4, 5, 6)),
+        )
+
+
+def test_save_rejects_custom_object_in_optimizer_state(tmp_path: Path) -> None:
+    model = nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    optimizer.state[next(model.parameters())]["unsafe"] = Dangerous()
+    with pytest.raises(PilotResumeError, match="safe primitive"):
+        save_pilot_checkpoint(
+            tmp_path / "unsafe.pt", **_checkpoint_kwargs(model, optimizer)
+        )
+    assert not (tmp_path / "unsafe.pt").exists()
+
+
+def test_best_checkpoint_self_inspects_but_cannot_be_active_resume(tmp_path: Path) -> None:
+    model = nn.Linear(2, 1)
+    path = tmp_path / "best.pt"
+    kwargs = _checkpoint_kwargs(model, None)
+    kwargs.update(
+        checkpoint_kind="best",
+        optimizer=None,
+        optimizer_stage=None,
+        best_evaluation_summary={"audio_total": {"mean": 1.0}},
+    )
+    save_pilot_checkpoint(path, **kwargs)
+    artifact = inspect_pilot_checkpoint(
+        path,
+        expected_compatibility=compatibility(),
+        indices=VariantIndices((0, 1), (4, 5, 6)),
+        active_resume=False,
+    )
+    assert artifact.checkpoint_kind == "best"
+    assert artifact.best_evaluation_summary == {"audio_total": {"mean": 1.0}}
+    with pytest.raises(PilotResumeError, match="best.*active"):
+        inspect_pilot_checkpoint(
+            path,
+            expected_compatibility=compatibility(),
+            indices=VariantIndices((0, 1), (4, 5, 6)),
+        )
