@@ -17,10 +17,16 @@ from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
 
-import torch
-
-from avgaussianv2.experiment.checkpoint import hash_index_manifest
-from avgaussianv2.experiment.contracts import EvaluationResult
+from avgaussianv2.experiment.checkpoint import (
+    PilotCompatibility,
+    hash_index_manifest,
+    inspect_pilot_checkpoint,
+)
+from avgaussianv2.experiment.contracts import (
+    EvaluationResult,
+    PilotConfig,
+    VariantIndices,
+)
 from avgaussianv2.experiment.evaluation import METRIC_NAMES
 from avgaussianv2.experiment.metrics import aggregate_metrics
 from avgaussianv2.experiment.selection import (
@@ -37,6 +43,8 @@ REQUIRED_SYSTEMS = (
     "frozen_visual_on",
     "condition_off",
 )
+PSNR_TOLERANCE_DB = 0.5
+SSIM_TOLERANCE = 0.01
 STATISTICS = ("mean", "std", "median")
 METRIC_DIRECTIONS = {
     metric: (
@@ -133,6 +141,25 @@ class EvaluationProvenance:
     evaluation_indices_hash: str
     condition_enabled: bool
     evaluation_run_id: str
+    compatibility: PilotCompatibility | None
+    variant_indices: VariantIndices | None
+    pilot_config: PilotConfig | None
+
+
+@dataclass(frozen=True)
+class EvaluationArtifactProvenance:
+    metrics_per_sample_path: Path
+    metrics_per_sample_sha256: str
+    metrics_summary_path: Path
+    metrics_summary_sha256: str
+    manifest_sha256: str
+    system_name: str
+    condition_enabled: bool
+    count: int
+    evaluation_indices: tuple[int, ...]
+    evaluation_indices_hash: str
+    checkpoint: EvaluationProvenance
+    evaluation_run_id: str
 
 
 @dataclass(frozen=True)
@@ -140,6 +167,10 @@ class CheckpointArtifactIdentity:
     checkpoint_kind: str
     generation: int
     run_fingerprint: Mapping[str, object]
+    best_step: int
+    visual_baseline: Mapping[str, object]
+    psnr_tolerance_db: float
+    ssim_tolerance: float
 
 
 @dataclass(frozen=True)
@@ -147,7 +178,7 @@ class SystemReportInput:
     name: str
     evaluation: EvaluationResult
     worker_summary: Mapping[str, object] | None
-    provenance: EvaluationProvenance
+    provenance: EvaluationArtifactProvenance
 
 
 @dataclass(frozen=True)
@@ -165,6 +196,8 @@ class ComparisonResult:
     decision: PilotDecision
     content_digest: str
     generation_path: Path
+    committed: bool
+    durability_warnings: tuple[str, ...]
 
     @property
     def pair_records(self) -> tuple[dict[str, object], ...]:
@@ -276,6 +309,54 @@ def build_evaluation_run_id(
     return hash_index_manifest(payload)
 
 
+def build_evaluation_manifest_sha256(
+    *,
+    metrics_per_sample_sha256: str,
+    metrics_summary_sha256: str,
+    system_name: str,
+    condition_enabled: bool,
+    count: int,
+    evaluation_indices: Sequence[int],
+    evaluation_indices_hash: str,
+    checkpoint_sha256: str,
+    checkpoint_generation: int,
+    evaluation_run_id: str,
+) -> str:
+    if not isinstance(condition_enabled, bool):
+        raise TypeError("condition_enabled must be boolean")
+    indices = tuple(
+        _integer(index, f"evaluation_indices[{position}]")
+        for position, index in enumerate(evaluation_indices)
+    )
+    if not indices or len(indices) != len(set(indices)):
+        raise ValueError("evaluation_indices must be nonempty and unique")
+    payload = {
+        "metrics_per_sample_sha256": _digest(
+            metrics_per_sample_sha256, "metrics_per_sample_sha256"
+        ),
+        "metrics_summary_sha256": _digest(
+            metrics_summary_sha256, "metrics_summary_sha256"
+        ),
+        "system_name": _text(system_name, "system_name"),
+        "condition_enabled": condition_enabled,
+        "count": _integer(count, "count", minimum=1),
+        "evaluation_indices": list(indices),
+        "evaluation_indices_hash": _digest(
+            evaluation_indices_hash, "evaluation_indices_hash"
+        ),
+        "checkpoint_sha256": _digest(
+            checkpoint_sha256, "checkpoint_sha256"
+        ),
+        "checkpoint_generation": _integer(
+            checkpoint_generation, "checkpoint_generation"
+        ),
+        "evaluation_run_id": _digest(
+            evaluation_run_id, "evaluation_run_id"
+        ),
+    }
+    return hash_index_manifest(payload)
+
+
 def _secure_sha256_file(path: Path) -> str:
     try:
         before = path.lstat()
@@ -340,27 +421,68 @@ def _artifact_identity_tuple(path: Path) -> tuple[int, int, int, int, int]:
     )
 
 
-def resolve_pilot_checkpoint_identity(path: Path) -> CheckpointArtifactIdentity:
-    """Safely load only the checkpoint identity metadata needed by this report."""
+def _read_verified_artifact(
+    path: Path, expected_sha256: str, *, limit: int, name: str
+) -> bytes:
+    before = _artifact_identity_tuple(path)
+    if before[2] > limit:
+        raise ValueError(f"{name} exceeds {limit} byte limit")
+    descriptor = os.open(
+        path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    )
+    digest = hashlib.sha256()
+    chunks: list[bytes] = []
     try:
-        payload = torch.load(path, map_location="cpu", weights_only=True)
-    except Exception as error:
-        raise ValueError(f"cannot inspect pilot checkpoint identity: {path}") from error
-    if not isinstance(payload, Mapping):
-        raise ValueError("pilot checkpoint identity payload must be a mapping")
-    kind = payload.get("checkpoint_kind")
-    if kind != "best":
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != before[:2]:
+            raise ValueError(f"{name} identity changed while opening")
+        total = 0
+        while block := os.read(descriptor, min(1024 * 1024, limit + 1 - total)):
+            total += len(block)
+            if total > limit:
+                raise ValueError(f"{name} exceeds {limit} byte limit")
+            digest.update(block)
+            chunks.append(block)
+        after = os.fstat(descriptor)
+        if (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) != before:
+            raise ValueError(f"{name} changed while reading")
+    finally:
+        os.close(descriptor)
+    if digest.hexdigest() != _digest(expected_sha256, f"{name} SHA-256"):
+        raise ValueError(f"{name} SHA-256 mismatch")
+    return b"".join(chunks)
+
+
+def resolve_pilot_checkpoint_identity(
+    path: Path, provenance: EvaluationProvenance
+) -> CheckpointArtifactIdentity:
+    """Safely load only the checkpoint identity metadata needed by this report."""
+    if provenance.compatibility is None or provenance.variant_indices is None:
+        raise ValueError("pilot checkpoint provenance requires compatibility and indices")
+    state = inspect_pilot_checkpoint(
+        path,
+        expected_compatibility=provenance.compatibility,
+        indices=provenance.variant_indices,
+        expected_run_fingerprint=provenance.run_fingerprint,
+        active_resume=False,
+    )
+    if state.checkpoint_kind != "best":
         raise ValueError("pilot evaluation checkpoint must have kind 'best'")
-    generation = _integer(payload.get("generation"), "checkpoint generation")
-    fingerprint = payload.get("run_fingerprint")
-    if not isinstance(fingerprint, Mapping):
-        raise TypeError("checkpoint run_fingerprint must be a mapping")
+    selector_state = state.selector.state_dict()
     return CheckpointArtifactIdentity(
-        checkpoint_kind=kind,
-        generation=generation,
-        run_fingerprint=_run_fingerprint(
-            fingerprint, "checkpoint run_fingerprint"
-        ),
+        checkpoint_kind=state.checkpoint_kind,
+        generation=state.generation,
+        run_fingerprint=state.run_fingerprint,
+        best_step=int(selector_state["best_step"]),
+        visual_baseline=selector_state["visual_baseline"],
+        psnr_tolerance_db=float(selector_state["psnr_tolerance_db"]),
+        ssim_tolerance=float(selector_state["ssim_tolerance"]),
     )
 
 
@@ -477,7 +599,8 @@ def _validate_numeric_mapping(value: object, name: str) -> None:
         raise TypeError(f"{name} must be a nonempty mapping")
     for key, item in value.items():
         _text(key, f"{name} key")
-        _scalar(item, f"{name}.{key}")
+        if _scalar(item, f"{name}.{key}") < 0:
+            raise ValueError(f"{name}.{key} must be nonnegative")
 
 
 def _validate_worker(
@@ -616,6 +739,15 @@ def _validate_worker(
             selector[field], f"{system_name}.selector_state.{field}"
         ) < 0:
             raise ValueError(f"{system_name}.selector_state.{field} must be nonnegative")
+    if selector["psnr_tolerance_db"] != PSNR_TOLERANCE_DB:
+        raise ValueError(
+            f"{system_name} selector PSNR tolerance must equal "
+            f"{PSNR_TOLERANCE_DB}"
+        )
+    if selector["ssim_tolerance"] != SSIM_TOLERANCE:
+        raise ValueError(
+            f"{system_name} selector SSIM tolerance must equal {SSIM_TOLERANCE}"
+        )
     if _integer(
         selector["best_step"],
         f"{system_name}.selector_state.best_step",
@@ -722,6 +854,17 @@ def _validate_worker(
             checkpoint_io[field],
             f"{system_name}.checkpoint_io.{field}",
         )
+    if (
+        checkpoint_io["save_count"] + checkpoint_io["failed_save_count"]
+        != checkpoint_io["save_attempt_count"]
+    ):
+        raise ValueError(f"{system_name}.checkpoint_io save counters are incoherent")
+    if (
+        checkpoint_io["backup_copy_count"]
+        + checkpoint_io["backup_copy_failure_count"]
+        != checkpoint_io["backup_copy_attempt_count"]
+    ):
+        raise ValueError(f"{system_name}.checkpoint_io backup counters are incoherent")
     for field in ("save_duration_seconds", "backup_copy_duration_seconds"):
         if _scalar(
             checkpoint_io[field], f"{system_name}.checkpoint_io.{field}"
@@ -768,7 +911,9 @@ def _validate_provenance(
     *,
     hash_cache: dict[Path, tuple[str, tuple[int, int, int, int, int]]],
     identity_cache: dict[Path, CheckpointArtifactIdentity],
-    checkpoint_identity_resolver: Callable[[Path], CheckpointArtifactIdentity],
+    checkpoint_identity_resolver: Callable[
+        [Path, EvaluationProvenance], CheckpointArtifactIdentity
+    ],
 ) -> dict[str, object]:
     if not isinstance(value, EvaluationProvenance):
         raise TypeError(
@@ -790,11 +935,41 @@ def _validate_provenance(
     resolved_path = artifact_path.resolve(strict=True)
     cached = hash_cache.get(resolved_path)
     if cached is None:
-        actual_sha = _secure_sha256_file(artifact_path)
-        after_hash_identity = _artifact_identity_tuple(artifact_path)
-        if after_hash_identity != before_identity:
-            raise ValueError(f"{system_name} checkpoint identity changed while hashing")
-        hash_cache[resolved_path] = (actual_sha, after_hash_identity)
+        descriptor = os.open(
+            artifact_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != before_identity[:2]:
+                raise ValueError(f"{system_name} checkpoint identity changed")
+            actual_sha = _hash_fd(descriptor)
+            if actual_sha != expected_sha:
+                raise ValueError(f"{system_name} checkpoint SHA-256 mismatch")
+            pinned_path = Path(f"/proc/self/fd/{descriptor}")
+            if system_name != "baseline_imported":
+                identity = checkpoint_identity_resolver(pinned_path, value)
+                if not isinstance(identity, CheckpointArtifactIdentity):
+                    raise TypeError(
+                        "checkpoint identity resolver must return "
+                        "CheckpointArtifactIdentity"
+                    )
+                identity_cache[resolved_path] = identity
+            after = os.fstat(descriptor)
+            after_identity = (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            if after_identity != before_identity:
+                raise ValueError(
+                    f"{system_name} checkpoint changed during pinned inspection"
+                )
+        finally:
+            os.close(descriptor)
+        hash_cache[resolved_path] = (actual_sha, before_identity)
     else:
         actual_sha, cached_identity = cached
         if before_identity != cached_identity:
@@ -823,15 +998,20 @@ def _validate_provenance(
     if run_id != expected_run_id:
         raise ValueError(f"{system_name} evaluation_run_id mismatch")
     if system_name != "baseline_imported":
+        if not isinstance(value.pilot_config, PilotConfig):
+            raise TypeError(f"{system_name}.pilot_config must be a PilotConfig")
+        value.pilot_config.validate()
+        if value.pilot_config.psnr_tolerance_db != PSNR_TOLERANCE_DB:
+            raise ValueError(
+                f"{system_name} pilot PSNR tolerance must equal {PSNR_TOLERANCE_DB}"
+            )
+        if value.pilot_config.ssim_tolerance != SSIM_TOLERANCE:
+            raise ValueError(
+                f"{system_name} pilot SSIM tolerance must equal {SSIM_TOLERANCE}"
+            )
         identity = identity_cache.get(resolved_path)
         if identity is None:
-            identity = checkpoint_identity_resolver(artifact_path)
-            if not isinstance(identity, CheckpointArtifactIdentity):
-                raise TypeError(
-                    "checkpoint identity resolver must return "
-                    "CheckpointArtifactIdentity"
-                )
-            identity_cache[resolved_path] = identity
+            raise RuntimeError("checkpoint identity cache is incomplete")
         if _artifact_identity_tuple(artifact_path) != hash_cache[resolved_path][1]:
             raise ValueError(
                 f"{system_name} checkpoint changed during metadata inspection"
@@ -844,7 +1024,7 @@ def _validate_provenance(
             identity.run_fingerprint, "resolved checkpoint run_fingerprint"
         ) != fingerprint:
             raise ValueError(f"{system_name} checkpoint run_fingerprint mismatch")
-    return {
+    result = {
         "scene_id": scene_id,
         "checkpoint_path": str(resolved_path),
         "checkpoint_sha256": actual_sha,
@@ -854,6 +1034,97 @@ def _validate_provenance(
         "condition_enabled": condition,
         "evaluation_run_id": run_id,
     }
+    if system_name != "baseline_imported":
+        result["_checkpoint_best_step"] = identity.best_step
+        result["_checkpoint_visual_baseline"] = identity.visual_baseline
+        result["_checkpoint_psnr_tolerance_db"] = identity.psnr_tolerance_db
+        result["_checkpoint_ssim_tolerance"] = identity.ssim_tolerance
+    return result
+
+
+def _load_evaluation_artifact(
+    value: object, system_name: str
+) -> tuple[EvaluationResult, EvaluationProvenance]:
+    if not isinstance(value, EvaluationArtifactProvenance):
+        raise TypeError(
+            f"{system_name} provenance must be an "
+            "EvaluationArtifactProvenance"
+        )
+    if value.system_name != system_name:
+        raise ValueError(f"{system_name} evaluation artifact system_name mismatch")
+    if value.condition_enabled != _EXPECTED_CONDITION[system_name]:
+        raise ValueError(f"{system_name} evaluation artifact condition mismatch")
+    if value.condition_enabled != value.checkpoint.condition_enabled:
+        raise ValueError(f"{system_name} artifact/checkpoint condition mismatch")
+    count = _integer(value.count, f"{system_name} artifact count", minimum=1)
+    indices = tuple(
+        _integer(index, f"{system_name}.evaluation_indices[{position}]")
+        for position, index in enumerate(value.evaluation_indices)
+    )
+    if len(indices) != count or len(indices) != len(set(indices)):
+        raise ValueError(f"{system_name} evaluation indices/count mismatch")
+    indices_hash = _digest(
+        value.evaluation_indices_hash,
+        f"{system_name}.evaluation_indices_hash",
+    )
+    if hash_index_manifest(list(indices)) != indices_hash:
+        raise ValueError(f"{system_name} evaluation indices hash mismatch")
+    if indices_hash != value.checkpoint.evaluation_indices_hash:
+        raise ValueError(f"{system_name} artifact/checkpoint indices hash mismatch")
+    if value.evaluation_run_id != value.checkpoint.evaluation_run_id:
+        raise ValueError(f"{system_name} artifact/checkpoint run ID mismatch")
+    if not isinstance(value.metrics_per_sample_path, Path) or not isinstance(
+        value.metrics_summary_path, Path
+    ):
+        raise TypeError(f"{system_name} metric artifact paths must be Paths")
+    rows_data = _read_verified_artifact(
+        value.metrics_per_sample_path,
+        value.metrics_per_sample_sha256,
+        limit=256 * 1024 * 1024,
+        name=f"{system_name} metrics_per_sample.jsonl",
+    )
+    summary_data = _read_verified_artifact(
+        value.metrics_summary_path,
+        value.metrics_summary_sha256,
+        limit=16 * 1024 * 1024,
+        name=f"{system_name} metrics_summary.json",
+    )
+    try:
+        row_lines = rows_data.decode("utf-8").splitlines()
+        if len(row_lines) != count or any(not line for line in row_lines):
+            raise ValueError(f"{system_name} metrics JSONL row count mismatch")
+        rows = tuple(
+            json.loads(
+                line,
+                parse_constant=lambda token: (_ for _ in ()).throw(
+                    ValueError(f"non-finite JSON constant {token}")
+                ),
+            )
+            for line in row_lines
+        )
+        summary = json.loads(
+            summary_data.decode("utf-8"),
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON constant {token}")
+            ),
+        )
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{system_name} metric artifacts are invalid JSON") from error
+    expected_manifest = build_evaluation_manifest_sha256(
+        metrics_per_sample_sha256=value.metrics_per_sample_sha256,
+        metrics_summary_sha256=value.metrics_summary_sha256,
+        system_name=system_name,
+        condition_enabled=value.condition_enabled,
+        count=count,
+        evaluation_indices=indices,
+        evaluation_indices_hash=indices_hash,
+        checkpoint_sha256=value.checkpoint.checkpoint_sha256,
+        checkpoint_generation=value.checkpoint.checkpoint_generation,
+        evaluation_run_id=value.evaluation_run_id,
+    )
+    if _digest(value.manifest_sha256, f"{system_name}.manifest_sha256") != expected_manifest:
+        raise ValueError(f"{system_name} evaluation manifest hash mismatch")
+    return EvaluationResult(system_name, count, rows, summary), value.checkpoint
 
 
 def paired_audio_deltas(
@@ -929,7 +1200,7 @@ def _normalize_systems(
     systems: Sequence[SystemReportInput],
     *,
     checkpoint_identity_resolver: Callable[
-        [Path], CheckpointArtifactIdentity
+        [Path, EvaluationProvenance], CheckpointArtifactIdentity
     ] = resolve_pilot_checkpoint_identity,
 ) -> tuple[
     dict[str, dict[str, object]],
@@ -956,9 +1227,18 @@ def _normalize_systems(
     identity_cache: dict[Path, CheckpointArtifactIdentity] = {}
     for name in REQUIRED_SYSTEMS:
         item = by_name[name]
-        summary, system_rows = _validate_evaluation(item.evaluation, name)
+        artifact_evaluation, checkpoint_provenance = _load_evaluation_artifact(
+            item.provenance, name
+        )
+        if artifact_evaluation != item.evaluation:
+            raise ValueError(
+                f"{name} in-memory evaluation disagrees with metric artifacts"
+            )
+        summary, system_rows = _validate_evaluation(
+            artifact_evaluation, name
+        )
         provenance = _validate_provenance(
-            item.provenance,
+            checkpoint_provenance,
             name,
             hash_cache=hash_cache,
             identity_cache=identity_cache,
@@ -978,6 +1258,31 @@ def _normalize_systems(
             worker = _validate_worker(
                 item.worker_summary, name, str(provenance["scene_id"])
             )
+            if worker["best_step"] != provenance["_checkpoint_best_step"]:
+                raise ValueError(f"{name} worker/checkpoint best_step mismatch")
+            if (
+                worker["quick_visual_baseline"]
+                != provenance["_checkpoint_visual_baseline"]
+            ):
+                raise ValueError(
+                    f"{name} worker/checkpoint visual baseline mismatch"
+                )
+            if (
+                worker["quick_psnr_tolerance_db"]
+                != provenance["_checkpoint_psnr_tolerance_db"]
+                or worker["quick_ssim_tolerance"]
+                != provenance["_checkpoint_ssim_tolerance"]
+            ):
+                raise ValueError(
+                    f"{name} worker/checkpoint visual tolerances mismatch"
+                )
+            for internal_field in (
+                "_checkpoint_best_step",
+                "_checkpoint_visual_baseline",
+                "_checkpoint_psnr_tolerance_db",
+                "_checkpoint_ssim_tolerance",
+            ):
+                provenance.pop(internal_field)
         normalized[name] = {
             "summary": summary,
             "provenance": provenance,
@@ -1145,7 +1450,7 @@ def _system_output(
                 else source["worker"]["quick_best_visual_feasible"]
             ),
             "full_split_visual_feasible": visual_feasible(
-                summary, baseline, 0.5, 0.01
+                summary, baseline, PSNR_TOLERANCE_DB, SSIM_TOLERANCE
             ),
             "provenance": {
                 key: value
@@ -1594,7 +1899,7 @@ def _ensure_discovery_symlinks(output_fd: int) -> None:
 
 def _publish_generation(
     output_dir: Path, contents: Mapping[str, str]
-) -> tuple[str, Path]:
+) -> tuple[str, Path, tuple[str, ...]]:
     encoded = {name: contents[name].encode("utf-8") for name in _REPORT_FILES}
     metadata = _generation_metadata(encoded)
     digest = str(metadata["content_digest"])
@@ -1603,6 +1908,8 @@ def _publish_generation(
     generations_fd: int | None = None
     temporary_name: str | None = None
     pointer_temporary: str | None = None
+    committed = False
+    durability_warnings: list[str] = []
     try:
         lock_fd = _open_lock(output_fd)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -1678,8 +1985,19 @@ def _publish_generation(
             dst_dir_fd=output_fd,
         )
         pointer_temporary = None
-        os.fsync(output_fd)
-        _verify_output_identity(output_fd, absolute_output)
+        committed = True
+        try:
+            os.fsync(output_fd)
+        except OSError as error:
+            durability_warnings.append(
+                f"current pointer committed but output-directory fsync failed: {error}"
+            )
+        try:
+            _verify_output_identity(output_fd, absolute_output)
+        except (OSError, ValueError) as error:
+            durability_warnings.append(
+                f"current pointer committed but output identity recheck failed: {error}"
+            )
     finally:
         if pointer_temporary is not None:
             try:
@@ -1697,10 +2015,9 @@ def _publish_generation(
                 os.close(lock_fd)
         os.close(output_fd)
     generation_path = absolute_output / ".report-generations" / digest
-    resolved = resolve_current_report(absolute_output)
-    if resolved != generation_path:
-        raise RuntimeError("published report generation did not become current")
-    return digest, generation_path
+    if not committed:
+        raise RuntimeError("report publication returned without committing current")
+    return digest, generation_path, tuple(durability_warnings)
 
 
 def resolve_current_report(output_dir: str | Path) -> Path:
@@ -1753,7 +2070,7 @@ def build_comparison(
     output_dir: str | Path,
     *,
     checkpoint_identity_resolver: Callable[
-        [Path], CheckpointArtifactIdentity
+        [Path, EvaluationProvenance], CheckpointArtifactIdentity
     ] = resolve_pilot_checkpoint_identity,
 ) -> ComparisonResult:
     """Validate five systems, decide acceptance, and atomically publish reports."""
@@ -1782,7 +2099,7 @@ def build_comparison(
     paired_jsonl = "".join(
         _json_text(record, indent=None) for record in paired["records"]
     )
-    digest, generation_path = _publish_generation(
+    digest, generation_path, durability_warnings = _publish_generation(
         Path(output_dir),
         {
             "comparison.json": _json_text(json_payload),
@@ -1801,17 +2118,21 @@ def build_comparison(
         decision=decision,
         content_digest=digest,
         generation_path=generation_path,
+        committed=True,
+        durability_warnings=durability_warnings,
     )
 
 
 __all__ = [
     "ComparisonResult",
     "CheckpointArtifactIdentity",
+    "EvaluationArtifactProvenance",
     "EvaluationProvenance",
     "PilotDecision",
     "REQUIRED_SYSTEMS",
     "SystemReportInput",
     "build_comparison",
+    "build_evaluation_manifest_sha256",
     "build_evaluation_run_id",
     "decide_long_training",
     "paired_audio_deltas",

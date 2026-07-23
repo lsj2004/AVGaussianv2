@@ -8,22 +8,34 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch import nn
 
 import avgaussianv2.experiment.report as report_module
 from avgaussianv2.experiment.contracts import EvaluationResult
 from avgaussianv2.experiment.evaluation import METRIC_NAMES
 from avgaussianv2.experiment.metrics import aggregate_metrics
 from avgaussianv2.experiment.report import (
+    EvaluationArtifactProvenance,
     EvaluationProvenance,
     REQUIRED_SYSTEMS,
     SystemReportInput,
     build_comparison,
+    build_evaluation_manifest_sha256,
     build_evaluation_run_id,
     decide_long_training,
     paired_audio_deltas,
     resolve_current_report,
 )
-from avgaussianv2.experiment.checkpoint import hash_index_manifest, sha256_file
+from avgaussianv2.config import TrainConfig
+from avgaussianv2.experiment.checkpoint import (
+    PilotCompatibility,
+    build_pilot_payload,
+    build_run_fingerprint,
+    hash_index_manifest,
+    sha256_file,
+)
+from avgaussianv2.experiment.contracts import PilotConfig, VariantIndices
+from avgaussianv2.experiment.selection import BestSelector, EarlyStopper
 from avgaussianv2.experiment import PilotDecision as ExportedPilotDecision
 
 
@@ -120,7 +132,7 @@ def _worker(
             "last_step": 3,
         },
         "stopper_state": {
-            "minimum_steps": 1,
+            "minimum_steps": 0,
             "patience": 2,
             "relative_delta": 0.01,
             "best": 0.5,
@@ -197,19 +209,96 @@ _RUN_FINGERPRINT = {
 _EVALUATION_INDICES_HASH = hash_index_manifest([0, 1, 2])
 
 
-def _artifact(path: Path, *, generation: int, pilot: bool) -> str:
+def _artifact(
+    path: Path, *, generation: int, pilot: bool, variant: str
+):
     if pilot:
-        torch.save(
-            {
-                "checkpoint_kind": "best",
-                "generation": generation,
-                "run_fingerprint": _RUN_FINGERPRINT,
-            },
-            path,
+        model = nn.Linear(2, 1)
+        pilot_config = PilotConfig(
+            warmup_steps=1,
+            joint_steps=3,
+            validation_interval=1,
+            minimum_joint_steps=0,
+            patience=2,
+            minimum_relative_improvement=0.01,
+            psnr_tolerance_db=0.5,
+            ssim_tolerance=0.01,
         )
+        baseline = {
+            "rgb_psnr": {"mean": 30.0},
+            "rgb_ssim": {"mean": 0.95},
+        }
+        run_fingerprint = build_run_fingerprint(
+            pilot_config=pilot_config,
+            train_config=TrainConfig(),
+            visual_baseline=baseline,
+            model=model,
+            warmup_optimizer_factory=hash_index_manifest,
+            joint_optimizer_factory=hash_index_manifest,
+            warmup_step_fn=hash_index_manifest,
+            joint_step_fn=hash_index_manifest,
+            audio_loss_fn=hash_index_manifest,
+        )
+        compatibility = PilotCompatibility(
+            scene_id="scene1_opera",
+            variant=variant,
+            seed=7,
+            index_hash="1" * 64,
+            visual_checkpoint_sha256="2" * 64,
+            audio_checkpoint_sha256="3" * 64,
+            camera_mapping_sha256="4" * 64,
+            n_fft=512,
+            hop_length=128,
+            win_length=512,
+            sample_rate=48_000,
+        )
+        worker = _worker(variant)
+        indices = VariantIndices(
+            () if variant == "condition_off" else (11,),
+            (21, 22, 23),
+        )
+        selector = BestSelector(baseline, 0.5, 0.01)
+        stopper = EarlyStopper(0, 2, 0.01)
+        for validation in worker["validation_history"]:
+            selector.consider(validation["step"], validation["summary"])
+            stopper.update(
+                validation["step"],
+                validation["summary"]["audio_total"]["mean"],
+            )
+        payload = build_pilot_payload(
+            model=model,
+            compatibility=compatibility,
+            run_fingerprint=run_fingerprint,
+            stage="joint",
+            next_warmup_position=len(indices.warmup),
+            next_joint_position=3,
+            optimizer=None,
+            optimizer_stage=None,
+            selector=selector,
+            stopper=stopper,
+            training_history=worker["training_history"],
+            validation_history=worker["validation_history"],
+            maximum_positive_audio_visual_gradient=0.2,
+            checkpoint_kind="best",
+            generation=generation,
+            best_generation=generation,
+            validation_summary=worker["validation_history"][-1]["summary"],
+            best_evaluation_summary=worker["validation_history"][-1]["summary"],
+        )
+        torch.save(payload, path)
     else:
         path.write_bytes(b"imported-baseline-artifact-v1")
-    return sha256_file(path)
+        compatibility = None
+        indices = None
+        pilot_config = None
+        run_fingerprint = _RUN_FINGERPRINT
+    return (
+        sha256_file(path),
+        compatibility,
+        indices,
+        pilot_config,
+        run_fingerprint,
+    )
 
 
 def _provenance(
@@ -218,13 +307,16 @@ def _provenance(
     generation: int,
     condition_enabled: bool,
     pilot: bool,
+    variant: str,
 ) -> EvaluationProvenance:
-    sha = _artifact(path, generation=generation, pilot=pilot)
+    sha, compatibility, indices, pilot_config, run_fingerprint = _artifact(
+        path, generation=generation, pilot=pilot, variant=variant
+    )
     run_id = build_evaluation_run_id(
         checkpoint_path=path,
         checkpoint_sha256=sha,
         checkpoint_generation=generation,
-        run_fingerprint=_RUN_FINGERPRINT,
+        run_fingerprint=run_fingerprint,
         evaluation_indices_hash=_EVALUATION_INDICES_HASH,
     )
     return EvaluationProvenance(
@@ -232,10 +324,13 @@ def _provenance(
         checkpoint_path=path,
         checkpoint_sha256=sha,
         checkpoint_generation=generation,
-        run_fingerprint=_RUN_FINGERPRINT,
+        run_fingerprint=run_fingerprint,
         evaluation_indices_hash=_EVALUATION_INDICES_HASH,
         condition_enabled=condition_enabled,
         evaluation_run_id=run_id,
+        compatibility=compatibility,
+        variant_indices=indices,
+        pilot_config=pilot_config,
     )
 
 
@@ -245,12 +340,14 @@ def _ready_systems(tmp_path: Path):
         generation=0,
         condition_enabled=False,
         pilot=False,
+        variant="joint_conditioned",
     )
     joint = _provenance(
         tmp_path / "joint-best.pt",
         generation=7,
         condition_enabled=True,
         pilot=True,
+        variant="joint_conditioned",
     )
     joint_off = replace(joint, condition_enabled=False)
     frozen = _provenance(
@@ -258,20 +355,87 @@ def _ready_systems(tmp_path: Path):
         generation=3,
         condition_enabled=True,
         pilot=True,
+        variant="frozen_visual",
     )
     condition_off = _provenance(
         tmp_path / "condition-off-best.pt",
         generation=5,
         condition_enabled=False,
         pilot=True,
+        variant="condition_off",
     )
-    return [
+    systems = [
         _system("baseline_imported", [1.0, 1.0, 1.0], baseline),
         _system("joint_conditioned_on", [0.6, 0.7, 0.8], joint),
         _system("joint_conditioned_off", [0.9, 0.9, 0.9], joint_off),
         _system("frozen_visual_on", [0.75, 0.8, 0.85], frozen),
         _system("condition_off", [0.95, 0.95, 0.95], condition_off),
     ]
+    return [_bind_evaluation_artifact(system, tmp_path) for system in systems]
+
+
+def _bind_evaluation_artifact(
+    system: SystemReportInput, root: Path
+) -> SystemReportInput:
+    checkpoint = (
+        system.provenance.checkpoint
+        if isinstance(system.provenance, EvaluationArtifactProvenance)
+        else system.provenance
+    )
+    artifact_dir = root / "evaluation-artifacts" / system.name
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    rows_path = artifact_dir / "metrics_per_sample.jsonl"
+    summary_path = artifact_dir / "metrics_summary.json"
+    rows_path.write_text(
+        "".join(
+            json.dumps(
+                row, sort_keys=True, separators=(",", ":"), allow_nan=False
+            )
+            + "\n"
+            for row in system.evaluation.rows
+        )
+    )
+    summary_path.write_text(
+        json.dumps(
+            system.evaluation.summary,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n"
+    )
+    rows_sha = sha256_file(rows_path)
+    summary_sha = sha256_file(summary_path)
+    indices = tuple(range(system.evaluation.count))
+    indices_hash = hash_index_manifest(list(indices))
+    assert indices_hash == checkpoint.evaluation_indices_hash
+    manifest_sha = build_evaluation_manifest_sha256(
+        metrics_per_sample_sha256=rows_sha,
+        metrics_summary_sha256=summary_sha,
+        system_name=system.name,
+        condition_enabled=checkpoint.condition_enabled,
+        count=system.evaluation.count,
+        evaluation_indices=indices,
+        evaluation_indices_hash=indices_hash,
+        checkpoint_sha256=checkpoint.checkpoint_sha256,
+        checkpoint_generation=checkpoint.checkpoint_generation,
+        evaluation_run_id=checkpoint.evaluation_run_id,
+    )
+    provenance = EvaluationArtifactProvenance(
+        metrics_per_sample_path=rows_path,
+        metrics_per_sample_sha256=rows_sha,
+        metrics_summary_path=summary_path,
+        metrics_summary_sha256=summary_sha,
+        manifest_sha256=manifest_sha,
+        system_name=system.name,
+        condition_enabled=checkpoint.condition_enabled,
+        count=system.evaluation.count,
+        evaluation_indices=indices,
+        evaluation_indices_hash=indices_hash,
+        checkpoint=checkpoint,
+        evaluation_run_id=checkpoint.evaluation_run_id,
+    )
+    return replace(system, provenance=provenance)
 
 
 def _replace_system(
@@ -298,12 +462,16 @@ def _replace_system(
         worker["validation_history"][-1]["summary"]["rgb_ssim"].update(
             mean=quick_ssim, median=quick_ssim
         )
-    return replace(
+    updated = replace(
         system,
         evaluation=_evaluation(
             system.name, tuple(audio), psnr=psnr, ssim=ssim
         ),
         worker_summary=worker,
+    )
+    return _bind_evaluation_artifact(
+        updated,
+        system.provenance.metrics_per_sample_path.parents[2],
     )
 
 
@@ -470,6 +638,50 @@ def test_quick_infeasible_worker_is_corruption_even_when_full_split_is_feasible(
         build_comparison(systems, tmp_path / "report")
 
 
+def test_widened_worker_visual_tolerance_can_never_create_false_ready(tmp_path):
+    systems = _ready_systems(tmp_path)
+    worker = systems[1].worker_summary
+    worker["selector_state"]["psnr_tolerance_db"] = 1.0
+    worker["validation_history"][-1]["summary"]["rgb_psnr"].update(
+        mean=29.2, median=29.2
+    )
+    assert not decide_long_training(systems).ready
+    with pytest.raises(ValueError, match="PSNR tolerance must equal 0.5"):
+        build_comparison(systems, tmp_path / "report")
+
+
+def test_negative_loss_and_gradient_norm_evidence_is_rejected(tmp_path):
+    systems = _ready_systems(tmp_path)
+    worker = systems[1].worker_summary
+    worker["training_history"][0]["losses"]["audio"] = -0.1
+    with pytest.raises(ValueError, match="must be nonnegative"):
+        build_comparison(systems, tmp_path / "negative-loss")
+
+    gradient_root = tmp_path / "gradient"
+    gradient_root.mkdir()
+    systems = _ready_systems(gradient_root)
+    worker = systems[1].worker_summary
+    worker["training_history"][0]["gradient_norms"]["visual"] = -0.1
+    with pytest.raises(ValueError, match="must be nonnegative"):
+        build_comparison(systems, tmp_path / "negative-gradient")
+
+
+def test_checkpoint_io_success_failure_attempt_counters_must_balance(tmp_path):
+    systems = _ready_systems(tmp_path)
+    worker = systems[1].worker_summary
+    worker["checkpoint_io"]["save_attempt_count"] += 1
+    with pytest.raises(ValueError, match="save counters are incoherent"):
+        build_comparison(systems, tmp_path / "report")
+
+
+def test_worker_selector_baseline_is_bound_to_canonical_checkpoint(tmp_path):
+    systems = _ready_systems(tmp_path)
+    worker = systems[1].worker_summary
+    worker["selector_state"]["visual_baseline"]["rgb_ssim"]["mean"] = 0.94
+    with pytest.raises(ValueError, match="worker/checkpoint visual baseline mismatch"):
+        build_comparison(systems, tmp_path / "report")
+
+
 def test_exact_system_names_and_same_checkpoint_pair_are_required(tmp_path):
     with pytest.raises(ValueError, match="exactly"):
         build_comparison(_ready_systems(tmp_path)[:-1], tmp_path / "report")
@@ -478,32 +690,31 @@ def test_exact_system_names_and_same_checkpoint_pair_are_required(tmp_path):
     with pytest.raises(ValueError, match="duplicate"):
         build_comparison(duplicated, tmp_path)
     systems = _ready_systems(tmp_path)
-    changed = replace(systems[2].provenance, checkpoint_generation=8)
     changed = replace(
-        changed,
-        evaluation_run_id=build_evaluation_run_id(
-            checkpoint_path=changed.checkpoint_path,
-            checkpoint_sha256=changed.checkpoint_sha256,
-            checkpoint_generation=changed.checkpoint_generation,
-            run_fingerprint=changed.run_fingerprint,
-            evaluation_indices_hash=changed.evaluation_indices_hash,
+        systems[2].provenance,
+        checkpoint=replace(
+            systems[2].provenance.checkpoint,
+            checkpoint_generation=8,
         ),
     )
     systems[2] = replace(
         systems[2],
         provenance=changed,
     )
-    with pytest.raises(ValueError, match="checkpoint generation mismatch"):
+    with pytest.raises(ValueError, match="manifest hash mismatch"):
         build_comparison(systems, tmp_path)
 
 
 @pytest.mark.parametrize(
     "mutation,match",
     [
-        (lambda systems: systems[1].evaluation.summary.pop("rgb_l1"), "metric fields"),
+        (
+            lambda systems: systems[1].evaluation.summary.pop("rgb_l1"),
+            "in-memory evaluation disagrees",
+        ),
         (
             lambda systems: object.__setattr__(systems[1].evaluation, "count", 99),
-            "sample count",
+            "in-memory evaluation disagrees",
         ),
         (
             lambda systems: systems[1].worker_summary["training_history"].clear(),
@@ -529,7 +740,7 @@ def test_exact_system_names_and_same_checkpoint_pair_are_required(tmp_path):
             lambda systems: systems.__setitem__(
                 1, replace(systems[1], provenance={"bad": True})
             ),
-            "EvaluationProvenance",
+            "EvaluationArtifactProvenance",
         ),
     ],
 )
@@ -557,7 +768,7 @@ def test_rows_must_match_each_system_provenance_scene_even_when_all_agree(tmp_pa
     assert decision.reasons == (
         "comparison data is missing, nonfinite, or inconsistent",
     )
-    with pytest.raises(ValueError, match="row scene.*provenance"):
+    with pytest.raises(ValueError, match="in-memory evaluation disagrees"):
         build_comparison(systems, tmp_path)
     assert not (tmp_path / "comparison.json").exists()
 
@@ -570,7 +781,10 @@ def test_artifact_path_is_verified_instead_of_trusting_stamped_identity(tmp_path
         systems[2],
         provenance=replace(
             systems[2].provenance,
-            checkpoint_path=impostor,
+            checkpoint=replace(
+                systems[2].provenance.checkpoint,
+                checkpoint_path=impostor,
+            ),
         ),
     )
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
@@ -698,21 +912,77 @@ def test_failed_overwrite_keeps_old_complete_generation_authoritative(
     ).read_text()
 
 
+@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("fault", ["fsync", "identity"])
+def test_post_current_fault_reports_committed_generation(
+    tmp_path, monkeypatch, persistent, fault
+):
+    report_dir = tmp_path / "report"
+    previous = build_comparison(_ready_systems(tmp_path), report_dir)
+    next_dir = tmp_path / "next"
+    next_dir.mkdir()
+    systems = _ready_systems(next_dir)
+    systems[1] = _replace_system(systems[1], [1.0, 1.0, 1.0])
+    state = {"committed": False, "raised": False}
+    original_rename = report_module.os.rename
+    original_fsync = report_module.os.fsync
+    original_identity = report_module._verify_output_identity
+
+    def tracking_rename(source, destination, **kwargs):
+        result = original_rename(source, destination, **kwargs)
+        if destination == "current":
+            state["committed"] = True
+        return result
+
+    def failing_fsync(descriptor):
+        if state["committed"] and (persistent or not state["raised"]):
+            state["raised"] = True
+            raise OSError("forced post-current fsync failure")
+        return original_fsync(descriptor)
+
+    def failing_identity(descriptor, output):
+        if state["committed"] and (persistent or not state["raised"]):
+            state["raised"] = True
+            raise ValueError("forced post-current identity failure")
+        return original_identity(descriptor, output)
+
+    monkeypatch.setattr(report_module.os, "rename", tracking_rename)
+    if fault == "fsync":
+        monkeypatch.setattr(report_module.os, "fsync", failing_fsync)
+    else:
+        monkeypatch.setattr(
+            report_module, "_verify_output_identity", failing_identity
+        )
+
+    published = build_comparison(systems, report_dir)
+    assert published.committed is True
+    assert published.generation_path != previous.generation_path
+    assert len(published.durability_warnings) == 1
+    assert fault in published.durability_warnings[0]
+
+    monkeypatch.setattr(report_module.os, "fsync", original_fsync)
+    monkeypatch.setattr(
+        report_module, "_verify_output_identity", original_identity
+    )
+    assert resolve_current_report(report_dir) == published.generation_path
+
+
 def test_distinct_artifacts_are_hashed_and_inspected_once(tmp_path, monkeypatch):
     hash_calls = []
     identity_calls = []
-    original_hash = report_module._secure_sha256_file
+    original_hash = report_module._hash_fd
     original_identity = report_module.resolve_pilot_checkpoint_identity
 
-    def counting_hash(path):
-        hash_calls.append(Path(path).resolve())
-        return original_hash(path)
+    def counting_hash(descriptor):
+        stat_result = report_module.os.fstat(descriptor)
+        hash_calls.append((stat_result.st_dev, stat_result.st_ino))
+        return original_hash(descriptor)
 
-    def counting_identity(path):
+    def counting_identity(path, provenance):
         identity_calls.append(Path(path).resolve())
-        return original_identity(path)
+        return original_identity(path, provenance)
 
-    monkeypatch.setattr(report_module, "_secure_sha256_file", counting_hash)
+    monkeypatch.setattr(report_module, "_hash_fd", counting_hash)
     build_comparison(
         _ready_systems(tmp_path),
         tmp_path / "report",

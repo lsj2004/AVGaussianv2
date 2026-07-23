@@ -608,10 +608,14 @@ def _validate_checkpoint_metadata(value: object) -> None:
 def _payload(path: str | Path) -> dict[str, Any]:
     source = Path(path)
     try:
-        descriptor = os.open(
-            source,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-        )
+        parts = source.parts
+        if len(parts) == 5 and parts[:4] == ("/", "proc", "self", "fd"):
+            descriptor = os.dup(int(parts[4]))
+        else:
+            descriptor = os.open(
+                source,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
     except FileNotFoundError:
         raise FileNotFoundError(
             f"pilot checkpoint does not exist: {source}"
