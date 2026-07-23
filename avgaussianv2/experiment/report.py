@@ -3,22 +3,31 @@
 from __future__ import annotations
 
 import csv
+import fcntl
+import hashlib
 import io
 import json
 import math
 import os
 import stat
-import tempfile
-from collections.abc import Mapping, Sequence
+import uuid
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
 
+import torch
+
+from avgaussianv2.experiment.checkpoint import hash_index_manifest
 from avgaussianv2.experiment.contracts import EvaluationResult
 from avgaussianv2.experiment.evaluation import METRIC_NAMES
 from avgaussianv2.experiment.metrics import aggregate_metrics
-from avgaussianv2.experiment.selection import visual_feasible
+from avgaussianv2.experiment.selection import (
+    BestSelector,
+    EarlyStopper,
+    visual_feasible,
+)
 
 
 REQUIRED_SYSTEMS = (
@@ -38,12 +47,6 @@ METRIC_DIRECTIONS = {
 _ROW_METADATA = ("sample_id", "scene_id", "camera", "frame_index", "time_seconds")
 _ROW_FIELDS = set(_ROW_METADATA) | set(METRIC_NAMES)
 _AGGREGATE_FIELDS = set(STATISTICS)
-_PROVENANCE_FIELDS = {
-    "scene_id",
-    "checkpoint_sha256",
-    "checkpoint_generation",
-    "condition_enabled",
-}
 _WORKER_FIELDS = {
     "variant",
     "completed_warmup_steps",
@@ -121,11 +124,30 @@ _EXPECTED_CONDITION = {
 
 
 @dataclass(frozen=True)
+class EvaluationProvenance:
+    scene_id: str
+    checkpoint_path: Path
+    checkpoint_sha256: str
+    checkpoint_generation: int
+    run_fingerprint: Mapping[str, object]
+    evaluation_indices_hash: str
+    condition_enabled: bool
+    evaluation_run_id: str
+
+
+@dataclass(frozen=True)
+class CheckpointArtifactIdentity:
+    checkpoint_kind: str
+    generation: int
+    run_fingerprint: Mapping[str, object]
+
+
+@dataclass(frozen=True)
 class SystemReportInput:
     name: str
     evaluation: EvaluationResult
     worker_summary: Mapping[str, object] | None
-    provenance: Mapping[str, object]
+    provenance: EvaluationProvenance
 
 
 @dataclass(frozen=True)
@@ -141,6 +163,8 @@ class ComparisonResult:
     paired_condition: dict[str, object]
     descriptive_comparisons: dict[str, dict[str, object]]
     decision: PilotDecision
+    content_digest: str
+    generation_path: Path
 
     @property
     def pair_records(self) -> tuple[dict[str, object], ...]:
@@ -190,6 +214,154 @@ def _digest(value: object, name: str) -> str:
     if len(result) != 64 or any(char not in "0123456789abcdef" for char in result):
         raise ValueError(f"{name} must be a lowercase SHA-256 digest")
     return result
+
+
+def _canonical_json(value: object, name: str) -> object:
+    try:
+        return json.loads(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        )
+    except (TypeError, ValueError) as error:
+        raise TypeError(f"{name} must be strict JSON-safe data") from error
+
+
+def _run_fingerprint(value: object, name: str) -> dict[str, object]:
+    mapping = _exact(
+        value, {"algorithm", "sha256", "inputs"}, name
+    )
+    algorithm = _text(mapping["algorithm"], f"{name}.algorithm")
+    digest = _digest(mapping["sha256"], f"{name}.sha256")
+    inputs = _canonical_json(mapping["inputs"], f"{name}.inputs")
+    if not isinstance(inputs, Mapping):
+        raise TypeError(f"{name}.inputs must be a mapping")
+    encoded = json.dumps(
+        inputs, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    if hashlib.sha256(encoded).hexdigest() != digest:
+        raise ValueError(f"{name}.sha256 does not match inputs")
+    return {"algorithm": algorithm, "sha256": digest, "inputs": inputs}
+
+
+def build_evaluation_run_id(
+    *,
+    checkpoint_path: str | Path,
+    checkpoint_sha256: str,
+    checkpoint_generation: int,
+    run_fingerprint: Mapping[str, object],
+    evaluation_indices_hash: str,
+) -> str:
+    """Return the condition-independent identity of one checkpoint evaluation."""
+    if not isinstance(checkpoint_path, (str, Path)):
+        raise TypeError("checkpoint_path must be path-like")
+    payload = {
+        "checkpoint_sha256": _digest(
+            checkpoint_sha256, "checkpoint_sha256"
+        ),
+        "checkpoint_generation": _integer(
+            checkpoint_generation, "checkpoint_generation"
+        ),
+        "run_fingerprint": _run_fingerprint(
+            run_fingerprint, "run_fingerprint"
+        ),
+        "evaluation_indices_hash": _digest(
+            evaluation_indices_hash, "evaluation_indices_hash"
+        ),
+    }
+    return hash_index_manifest(payload)
+
+
+def _secure_sha256_file(path: Path) -> str:
+    try:
+        before = path.lstat()
+    except FileNotFoundError as error:
+        raise FileNotFoundError(f"evaluation artifact does not exist: {path}") from error
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+    ):
+        raise ValueError(
+            f"evaluation artifact must be a single-link non-symlink regular file: {path}"
+        )
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    digest = hashlib.sha256()
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino)
+            != (before.st_dev, before.st_ino)
+        ):
+            raise ValueError(f"evaluation artifact identity changed: {path}")
+        while block := os.read(descriptor, 1024 * 1024):
+            digest.update(block)
+        after = os.fstat(descriptor)
+        if (
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        ) != (
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise ValueError(f"evaluation artifact changed while hashing: {path}")
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
+
+
+def _artifact_identity_tuple(path: Path) -> tuple[int, int, int, int, int]:
+    metadata = path.lstat()
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+    ):
+        raise ValueError(
+            f"evaluation artifact must be a single-link non-symlink regular file: {path}"
+        )
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def resolve_pilot_checkpoint_identity(path: Path) -> CheckpointArtifactIdentity:
+    """Safely load only the checkpoint identity metadata needed by this report."""
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as error:
+        raise ValueError(f"cannot inspect pilot checkpoint identity: {path}") from error
+    if not isinstance(payload, Mapping):
+        raise ValueError("pilot checkpoint identity payload must be a mapping")
+    kind = payload.get("checkpoint_kind")
+    if kind != "best":
+        raise ValueError("pilot evaluation checkpoint must have kind 'best'")
+    generation = _integer(payload.get("generation"), "checkpoint generation")
+    fingerprint = payload.get("run_fingerprint")
+    if not isinstance(fingerprint, Mapping):
+        raise TypeError("checkpoint run_fingerprint must be a mapping")
+    return CheckpointArtifactIdentity(
+        checkpoint_kind=kind,
+        generation=generation,
+        run_fingerprint=_run_fingerprint(
+            fingerprint, "checkpoint run_fingerprint"
+        ),
+    )
 
 
 def _finite_tree(value: object, name: str) -> None:
@@ -334,7 +506,7 @@ def _validate_worker(
     if not isinstance(history, list) or not history:
         raise ValueError(f"{system_name}.training_history must be a nonempty list")
     gradients: list[float] = []
-    previous: dict[str, int] = {}
+    observed_stage_steps: list[tuple[str, int]] = []
     for index, raw_row in enumerate(history):
         row = _exact(
             raw_row,
@@ -345,9 +517,7 @@ def _validate_worker(
         if stage not in {"warmup", "joint"}:
             raise ValueError(f"{system_name} training stage is invalid")
         step = _integer(row["step"], f"{system_name}.training_history[{index}].step", minimum=1)
-        if step <= previous.get(str(stage), 0):
-            raise ValueError(f"{system_name} training steps must increase within stage")
-        previous[str(stage)] = step
+        observed_stage_steps.append((str(stage), step))
         _integer(row["sample_index"], f"{system_name}.training_history[{index}].sample_index")
         _scalar(row["total"], f"{system_name}.training_history[{index}].total")
         gradient = _scalar(
@@ -365,23 +535,22 @@ def _validate_worker(
             row["gradient_norms"],
             f"{system_name}.training_history[{index}].gradient_norms",
         )
-    if len(history) != completed_warmup + completed_joint:
+    expected_stage_steps = [
+        ("warmup", step) for step in range(1, completed_warmup + 1)
+    ] + [
+        ("joint", step) for step in range(1, completed_joint + 1)
+    ]
+    if observed_stage_steps != expected_stage_steps:
         raise ValueError(
-            f"{system_name}.training_history length does not match completed steps"
-        )
-    if sum(row["stage"] == "warmup" for row in history) != completed_warmup:
-        raise ValueError(
-            f"{system_name}.training_history warmup count does not match completed steps"
-        )
-    if sum(row["stage"] == "joint" for row in history) != completed_joint:
-        raise ValueError(
-            f"{system_name}.training_history joint count does not match completed steps"
+            f"{system_name}.training_history must contain contiguous warmup then "
+            "joint stage steps matching completed counts"
         )
 
     validation_history = value["validation_history"]
     if not isinstance(validation_history, list):
         raise TypeError(f"{system_name}.validation_history must be a list")
     validation_steps: list[int] = []
+    validated_validations: list[dict[str, object]] = []
     for index, raw_validation in enumerate(validation_history):
         validation = _exact(
             raw_validation,
@@ -401,19 +570,24 @@ def _validate_worker(
             set(METRIC_NAMES),
             f"{system_name}.validation_history[{index}].summary metric",
         )
+        normalized_summary: dict[str, dict[str, float]] = {}
         for metric in METRIC_NAMES:
             aggregate = _exact(
                 summary[metric],
                 _AGGREGATE_FIELDS,
                 f"{system_name}.validation_history[{index}].summary.{metric} aggregate",
             )
+            normalized_summary[metric] = {}
             for statistic in STATISTICS:
-                _metric_value(
+                normalized_summary[metric][statistic] = _metric_value(
                     metric,
                     aggregate[statistic],
                     f"{system_name}.validation_history[{index}].summary."
                     f"{metric}.{statistic}",
                 )
+        validated_validations.append(
+            {"step": step, "summary": normalized_summary}
+        )
     if validation_steps != sorted(set(validation_steps)):
         raise ValueError(f"{system_name} validation steps must strictly increase")
     if best_step not in validation_steps:
@@ -483,6 +657,52 @@ def _validate_worker(
     )
     if stopper_last != selector_last:
         raise ValueError(f"{system_name} stopper last_step mismatch")
+    replay_selector = BestSelector(
+        selector["visual_baseline"],
+        selector["psnr_tolerance_db"],
+        selector["ssim_tolerance"],
+    )
+    replay_stopper = EarlyStopper(
+        stopper["minimum_steps"],
+        stopper["patience"],
+        stopper["relative_delta"],
+    )
+    replay_should_stop = False
+    for validation_index, validation in enumerate(validated_validations):
+        replay_selector.consider(validation["step"], validation["summary"])
+        replay_should_stop = replay_stopper.update(
+            validation["step"],
+            validation["summary"]["audio_total"]["mean"],
+        )
+        if (
+            replay_should_stop
+            and validation_index != len(validated_validations) - 1
+        ):
+            raise ValueError(
+                f"{system_name} validation history continues after early stop"
+            )
+    if replay_selector.state_dict() != dict(selector):
+        raise ValueError(f"{system_name} selector_state does not replay")
+    if replay_stopper.state_dict() != dict(stopper):
+        raise ValueError(f"{system_name} stopper_state does not replay")
+    expected_stop_reason = "early_stop" if replay_should_stop else "max_steps"
+    if stop_reason != expected_stop_reason:
+        raise ValueError(f"{system_name} stop_reason does not replay")
+    replay_best_step = replay_selector.best_step
+    if replay_best_step != best_step:
+        raise ValueError(f"{system_name} replayed best_step mismatch")
+    best_validation = next(
+        validation
+        for validation in validated_validations
+        if validation["step"] == best_step
+    )
+    quick_best_summary = best_validation["summary"]
+    quick_best_visual_feasible = visual_feasible(
+        quick_best_summary,
+        selector["visual_baseline"],
+        selector["psnr_tolerance_db"],
+        selector["ssim_tolerance"],
+    )
     checkpoint_io = _exact(
         value["checkpoint_io"],
         _CHECKPOINT_IO_FIELDS,
@@ -534,28 +754,105 @@ def _validate_worker(
         "max_audio_to_visual_grad_norm": max(gradients),
         "config_sha256": identity["config_sha256"],
         "manifest_sha256": identity["manifest_sha256"],
+        "quick_best_summary": quick_best_summary,
+        "quick_visual_baseline": selector["visual_baseline"],
+        "quick_psnr_tolerance_db": selector["psnr_tolerance_db"],
+        "quick_ssim_tolerance": selector["ssim_tolerance"],
+        "quick_best_visual_feasible": quick_best_visual_feasible,
     }
 
 
 def _validate_provenance(
-    value: object, system_name: str
+    value: object,
+    system_name: str,
+    *,
+    hash_cache: dict[Path, tuple[str, tuple[int, int, int, int, int]]],
+    identity_cache: dict[Path, CheckpointArtifactIdentity],
+    checkpoint_identity_resolver: Callable[[Path], CheckpointArtifactIdentity],
 ) -> dict[str, object]:
-    source = _exact(value, _PROVENANCE_FIELDS, f"{system_name} provenance")
-    condition = source["condition_enabled"]
+    if not isinstance(value, EvaluationProvenance):
+        raise TypeError(
+            f"{system_name} provenance must be an EvaluationProvenance"
+        )
+    condition = value.condition_enabled
     if not isinstance(condition, bool):
         raise TypeError(f"{system_name}.condition_enabled must be boolean")
     if condition != _EXPECTED_CONDITION[system_name]:
         raise ValueError(f"{system_name} condition_enabled mismatch")
+    scene_id = _text(value.scene_id, f"{system_name}.scene_id")
+    if not isinstance(value.checkpoint_path, Path):
+        raise TypeError(f"{system_name}.checkpoint_path must be a Path")
+    artifact_path = Path(os.path.abspath(value.checkpoint_path))
+    expected_sha = _digest(
+        value.checkpoint_sha256, f"{system_name}.checkpoint_sha256"
+    )
+    before_identity = _artifact_identity_tuple(artifact_path)
+    resolved_path = artifact_path.resolve(strict=True)
+    cached = hash_cache.get(resolved_path)
+    if cached is None:
+        actual_sha = _secure_sha256_file(artifact_path)
+        after_hash_identity = _artifact_identity_tuple(artifact_path)
+        if after_hash_identity != before_identity:
+            raise ValueError(f"{system_name} checkpoint identity changed while hashing")
+        hash_cache[resolved_path] = (actual_sha, after_hash_identity)
+    else:
+        actual_sha, cached_identity = cached
+        if before_identity != cached_identity:
+            raise ValueError(f"{system_name} checkpoint identity changed between uses")
+    if actual_sha != expected_sha:
+        raise ValueError(f"{system_name} checkpoint SHA-256 mismatch")
+    generation = _integer(
+        value.checkpoint_generation,
+        f"{system_name}.checkpoint_generation",
+    )
+    fingerprint = _run_fingerprint(
+        value.run_fingerprint, f"{system_name}.run_fingerprint"
+    )
+    indices_hash = _digest(
+        value.evaluation_indices_hash,
+        f"{system_name}.evaluation_indices_hash",
+    )
+    expected_run_id = build_evaluation_run_id(
+        checkpoint_path=resolved_path,
+        checkpoint_sha256=actual_sha,
+        checkpoint_generation=generation,
+        run_fingerprint=fingerprint,
+        evaluation_indices_hash=indices_hash,
+    )
+    run_id = _digest(value.evaluation_run_id, f"{system_name}.evaluation_run_id")
+    if run_id != expected_run_id:
+        raise ValueError(f"{system_name} evaluation_run_id mismatch")
+    if system_name != "baseline_imported":
+        identity = identity_cache.get(resolved_path)
+        if identity is None:
+            identity = checkpoint_identity_resolver(artifact_path)
+            if not isinstance(identity, CheckpointArtifactIdentity):
+                raise TypeError(
+                    "checkpoint identity resolver must return "
+                    "CheckpointArtifactIdentity"
+                )
+            identity_cache[resolved_path] = identity
+        if _artifact_identity_tuple(artifact_path) != hash_cache[resolved_path][1]:
+            raise ValueError(
+                f"{system_name} checkpoint changed during metadata inspection"
+            )
+        if identity.checkpoint_kind != "best":
+            raise ValueError(f"{system_name} checkpoint kind must be best")
+        if identity.generation != generation:
+            raise ValueError(f"{system_name} checkpoint generation mismatch")
+        if _run_fingerprint(
+            identity.run_fingerprint, "resolved checkpoint run_fingerprint"
+        ) != fingerprint:
+            raise ValueError(f"{system_name} checkpoint run_fingerprint mismatch")
     return {
-        "scene_id": _text(source["scene_id"], f"{system_name}.scene_id"),
-        "checkpoint_sha256": _digest(
-            source["checkpoint_sha256"], f"{system_name}.checkpoint_sha256"
-        ),
-        "checkpoint_generation": _integer(
-            source["checkpoint_generation"],
-            f"{system_name}.checkpoint_generation",
-        ),
+        "scene_id": scene_id,
+        "checkpoint_path": str(resolved_path),
+        "checkpoint_sha256": actual_sha,
+        "checkpoint_generation": generation,
+        "run_fingerprint": fingerprint,
+        "evaluation_indices_hash": indices_hash,
         "condition_enabled": condition,
+        "evaluation_run_id": run_id,
     }
 
 
@@ -630,6 +927,10 @@ def paired_audio_deltas(
 
 def _normalize_systems(
     systems: Sequence[SystemReportInput],
+    *,
+    checkpoint_identity_resolver: Callable[
+        [Path], CheckpointArtifactIdentity
+    ] = resolve_pilot_checkpoint_identity,
 ) -> tuple[
     dict[str, dict[str, object]],
     dict[str, tuple[dict[str, object], ...]],
@@ -649,10 +950,20 @@ def _normalize_systems(
     by_name = {item.name: item for item in systems}
     normalized: dict[str, dict[str, object]] = {}
     rows: dict[str, tuple[dict[str, object], ...]] = {}
+    hash_cache: dict[
+        Path, tuple[str, tuple[int, int, int, int, int]]
+    ] = {}
+    identity_cache: dict[Path, CheckpointArtifactIdentity] = {}
     for name in REQUIRED_SYSTEMS:
         item = by_name[name]
         summary, system_rows = _validate_evaluation(item.evaluation, name)
-        provenance = _validate_provenance(item.provenance, name)
+        provenance = _validate_provenance(
+            item.provenance,
+            name,
+            hash_cache=hash_cache,
+            identity_cache=identity_cache,
+            checkpoint_identity_resolver=checkpoint_identity_resolver,
+        )
         if any(row["scene_id"] != provenance["scene_id"] for row in system_rows):
             raise ValueError(
                 f"{name} row scene_id does not match provenance scene_id"
@@ -693,14 +1004,21 @@ def _normalize_systems(
     on_provenance = normalized["joint_conditioned_on"]["provenance"]
     off_provenance = normalized["joint_conditioned_off"]["provenance"]
     if (
+        on_provenance["checkpoint_path"]
+        != off_provenance["checkpoint_path"]
+        or
         on_provenance["checkpoint_sha256"]
         != off_provenance["checkpoint_sha256"]
         or on_provenance["checkpoint_generation"]
         != off_provenance["checkpoint_generation"]
+        or on_provenance["run_fingerprint"]
+        != off_provenance["run_fingerprint"]
+        or on_provenance["evaluation_run_id"]
+        != off_provenance["evaluation_run_id"]
     ):
         raise ValueError(
-            "joint_conditioned_on/off must use the same checkpoint SHA-256 "
-            "and checkpoint generation"
+            "joint_conditioned_on/off must use the same actual checkpoint path, "
+            "SHA-256, generation, run fingerprint, and evaluation_run_id"
         )
     trained_workers = [
         normalized[name]["worker"] for name in REQUIRED_SYSTEMS[1:]
@@ -721,26 +1039,32 @@ def _decide_normalized(
         return PilotDecision(False, ("required five-system comparison is incomplete",))
     reasons: list[str] = []
     try:
-        baseline = systems["baseline_imported"]["summary"]
         joint = systems["joint_conditioned_on"]
         joint_summary = joint["summary"]
         off_summary = systems["joint_conditioned_off"]["summary"]
+        worker = joint["worker"]
+        quick_summary = worker["quick_best_summary"]
+        quick_baseline = worker["quick_visual_baseline"]
+        psnr_tolerance = worker["quick_psnr_tolerance_db"]
+        ssim_tolerance = worker["quick_ssim_tolerance"]
         psnr_drop = (
-            baseline["rgb_psnr"]["mean"] - joint_summary["rgb_psnr"]["mean"]
+            quick_baseline["rgb_psnr"]["mean"]
+            - quick_summary["rgb_psnr"]["mean"]
         )
         ssim_drop = (
-            baseline["rgb_ssim"]["mean"] - joint_summary["rgb_ssim"]["mean"]
+            quick_baseline["rgb_ssim"]["mean"]
+            - quick_summary["rgb_ssim"]["mean"]
         )
         if (
-            joint_summary["rgb_psnr"]["mean"]
-            < baseline["rgb_psnr"]["mean"] - 0.5
+            quick_summary["rgb_psnr"]["mean"]
+            < quick_baseline["rgb_psnr"]["mean"] - psnr_tolerance
         ):
             reasons.append(
                 "joint_conditioned_on PSNR drop exceeds 0.5 dB"
             )
         if (
-            joint_summary["rgb_ssim"]["mean"]
-            < baseline["rgb_ssim"]["mean"] - 0.01
+            quick_summary["rgb_ssim"]["mean"]
+            < quick_baseline["rgb_ssim"]["mean"] - ssim_tolerance
         ):
             reasons.append(
                 "joint_conditioned_on SSIM drop exceeds 0.01"
@@ -759,6 +1083,8 @@ def _decide_normalized(
             joint_summary["audio_total"]["mean"],
             off_summary["audio_total"]["mean"],
             paired_condition["median"],
+            psnr_tolerance,
+            ssim_tolerance,
         )
         if not all(math.isfinite(float(value)) for value in finite_gate_values):
             raise ValueError("nonfinite decision input")
@@ -766,7 +1092,6 @@ def _decide_normalized(
             reasons.append(
                 "paired audio_total median delta is not strictly negative"
             )
-        worker = joint["worker"]
         if worker is None or not (
             worker["max_audio_to_visual_grad_norm"] > 0
         ):
@@ -814,8 +1139,19 @@ def _system_output(
             "summary": summary,
             "deltas_vs_baseline": deltas,
             "metric_directions": dict(METRIC_DIRECTIONS),
-            "visual_feasible": visual_feasible(summary, baseline, 0.5, 0.01),
-            "provenance": source["provenance"],
+            "acceptance_visual_feasible": (
+                None
+                if source["worker"] is None
+                else source["worker"]["quick_best_visual_feasible"]
+            ),
+            "full_split_visual_feasible": visual_feasible(
+                summary, baseline, 0.5, 0.01
+            ),
+            "provenance": {
+                key: value
+                for key, value in source["provenance"].items()
+                if key != "checkpoint_path"
+            },
             "worker": source["worker"],
         }
     return result
@@ -858,7 +1194,8 @@ def _csv_text(systems: Mapping[str, Mapping[str, object]]) -> str:
             )
     fields.extend(
         (
-            "visual_feasible",
+            "acceptance_visual_feasible",
+            "full_split_visual_feasible",
             "completed_joint_steps",
             "best_step",
             "stop_reason",
@@ -882,7 +1219,14 @@ def _csv_text(systems: Mapping[str, Mapping[str, object]]) -> str:
                 )
         worker = system["worker"]
         row.update(
-            visual_feasible=str(system["visual_feasible"]).lower(),
+            acceptance_visual_feasible=(
+                ""
+                if system["acceptance_visual_feasible"] is None
+                else str(system["acceptance_visual_feasible"]).lower()
+            ),
+            full_split_visual_feasible=str(
+                system["full_split_visual_feasible"]
+            ).lower(),
             completed_joint_steps="" if worker is None else worker["completed_joint_steps"],
             best_step="" if worker is None else worker["best_step"],
             stop_reason="" if worker is None else worker["stop_reason"],
@@ -914,8 +1258,8 @@ def _markdown_text(
         "Every baseline delta is system minus imported baseline.",
         "",
         "| System | Audio total mean | Δ baseline | PSNR mean | Δ baseline | "
-        "SSIM mean | Δ baseline | Visual feasible | Stop |",
-        "|---|---:|---:|---:|---:|---:|---:|:---:|---|",
+        "SSIM mean | Δ baseline | Quick-best feasible | Full-split feasible | Stop |",
+        "|---|---:|---:|---:|---:|---:|---:|:---:|:---:|---|",
     ]
     for name in REQUIRED_SYSTEMS:
         system = systems[name]
@@ -934,7 +1278,8 @@ def _markdown_text(
             f"{deltas['rgb_psnr']['mean']:.12g} | "
             f"{summary['rgb_ssim']['mean']:.12g} | "
             f"{deltas['rgb_ssim']['mean']:.12g} | "
-            f"{str(system['visual_feasible']).lower()} | {stop} |"
+            f"{str(system['acceptance_visual_feasible']).lower()} | "
+            f"{str(system['full_split_visual_feasible']).lower()} | {stop} |"
         )
     joint = systems["joint_conditioned_on"]
     frozen = systems["frozen_visual_on"]
@@ -944,8 +1289,9 @@ def _markdown_text(
             "",
             "## Visual constraint and paired conditioning",
             "",
-            "The joint conditioned system must remain within a 0.5 dB PSNR drop "
-            "and a 0.01 SSIM drop from baseline.",
+            "The acceptance gate uses the joint worker's replayed quick-validation "
+            "best step and its stored baseline/tolerances. Full-split visual "
+            "feasibility is descriptive only and is never an additional gate.",
             f"Paired on-minus-off audio_total: mean {paired['mean']:.12g}, "
             f"median {paired['median']:.12g}, std {paired['std']:.12g}, "
             f"n={paired['sample_count']}. Negative means conditioning improves.",
@@ -976,103 +1322,451 @@ def _markdown_text(
     return "\n".join(lines)
 
 
-def _stage(path: Path, content: str) -> Path:
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+_REPORT_FILES = (
+    "comparison.json",
+    "comparison.csv",
+    "comparison.md",
+    "paired_condition_deltas.jsonl",
+)
+_GENERATION_MANIFEST = "generation_manifest.json"
+
+
+def _open_secure_directory(path: Path, *, create: bool) -> tuple[int, Path]:
+    absolute = Path(os.path.abspath(path))
+    descriptor = os.open(
+        "/",
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
     )
-    temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+        for part in absolute.parts[1:]:
+            if create:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+            next_descriptor = os.open(
+                part,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor, absolute
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_or_create_directory(parent_fd: int, name: str) -> int:
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    return os.open(
+        name,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_fd,
+    )
+
+
+def _open_lock(output_fd: int) -> int:
+    descriptor = os.open(
+        ".report.lock",
+        os.O_CREAT
+        | os.O_RDWR
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=output_fd,
+    )
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        os.close(descriptor)
+        raise ValueError("report lock must be a single-link regular file")
+    return descriptor
+
+
+def _hash_fd(descriptor: int) -> str:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    while block := os.read(descriptor, 1024 * 1024):
+        digest.update(block)
+    return digest.hexdigest()
+
+
+def _write_generation_file(
+    generation_fd: int, name: str, content: bytes
+) -> None:
+    descriptor = os.open(
+        name,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=generation_fd,
+    )
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-    return temporary
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
+            os.fchmod(stream.fileno(), 0o400)
     finally:
         os.close(descriptor)
 
 
-def _publish(output_dir: Path, contents: Mapping[str, str]) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    metadata = output_dir.lstat()
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise ValueError("report output must be a non-symlink directory")
-    ordered = (
-        "paired_condition_deltas.jsonl",
-        "comparison.csv",
-        "comparison.json",
-        "comparison.md",
+def _read_regular_file(directory_fd: int, name: str) -> bytes:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory_fd,
     )
-    staged: dict[str, Path] = {}
-    backups: dict[str, Path] = {}
-    installed: list[str] = []
     try:
-        for name in ordered:
-            destination = output_dir / name
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError(f"report generation file is unsafe: {name}")
+        chunks: list[bytes] = []
+        while block := os.read(descriptor, 1024 * 1024):
+            chunks.append(block)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _generation_metadata(contents: Mapping[str, bytes]) -> dict[str, object]:
+    hashes = {
+        name: hashlib.sha256(contents[name]).hexdigest()
+        for name in _REPORT_FILES
+    }
+    content_digest = hash_index_manifest(
+        {
+            "schema": "avgaussianv2.pilot-report-generation",
+            "version": 1,
+            "files": hashes,
+        }
+    )
+    return {
+        "schema": "avgaussianv2.pilot-report-generation",
+        "version": 1,
+        "content_digest": content_digest,
+        "files": hashes,
+    }
+
+
+def _verify_generation(generation_fd: int, expected_digest: str) -> None:
+    manifest_data = _read_regular_file(generation_fd, _GENERATION_MANIFEST)
+    try:
+        manifest = json.loads(
+            manifest_data.decode("utf-8"),
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON constant {token}")
+            ),
+        )
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid report generation manifest") from error
+    manifest = _exact(
+        manifest,
+        {"schema", "version", "content_digest", "files"},
+        "report generation manifest",
+    )
+    if (
+        manifest["schema"] != "avgaussianv2.pilot-report-generation"
+        or manifest["version"] != 1
+        or manifest["content_digest"] != expected_digest
+    ):
+        raise ValueError("report generation manifest identity mismatch")
+    hashes = _exact(
+        manifest["files"], set(_REPORT_FILES), "report generation hashes"
+    )
+    for name in _REPORT_FILES:
+        data = _read_regular_file(generation_fd, name)
+        if hashlib.sha256(data).hexdigest() != _digest(
+            hashes[name], f"generation hash for {name}"
+        ):
+            raise ValueError(f"report generation hash mismatch: {name}")
+
+
+def _remove_temporary_generation(generations_fd: int, name: str) -> None:
+    try:
+        generation_fd = os.open(
+            name,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=generations_fd,
+        )
+    except FileNotFoundError:
+        return
+    try:
+        os.fchmod(generation_fd, 0o700)
+        for child in (*_REPORT_FILES, _GENERATION_MANIFEST):
             try:
-                existing = destination.lstat()
+                os.unlink(child, dir_fd=generation_fd)
             except FileNotFoundError:
                 pass
-            else:
-                if (
-                    stat.S_ISLNK(existing.st_mode)
-                    or not stat.S_ISREG(existing.st_mode)
-                    or existing.st_nlink != 1
-                ):
-                    raise ValueError(
-                        f"report destination must be a single-link regular file: {name}"
-                    )
-            staged[name] = _stage(destination, contents[name])
-            if destination.exists():
-                backup = _stage(destination, destination.read_text(encoding="utf-8"))
-                backups[name] = backup
-        _fsync_directory(output_dir)
-        for name in ordered:
-            os.replace(staged[name], output_dir / name)
-            installed.append(name)
-        _fsync_directory(output_dir)
-    except BaseException:
-        for name in reversed(installed):
-            destination = output_dir / name
-            backup = backups.get(name)
-            if backup is None:
-                destination.unlink(missing_ok=True)
-            else:
-                os.replace(backup, destination)
-        _fsync_directory(output_dir)
-        raise
     finally:
-        for temporary in (*staged.values(), *backups.values()):
-            temporary.unlink(missing_ok=True)
+        os.close(generation_fd)
+    os.rmdir(name, dir_fd=generations_fd)
+
+
+def _cleanup_stale_generations(generations_fd: int) -> None:
+    for name in os.listdir(generations_fd):
+        if name.startswith(".") and name.endswith(".tmp"):
+            _remove_temporary_generation(generations_fd, name)
+
+
+def _cleanup_stale_output_entries(output_fd: int) -> None:
+    discovery_prefixes = tuple(f".{name}." for name in _REPORT_FILES)
+    for name in os.listdir(output_fd):
+        is_pointer_temp = name.startswith(".current.") and name.endswith(".tmp")
+        is_discovery_temp = (
+            name.endswith(".tmp")
+            and any(name.startswith(prefix) for prefix in discovery_prefixes)
+        )
+        if not (is_pointer_temp or is_discovery_temp):
+            continue
+        metadata = os.stat(name, dir_fd=output_fd, follow_symlinks=False)
+        if not stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"unsafe stale report temporary entry: {name}")
+        os.unlink(name, dir_fd=output_fd)
+
+
+def _current_pointer_state(
+    output_fd: int,
+) -> tuple[int, int, str] | None:
+    try:
+        metadata = os.stat("current", dir_fd=output_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISLNK(metadata.st_mode):
+        raise ValueError("report current pointer must be a symlink")
+    target = os.readlink("current", dir_fd=output_fd)
+    prefix = ".report-generations/"
+    if not target.startswith(prefix) or "/" in target[len(prefix):]:
+        raise ValueError("report current pointer is unsafe")
+    _digest(target[len(prefix):], "current generation digest")
+    return metadata.st_dev, metadata.st_ino, target
+
+
+def _verify_output_identity(output_fd: int, absolute_output: Path) -> None:
+    pinned = os.fstat(output_fd)
+    try:
+        current = absolute_output.lstat()
+    except FileNotFoundError as error:
+        raise ValueError("report output directory was replaced") from error
+    if (
+        stat.S_ISLNK(current.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or (current.st_dev, current.st_ino)
+        != (pinned.st_dev, pinned.st_ino)
+    ):
+        raise ValueError("report output directory identity changed")
+
+
+def _ensure_discovery_symlinks(output_fd: int) -> None:
+    for name in _REPORT_FILES:
+        expected = f"current/{name}"
+        try:
+            actual = os.readlink(name, dir_fd=output_fd)
+        except FileNotFoundError:
+            temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+            try:
+                os.symlink(expected, temporary, dir_fd=output_fd)
+                os.rename(
+                    temporary,
+                    name,
+                    src_dir_fd=output_fd,
+                    dst_dir_fd=output_fd,
+                )
+            finally:
+                try:
+                    os.unlink(temporary, dir_fd=output_fd)
+                except FileNotFoundError:
+                    pass
+        else:
+            if actual != expected:
+                raise ValueError(f"unsafe report discovery link: {name}")
+
+
+def _publish_generation(
+    output_dir: Path, contents: Mapping[str, str]
+) -> tuple[str, Path]:
+    encoded = {name: contents[name].encode("utf-8") for name in _REPORT_FILES}
+    metadata = _generation_metadata(encoded)
+    digest = str(metadata["content_digest"])
+    output_fd, absolute_output = _open_secure_directory(output_dir, create=True)
+    lock_fd: int | None = None
+    generations_fd: int | None = None
+    temporary_name: str | None = None
+    pointer_temporary: str | None = None
+    try:
+        lock_fd = _open_lock(output_fd)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        _cleanup_stale_output_entries(output_fd)
+        desired_target = f".report-generations/{digest}"
+        previous_pointer = _current_pointer_state(output_fd)
+        generations_fd = _open_or_create_directory(
+            output_fd, ".report-generations"
+        )
+        _cleanup_stale_generations(generations_fd)
+        try:
+            existing_fd = os.open(
+                digest,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=generations_fd,
+            )
+        except FileNotFoundError:
+            temporary_name = f".{digest}.{uuid.uuid4().hex}.tmp"
+            os.mkdir(temporary_name, mode=0o700, dir_fd=generations_fd)
+            generation_fd = os.open(
+                temporary_name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=generations_fd,
+            )
+            try:
+                for name in _REPORT_FILES:
+                    _write_generation_file(generation_fd, name, encoded[name])
+                manifest_text = _json_text(metadata).encode("utf-8")
+                _write_generation_file(
+                    generation_fd, _GENERATION_MANIFEST, manifest_text
+                )
+                os.fsync(generation_fd)
+                os.fchmod(generation_fd, 0o500)
+            finally:
+                os.close(generation_fd)
+            os.rename(
+                temporary_name,
+                digest,
+                src_dir_fd=generations_fd,
+                dst_dir_fd=generations_fd,
+            )
+            temporary_name = None
+            os.fsync(generations_fd)
+            existing_fd = os.open(
+                digest,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=generations_fd,
+            )
+        try:
+            _verify_generation(existing_fd, digest)
+        finally:
+            os.close(existing_fd)
+        _ensure_discovery_symlinks(output_fd)
+        if _current_pointer_state(output_fd) != previous_pointer:
+            raise ValueError("report current pointer identity changed during publication")
+        _verify_output_identity(output_fd, absolute_output)
+        pointer_temporary = f".current.{uuid.uuid4().hex}.tmp"
+        os.symlink(
+            desired_target,
+            pointer_temporary,
+            dir_fd=output_fd,
+        )
+        os.rename(
+            pointer_temporary,
+            "current",
+            src_dir_fd=output_fd,
+            dst_dir_fd=output_fd,
+        )
+        pointer_temporary = None
+        os.fsync(output_fd)
+        _verify_output_identity(output_fd, absolute_output)
+    finally:
+        if pointer_temporary is not None:
+            try:
+                os.unlink(pointer_temporary, dir_fd=output_fd)
+            except FileNotFoundError:
+                pass
+        if temporary_name is not None and generations_fd is not None:
+            _remove_temporary_generation(generations_fd, temporary_name)
+        if generations_fd is not None:
+            os.close(generations_fd)
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+        os.close(output_fd)
+    generation_path = absolute_output / ".report-generations" / digest
+    resolved = resolve_current_report(absolute_output)
+    if resolved != generation_path:
+        raise RuntimeError("published report generation did not become current")
+    return digest, generation_path
+
+
+def resolve_current_report(output_dir: str | Path) -> Path:
+    """Pin and verify the authoritative immutable report generation."""
+    output_fd, absolute_output = _open_secure_directory(
+        Path(output_dir), create=False
+    )
+    lock_fd = _open_lock(output_fd)
+    generation_fd: int | None = None
+    generations_fd: int | None = None
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_SH)
+        try:
+            target = os.readlink("current", dir_fd=output_fd)
+        except FileNotFoundError as error:
+            raise ValueError("report has no authoritative current generation") from error
+        prefix = ".report-generations/"
+        if not target.startswith(prefix) or "/" in target[len(prefix):]:
+            raise ValueError("report current pointer is unsafe")
+        digest = _digest(target[len(prefix):], "current generation digest")
+        generations_fd = os.open(
+            ".report-generations",
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=output_fd,
+        )
+        generation_fd = os.open(
+            digest,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=generations_fd,
+        )
+        _verify_generation(generation_fd, digest)
+        _verify_output_identity(output_fd, absolute_output)
+        return absolute_output / target
+    finally:
+        if generation_fd is not None:
+            os.close(generation_fd)
+        if generations_fd is not None:
+            os.close(generations_fd)
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+        os.close(output_fd)
 
 
 def build_comparison(
     systems: Sequence[SystemReportInput],
     output_dir: str | Path,
+    *,
+    checkpoint_identity_resolver: Callable[
+        [Path], CheckpointArtifactIdentity
+    ] = resolve_pilot_checkpoint_identity,
 ) -> ComparisonResult:
     """Validate five systems, decide acceptance, and atomically publish reports."""
-    normalized, rows = _normalize_systems(systems)
+    normalized, rows = _normalize_systems(
+        systems,
+        checkpoint_identity_resolver=checkpoint_identity_resolver,
+    )
     paired = paired_audio_deltas(
         rows["joint_conditioned_on"], rows["joint_conditioned_off"]
     )
     output_systems = _system_output(normalized)
     descriptive = _descriptive_comparisons(output_systems)
     decision = _decide_normalized(output_systems, paired)
-    result = ComparisonResult(
-        systems=output_systems,
-        rows=rows,
-        paired_condition=paired,
-        descriptive_comparisons=descriptive,
-        decision=decision,
-    )
     json_payload: dict[str, Any] = {
         "schema": "avgaussianv2.pilot-comparison",
         "version": 1,
@@ -1088,7 +1782,7 @@ def build_comparison(
     paired_jsonl = "".join(
         _json_text(record, indent=None) for record in paired["records"]
     )
-    _publish(
+    digest, generation_path = _publish_generation(
         Path(output_dir),
         {
             "comparison.json": _json_text(json_payload),
@@ -1099,15 +1793,28 @@ def build_comparison(
             "paired_condition_deltas.jsonl": paired_jsonl,
         },
     )
-    return result
+    return ComparisonResult(
+        systems=output_systems,
+        rows=rows,
+        paired_condition=paired,
+        descriptive_comparisons=descriptive,
+        decision=decision,
+        content_digest=digest,
+        generation_path=generation_path,
+    )
 
 
 __all__ = [
     "ComparisonResult",
+    "CheckpointArtifactIdentity",
+    "EvaluationProvenance",
     "PilotDecision",
     "REQUIRED_SYSTEMS",
     "SystemReportInput",
     "build_comparison",
+    "build_evaluation_run_id",
     "decide_long_training",
     "paired_audio_deltas",
+    "resolve_current_report",
+    "resolve_pilot_checkpoint_identity",
 ]

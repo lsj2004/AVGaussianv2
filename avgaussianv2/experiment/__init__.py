@@ -19,13 +19,18 @@ from avgaussianv2.experiment.checkpoint import (
     validate_compatibility,
 )
 from avgaussianv2.experiment.report import (
+    CheckpointArtifactIdentity,
     ComparisonResult,
+    EvaluationProvenance,
     PilotDecision,
     REQUIRED_SYSTEMS,
     SystemReportInput,
     build_comparison,
+    build_evaluation_run_id,
     decide_long_training,
     paired_audio_deltas,
+    resolve_current_report,
+    resolve_pilot_checkpoint_identity,
 )
 
 __all__ = [
@@ -46,11 +51,16 @@ __all__ = [
     "hash_index_manifest",
     "sha256_file",
     "validate_compatibility",
+    "CheckpointArtifactIdentity",
     "ComparisonResult",
+    "EvaluationProvenance",
     "PilotDecision",
     "REQUIRED_SYSTEMS",
     "SystemReportInput",
     "build_comparison",
+    "build_evaluation_run_id",
     "decide_long_training",
     "paired_audio_deltas",
+    "resolve_current_report",
+    "resolve_pilot_checkpoint_identity",
 ]
