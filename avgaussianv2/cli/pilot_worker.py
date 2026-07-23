@@ -16,12 +16,14 @@ from typing import Any
 
 import numpy as np
 import torch
+from torch import nn
 
 from avgaussianv2.config import ProjectConfig, load_project_config
 from avgaussianv2.experiment.checkpoint import (
     PilotCheckpointStore,
     PilotCompatibility,
     PilotResumeError,
+    build_run_fingerprint,
     hash_index_manifest,
     inspect_pilot_checkpoint,
     sha256_file,
@@ -31,12 +33,18 @@ from avgaussianv2.experiment.contracts import (
     SharedIndices,
     Variant,
 )
-from avgaussianv2.experiment.evaluation import Evaluator
+from avgaussianv2.experiment.evaluation import METRIC_NAMES, Evaluator
 from avgaussianv2.experiment.training import PilotTrainer, PilotTrainingResult
+from avgaussianv2.train import (
+    build_joint_optimizer,
+    build_warmup_optimizer,
+    condition_warmup_step,
+    joint_train_step,
+)
 
 
 MANIFEST_SCHEMA = "avgaussianv2.single-gpu-pilot-worker"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 _ROOT_FIELDS = {
     "schema",
     "version",
@@ -48,6 +56,7 @@ _ROOT_FIELDS = {
     "source_hashes",
     "compatibility",
     "component_identities",
+    "runtime_identity",
     "dataset_lengths",
     "visual_baseline",
 }
@@ -68,6 +77,8 @@ _COMPONENT_IDENTITY_FIELDS = {
     "joint_step_fn",
     "audio_loss_fn",
 }
+_AGGREGATE_FIELDS = {"mean", "std", "median"}
+_NONNEGATIVE_BASELINE_METRICS = set(METRIC_NAMES) - {"rgb_ssim"}
 
 
 def _exact(value: object, expected: set[str], name: str) -> Mapping[str, object]:
@@ -163,6 +174,50 @@ def _pilot_config(value: object) -> PilotConfig:
     return result
 
 
+def _visual_baseline_summary(value: object, name: str) -> dict[str, object]:
+    summary = _exact(value, set(METRIC_NAMES), f"{name} metric")
+    result: dict[str, object] = {}
+    for metric in METRIC_NAMES:
+        aggregate = _exact(
+            summary[metric],
+            _AGGREGATE_FIELDS,
+            f"{name}.{metric} aggregate",
+        )
+        values: dict[str, float] = {}
+        for statistic in ("mean", "std", "median"):
+            raw = aggregate[statistic]
+            if not isinstance(raw, Real) or isinstance(raw, bool):
+                raise TypeError(
+                    f"{name}.{metric}.{statistic} must be a numeric real"
+                )
+            number = float(raw)
+            if not math.isfinite(number):
+                raise ValueError(f"{name}.{metric}.{statistic} must be finite")
+            values[statistic] = number
+        if values["std"] < 0:
+            raise ValueError(f"{name}.{metric}.std must be nonnegative")
+        if metric in _NONNEGATIVE_BASELINE_METRICS:
+            for statistic in ("mean", "median"):
+                if values[statistic] < 0:
+                    raise ValueError(
+                        f"{name}.{metric}.{statistic} must be nonnegative"
+                    )
+        if metric == "rgb_l1":
+            for statistic in ("mean", "median"):
+                if values[statistic] > 1:
+                    raise ValueError(
+                        f"{name}.rgb_l1.{statistic} must be at most 1"
+                    )
+        if metric == "rgb_ssim":
+            for statistic in ("mean", "median"):
+                if not -1 <= values[statistic] <= 1:
+                    raise ValueError(
+                        f"{name}.rgb_ssim.{statistic} must be in [-1, 1]"
+                    )
+        result[metric] = values
+    return result
+
+
 @dataclass(frozen=True)
 class WorkerManifest:
     path: Path
@@ -175,6 +230,8 @@ class WorkerManifest:
     source_hashes: dict[str, str]
     compatibility: dict[Variant, PilotCompatibility]
     component_identities: dict[str, str]
+    runtime_model_class: str
+    runtime_model_format_version: str
     train_length: int
     eval_length: int
     visual_baseline_path: Path
@@ -304,6 +361,18 @@ def load_worker_manifest(
         name: _text(identities_raw[name], f"component_identities.{name}")
         for name in _COMPONENT_IDENTITY_FIELDS
     }
+    runtime_identity = _exact(
+        raw["runtime_identity"],
+        {"model_class", "model_format_version"},
+        "runtime_identity",
+    )
+    runtime_model_class = _text(
+        runtime_identity["model_class"], "runtime_identity.model_class"
+    )
+    runtime_model_format_version = _text(
+        runtime_identity["model_format_version"],
+        "runtime_identity.model_format_version",
+    )
     lengths = _exact(raw["dataset_lengths"], {"train", "eval"}, "dataset_lengths")
     train_length = _integer(
         lengths["train"], "dataset_lengths.train", positive=True
@@ -329,12 +398,8 @@ def load_worker_manifest(
     baseline_sha = _digest(
         baseline_raw["sha256"], "visual_baseline.sha256"
     )
-    summary = baseline_raw["summary"]
-    if not isinstance(summary, dict):
-        raise TypeError("visual_baseline.summary must be a JSON object")
-    # Round-trip also rejects non-string keys and non-finite values.
-    summary = json.loads(
-        json.dumps(summary, sort_keys=True, allow_nan=False)
+    summary = _visual_baseline_summary(
+        baseline_raw["summary"], "visual_baseline.summary"
     )
     return WorkerManifest(
         path=source.resolve(),
@@ -347,6 +412,8 @@ def load_worker_manifest(
         source_hashes=source_hashes,
         compatibility=compatibilities,
         component_identities=identities,
+        runtime_model_class=runtime_model_class,
+        runtime_model_format_version=runtime_model_format_version,
         train_length=train_length,
         eval_length=eval_length,
         visual_baseline_path=baseline_path.resolve(),
@@ -358,13 +425,13 @@ def load_worker_manifest(
 def _validate_baseline(manifest: WorkerManifest, path: Path) -> dict[str, object]:
     if path.resolve() != manifest.visual_baseline_path:
         raise ValueError("visual baseline path mismatch")
+    value = _visual_baseline_summary(
+        _strict_json(path), "visual baseline file"
+    )
     if sha256_file(path) != manifest.visual_baseline_sha256:
         raise ValueError("visual baseline hash mismatch")
-    value = _strict_json(path)
     if value != manifest.visual_baseline_summary:
         raise ValueError("visual baseline summary mismatch")
-    if not isinstance(value, dict):
-        raise TypeError("visual baseline must be a JSON object")
     return value
 
 
@@ -404,6 +471,55 @@ def _bound_component_identities(manifest: WorkerManifest) -> dict[str, str]:
         f"{manifest.sha256}"
     )
     return identities
+
+
+class _ManifestFingerprintModel(nn.Module):
+    def __init__(self, format_version: str) -> None:
+        super().__init__()
+        self.checkpoint_format_version = format_version
+
+
+def _fingerprint_audio_loss(*_args: object, **_kwargs: object) -> None:
+    raise RuntimeError("manifest fingerprint placeholder must not execute")
+
+
+def _expected_run_fingerprint(
+    manifest: WorkerManifest,
+    config: ProjectConfig,
+    baseline: Mapping[str, object],
+) -> dict[str, object]:
+    """Construct Task 6's exact fingerprint without loading a runtime."""
+    return build_run_fingerprint(
+        pilot_config=manifest.pilot_config,
+        train_config=config.train,
+        visual_baseline=baseline,
+        model=_ManifestFingerprintModel(manifest.runtime_model_format_version),
+        warmup_optimizer_factory=build_warmup_optimizer,
+        joint_optimizer_factory=build_joint_optimizer,
+        warmup_step_fn=condition_warmup_step,
+        joint_step_fn=joint_train_step,
+        audio_loss_fn=_fingerprint_audio_loss,
+        component_identities=_bound_component_identities(manifest),
+    )
+
+
+def _validate_runtime_identity(model: nn.Module, manifest: WorkerManifest) -> None:
+    model_type = model.__class__
+    actual_class = f"{model_type.__module__}.{model_type.__qualname__}"
+    if actual_class != manifest.runtime_model_class:
+        raise ValueError(
+            "runtime model class mismatch: "
+            f"actual={actual_class!r} expected={manifest.runtime_model_class!r}"
+        )
+    actual_format = str(
+        getattr(model, "checkpoint_format_version", "state-dict-v1")
+    )
+    if actual_format != manifest.runtime_model_format_version:
+        raise ValueError(
+            "runtime model format mismatch: "
+            f"actual={actual_format!r} "
+            f"expected={manifest.runtime_model_format_version!r}"
+        )
 
 
 def _seed_everything(seed: int) -> None:
@@ -478,16 +594,28 @@ def run_worker(
     output = Path(output_dir)
     _preflight_output(output, bool(resume))
     indices = manifest.indices_for(resolved_variant)
+    expected_run_fingerprint = _expected_run_fingerprint(
+        manifest, config, baseline
+    )
+    preflight_completed_positions: tuple[int, int] | None = None
     if resume:
         # This shape-independent pass uses weights_only loading and rejects
         # unsafe, corrupt, or incompatible state before expensive backends.
-        inspect_pilot_checkpoint(
+        preflight_state = inspect_pilot_checkpoint(
             output / "latest.pt",
             expected_compatibility=manifest.compatibility_for(resolved_variant),
             indices=indices,
+            expected_run_fingerprint=expected_run_fingerprint,
             model=None,
             allow_complete=True,
         )
+        preflight_completed_positions = (
+            preflight_state.completed_warmup_steps,
+            preflight_state.completed_joint_steps,
+        )
+        # Task 6 re-inspects under the store lock to close the TOCTOU window
+        # and validate model shapes. Do not retain this tensor-bearing copy.
+        del preflight_state
 
     _seed_everything(manifest.seed)
     if runtime_factory is None:
@@ -496,6 +624,7 @@ def run_worker(
 
         runtime_factory = build_runtime
     bundle = runtime_factory(config, resolved_device)
+    _validate_runtime_identity(bundle.model, manifest)
     if len(bundle.train_samples) != manifest.train_length:
         raise ValueError(
             "training dataset length mismatch: "
@@ -539,6 +668,14 @@ def run_worker(
         output_dir=output,
         checkpoint_store=store,
     )
+    if preflight_completed_positions is not None:
+        if (
+            result.completed_warmup_steps
+            < preflight_completed_positions[0]
+            or result.completed_joint_steps
+            < preflight_completed_positions[1]
+        ):
+            raise PilotResumeError("resumed result regressed from preflight state")
     _finite(asdict(result))
     if result.best_step is None:
         (output / "worker_summary.json").unlink(missing_ok=True)
@@ -548,6 +685,10 @@ def run_worker(
         )
     if store.run_fingerprint is None:
         raise RuntimeError("pilot checkpoint store did not bind a run fingerprint")
+    if store.run_fingerprint != expected_run_fingerprint:
+        raise PilotResumeError(
+            "runtime run fingerprint disagrees with preflight fingerprint"
+        )
     latest = inspect_pilot_checkpoint(
         store.latest_path,
         expected_compatibility=store.compatibility,

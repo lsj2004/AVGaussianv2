@@ -823,9 +823,19 @@ def inspect_pilot_checkpoint(
             raise PilotResumeError(
                 f"selector_state {name} disagrees with run_fingerprint"
             )
+    fingerprint_baseline = fingerprint_inputs.get("visual_baseline")
+    try:
+        selector_fingerprint_baseline = {
+            metric: {"mean": fingerprint_baseline[metric]["mean"]}
+            for metric in ("rgb_psnr", "rgb_ssim")
+        }
+    except (KeyError, TypeError) as error:
+        raise PilotResumeError(
+            "run_fingerprint visual_baseline cannot configure selector"
+        ) from error
     if (
         payload["selector_state"]["visual_baseline"]
-        != fingerprint_inputs.get("visual_baseline")
+        != selector_fingerprint_baseline
     ):
         raise PilotResumeError(
             "selector_state visual_baseline disagrees with run_fingerprint"

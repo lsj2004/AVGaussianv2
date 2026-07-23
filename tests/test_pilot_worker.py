@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import gc
 import json
+import weakref
 from dataclasses import asdict
 from pathlib import Path
 
@@ -101,9 +103,20 @@ def _manifest_files(
         quick_validation_samples=1,
     )
     baseline = {
-        "rgb_psnr": {"mean": 30.0},
-        "rgb_ssim": {"mean": 0.95},
+        name: {"mean": 0.5, "std": 0.1, "median": 0.5}
+        for name in (
+            "audio_total",
+            "audio_mono",
+            "audio_diff",
+            "waveform_l1",
+            "mono_lsd",
+            "diff_lsd",
+            "lre_error_db",
+            "rgb_l1",
+        )
     }
+    baseline["rgb_psnr"] = {"mean": 30.0, "std": 0.2, "median": 30.0}
+    baseline["rgb_ssim"] = {"mean": 0.95, "std": 0.01, "median": 0.95}
     baseline_path = tmp_path / "baseline.json"
     baseline_path.write_text(json.dumps(baseline, sort_keys=True) + "\n")
     shared = {
@@ -163,6 +176,10 @@ def _manifest_files(
             "warmup_step_fn": "avgaussianv2.train.condition_warmup_step-v1",
             "joint_step_fn": "avgaussianv2.train.joint_train_step-v1",
             "audio_loss_fn": "tests.worker.audio_loss-v1",
+        },
+        "runtime_identity": {
+            "model_class": f"{_WorkerModel.__module__}.{_WorkerModel.__qualname__}",
+            "model_format_version": "state-dict-v1",
         },
         "dataset_lengths": {"train": train_size, "eval": eval_size},
         "visual_baseline": {
@@ -264,10 +281,20 @@ class _FeasibleEvaluator:
         self.calls.append((samples, tuple(indices), condition_enabled))
         output_dir.mkdir(parents=True, exist_ok=True)
         summary = {
-            "audio_total": {"mean": 0.5},
-            "rgb_psnr": {"mean": 30.0},
-            "rgb_ssim": {"mean": 0.95},
+            name: {"mean": 0.5, "std": 0.1, "median": 0.5}
+            for name in (
+                "audio_total",
+                "audio_mono",
+                "audio_diff",
+                "waveform_l1",
+                "mono_lsd",
+                "diff_lsd",
+                "lre_error_db",
+                "rgb_l1",
+            )
         }
+        summary["rgb_psnr"] = {"mean": 30.0, "std": 0.2, "median": 30.0}
+        summary["rgb_ssim"] = {"mean": 0.95, "std": 0.01, "median": 0.95}
         return EvaluationResult(system_name, len(indices), (), summary)
 
 
@@ -333,9 +360,120 @@ def test_baseline_mismatch_is_rejected_before_runtime_factory(tmp_path) -> None:
     from avgaussianv2.cli.pilot_worker import run_worker
 
     config, manifest, baseline, _ = _manifest_files(tmp_path)
-    baseline.write_text('{"rgb_psnr":{"mean":1},"rgb_ssim":{"mean":1}}\n')
+    changed = json.loads(baseline.read_text())
+    changed["rgb_psnr"]["mean"] = 1
+    baseline.write_text(json.dumps(changed) + "\n")
     calls = []
     with pytest.raises(ValueError, match="visual baseline hash"):
+        run_worker(
+            config,
+            Variant.FROZEN_VISUAL,
+            manifest,
+            baseline,
+            tmp_path / "run",
+            device="cpu",
+            runtime_factory=lambda *_: calls.append(True),
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("invalid", [{}, {"bool": True}, {"nan": float("nan")}])
+def test_invalid_baseline_file_schema_is_rejected_before_runtime_factory(
+    tmp_path, invalid
+) -> None:
+    from avgaussianv2.cli.pilot_worker import run_worker
+
+    config, manifest, baseline, _ = _manifest_files(tmp_path)
+    baseline.write_text(json.dumps(invalid))
+    calls = []
+    with pytest.raises((TypeError, ValueError)):
+        run_worker(
+            config,
+            Variant.FROZEN_VISUAL,
+            manifest,
+            baseline,
+            tmp_path / "run",
+            device="cpu",
+            runtime_factory=lambda *_: calls.append(True),
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        (lambda summary: summary.clear(), "metric fields"),
+        (lambda summary: summary.pop("audio_mono"), "metric fields"),
+        (lambda summary: summary.update(extra={}), "metric fields"),
+        (
+            lambda summary: summary["audio_total"].pop("median"),
+            "aggregate fields",
+        ),
+        (
+            lambda summary: summary["audio_total"].update(extra=1),
+            "aggregate fields",
+        ),
+        (
+            lambda summary: summary["audio_total"].__setitem__("mean", "bad"),
+            "numeric",
+        ),
+        (
+            lambda summary: summary["audio_total"].__setitem__("mean", True),
+            "numeric",
+        ),
+        (
+            lambda summary: summary["audio_total"].__setitem__("std", -0.1),
+            "std.*nonnegative",
+        ),
+        (
+            lambda summary: summary["audio_total"].__setitem__("median", -0.1),
+            "nonnegative",
+        ),
+        (
+            lambda summary: summary["rgb_l1"].__setitem__("mean", 1.1),
+            "at most 1",
+        ),
+        (
+            lambda summary: summary["rgb_ssim"].__setitem__("median", 1.1),
+            r"\[-1, 1\]",
+        ),
+    ],
+)
+def test_invalid_baseline_schema_is_rejected_before_runtime_factory(
+    tmp_path, mutation, match
+) -> None:
+    from avgaussianv2.cli.pilot_worker import run_worker
+
+    config, manifest, baseline, _ = _manifest_files(tmp_path)
+    payload = json.loads(manifest.read_text())
+    summary = payload["visual_baseline"]["summary"]
+    mutation(summary)
+    baseline.write_text(json.dumps(summary, sort_keys=True) + "\n")
+    payload["visual_baseline"]["sha256"] = sha256_file(baseline)
+    manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    calls = []
+    with pytest.raises((TypeError, ValueError), match=match):
+        run_worker(
+            config,
+            Variant.FROZEN_VISUAL,
+            manifest,
+            baseline,
+            tmp_path / "run",
+            device="cpu",
+            runtime_factory=lambda *_: calls.append(True),
+        )
+    assert calls == []
+
+
+def test_nonfinite_baseline_is_rejected_before_runtime_factory(tmp_path) -> None:
+    from avgaussianv2.cli.pilot_worker import run_worker
+
+    config, manifest, baseline, _ = _manifest_files(tmp_path)
+    payload = json.loads(manifest.read_text())
+    payload["visual_baseline"]["summary"]["rgb_psnr"]["mean"] = float("nan")
+    manifest.write_text(json.dumps(payload))
+    calls = []
+    with pytest.raises(ValueError, match="non-finite"):
         run_worker(
             config,
             Variant.FROZEN_VISUAL,
@@ -357,7 +495,9 @@ def test_runtime_dataset_mismatch_is_rejected_after_one_factory_call(tmp_path) -
 
     def factory(*_):
         calls.append(True)
-        return TrainingBundle(nn.Linear(1, 1), [object()], [object(), object()], object())
+        return TrainingBundle(
+            _WorkerModel(), [object()], [object(), object()], _audio_loss
+        )
 
     with pytest.raises(ValueError, match="training dataset length"):
         run_worker(
@@ -370,6 +510,36 @@ def test_runtime_dataset_mismatch_is_rejected_after_one_factory_call(tmp_path) -
             runtime_factory=factory,
         )
     assert calls == [True]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("model_class", "tests.worker.WrongModel", "model class"),
+        ("model_format_version", "state-dict-v2", "model format"),
+    ],
+)
+def test_runtime_must_match_manifest_declared_identity(
+    tmp_path, field, value, match
+) -> None:
+    from avgaussianv2.cli.pilot_worker import run_worker
+
+    config, manifest, baseline, _ = _manifest_files(tmp_path)
+    payload = json.loads(manifest.read_text())
+    payload["runtime_identity"][field] = value
+    manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    calls = []
+    with pytest.raises(ValueError, match=match):
+        run_worker(
+            config,
+            Variant.FROZEN_VISUAL,
+            manifest,
+            baseline,
+            tmp_path / "run",
+            device="cpu",
+            runtime_factory=lambda *args: calls.append(args) or _fake_runtime(*args),
+        )
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -533,6 +703,12 @@ def test_resume_binds_exact_manifest_bytes_into_task6_fingerprint(tmp_path) -> N
     # Semantically valid, but it is no longer the exact shared contract used
     # for the checkpointed run.
     manifest.write_text(json.dumps(json.loads(manifest.read_text())))
+    calls = []
+
+    def factory(*args):
+        calls.append(args)
+        return _fake_runtime(*args)
+
     with pytest.raises(PilotResumeError, match="fingerprint"):
         run_worker(
             config,
@@ -542,9 +718,10 @@ def test_resume_binds_exact_manifest_bytes_into_task6_fingerprint(tmp_path) -> N
             output,
             device="cpu",
             resume=True,
-            runtime_factory=_fake_runtime,
+            runtime_factory=factory,
             evaluator_factory=_FeasibleEvaluator,
         )
+    assert calls == []
 
 
 def test_resume_preserves_and_validates_explicit_model_class_identity(tmp_path) -> None:
@@ -566,6 +743,7 @@ def test_resume_preserves_and_validates_explicit_model_class_identity(tmp_path) 
     payload = json.loads(manifest.read_text())
     payload["component_identities"]["model_class"] = "tests.worker.OtherModel-v2"
     manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    calls = []
     with pytest.raises(PilotResumeError, match="fingerprint"):
         run_worker(
             config,
@@ -575,9 +753,132 @@ def test_resume_preserves_and_validates_explicit_model_class_identity(tmp_path) 
             output,
             device="cpu",
             resume=True,
-            runtime_factory=_fake_runtime,
+            runtime_factory=lambda *args: calls.append(args) or _fake_runtime(*args),
             evaluator_factory=_FeasibleEvaluator,
         )
+    assert calls == []
+
+
+def test_resume_rejects_changed_baseline_values_before_runtime_factory(tmp_path) -> None:
+    from avgaussianv2.cli.pilot_worker import run_worker
+    from avgaussianv2.experiment.checkpoint import PilotResumeError
+
+    config, manifest, baseline, _ = _manifest_files(tmp_path)
+    output = tmp_path / "run"
+    run_worker(
+        config,
+        Variant.FROZEN_VISUAL,
+        manifest,
+        baseline,
+        output,
+        device="cpu",
+        runtime_factory=_fake_runtime,
+        evaluator_factory=_FeasibleEvaluator,
+    )
+    payload = json.loads(manifest.read_text())
+    payload["visual_baseline"]["summary"]["rgb_psnr"]["mean"] = 29.0
+    baseline.write_text(
+        json.dumps(payload["visual_baseline"]["summary"], sort_keys=True) + "\n"
+    )
+    payload["visual_baseline"]["sha256"] = sha256_file(baseline)
+    manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    calls = []
+    with pytest.raises(PilotResumeError, match="fingerprint"):
+        run_worker(
+            config,
+            Variant.FROZEN_VISUAL,
+            manifest,
+            baseline,
+            output,
+            device="cpu",
+            resume=True,
+            runtime_factory=lambda *args: calls.append(args) or _fake_runtime(*args),
+            evaluator_factory=_FeasibleEvaluator,
+        )
+    assert calls == []
+
+
+def test_resume_rejects_changed_project_config_before_runtime_factory(tmp_path) -> None:
+    from avgaussianv2.cli.pilot_worker import run_worker
+    from avgaussianv2.experiment.checkpoint import PilotResumeError
+
+    config, manifest, baseline, _ = _manifest_files(tmp_path)
+    output = tmp_path / "run"
+    run_worker(
+        config,
+        Variant.FROZEN_VISUAL,
+        manifest,
+        baseline,
+        output,
+        device="cpu",
+        runtime_factory=_fake_runtime,
+        evaluator_factory=_FeasibleEvaluator,
+    )
+    config.write_text(config.read_text().replace("embedding_dim: 8", "embedding_dim: 9"))
+    payload = json.loads(manifest.read_text())
+    payload["source_hashes"]["project_config_sha256"] = sha256_file(config)
+    manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    calls = []
+    with pytest.raises(PilotResumeError, match="fingerprint"):
+        run_worker(
+            config,
+            Variant.FROZEN_VISUAL,
+            manifest,
+            baseline,
+            output,
+            device="cpu",
+            resume=True,
+            runtime_factory=lambda *args: calls.append(args) or _fake_runtime(*args),
+            evaluator_factory=_FeasibleEvaluator,
+        )
+    assert calls == []
+
+
+def test_resume_releases_tensor_bearing_preflight_state_before_runtime(
+    tmp_path, monkeypatch
+) -> None:
+    import avgaussianv2.cli.pilot_worker as worker
+
+    config, manifest, baseline, _ = _manifest_files(tmp_path)
+    output = tmp_path / "run"
+    worker.run_worker(
+        config,
+        Variant.FROZEN_VISUAL,
+        manifest,
+        baseline,
+        output,
+        device="cpu",
+        runtime_factory=_fake_runtime,
+        evaluator_factory=_FeasibleEvaluator,
+    )
+    original_inspect = worker.inspect_pilot_checkpoint
+    state_reference = None
+
+    def tracking_inspect(*args, **kwargs):
+        nonlocal state_reference
+        state = original_inspect(*args, **kwargs)
+        state_reference = weakref.ref(state)
+        return state
+
+    monkeypatch.setattr(worker, "inspect_pilot_checkpoint", tracking_inspect)
+
+    def factory(*args):
+        gc.collect()
+        assert state_reference is not None
+        assert state_reference() is None
+        return _fake_runtime(*args)
+
+    worker.run_worker(
+        config,
+        Variant.FROZEN_VISUAL,
+        manifest,
+        baseline,
+        output,
+        device="cpu",
+        resume=True,
+        runtime_factory=factory,
+        evaluator_factory=_FeasibleEvaluator,
+    )
 
 
 def test_parser_has_exact_worker_surface_and_validates_devices() -> None:
