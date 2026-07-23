@@ -896,6 +896,144 @@ def test_validation_commit_retains_journal_when_durability_is_ambiguous(
     assert not resumed.journal_path.exists()
 
 
+def test_committed_validation_reraises_keyboard_interrupt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import avgaussianv2.experiment.checkpoint as checkpoint_module
+
+    model = nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    kwargs = _checkpoint_kwargs(model, optimizer)
+    checkpoint_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key not in {"run_fingerprint", "checkpoint_kind", "generation"}
+    }
+    store = PilotCheckpointStore(tmp_path, compatibility())
+    store.bind_run_fingerprint(kwargs["run_fingerprint"])
+    with store:
+        store.prepare()
+        store.publish_latest(**checkpoint_kwargs)
+        real_save = checkpoint_module.save_pilot_checkpoint
+
+        def interrupt_after_committed_latest(path, **save_kwargs):
+            real_save(path, **save_kwargs)
+            if path.name == "latest.pt" and save_kwargs["generation"] == 2:
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(
+            checkpoint_module,
+            "save_pilot_checkpoint",
+            interrupt_after_committed_latest,
+        )
+        with pytest.raises(KeyboardInterrupt):
+            store.publish_validation(
+                latest_kwargs=checkpoint_kwargs,
+                best_kwargs={
+                    **checkpoint_kwargs,
+                    "optimizer": None,
+                    "optimizer_stage": None,
+                },
+            )
+    assert torch.load(store.latest_path, weights_only=True)["generation"] == 2
+    assert torch.load(store.best_path, weights_only=True)["generation"] == 2
+    assert not store.journal_path.exists()
+
+
+def test_keyboard_interrupt_wins_when_durability_retry_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import avgaussianv2.experiment.checkpoint as checkpoint_module
+
+    model = nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    kwargs = _checkpoint_kwargs(model, optimizer)
+    checkpoint_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key not in {"run_fingerprint", "checkpoint_kind", "generation"}
+    }
+    store = PilotCheckpointStore(tmp_path, compatibility())
+    store.bind_run_fingerprint(kwargs["run_fingerprint"])
+    with store:
+        store.prepare()
+        store.publish_latest(**checkpoint_kwargs)
+        real_save = checkpoint_module.save_pilot_checkpoint
+
+        def interrupt_after_committed_latest(path, **save_kwargs):
+            real_save(path, **save_kwargs)
+            if path.name == "latest.pt" and save_kwargs["generation"] == 2:
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(
+            checkpoint_module,
+            "save_pilot_checkpoint",
+            interrupt_after_committed_latest,
+        )
+        monkeypatch.setattr(
+            checkpoint_module,
+            "_fsync_directory",
+            lambda path: (_ for _ in ()).throw(
+                OSError("injected durability retry failure")
+            ),
+        )
+        with pytest.raises(KeyboardInterrupt):
+            store.publish_validation(
+                latest_kwargs=checkpoint_kwargs,
+                best_kwargs={
+                    **checkpoint_kwargs,
+                    "optimizer": None,
+                    "optimizer_stage": None,
+                },
+            )
+    assert store.journal_path.is_file()
+    assert torch.load(store.latest_path, weights_only=True)["generation"] == 2
+
+
+def test_backup_copy_failure_metrics_distinguish_attempt_success_and_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import avgaussianv2.experiment.checkpoint as checkpoint_module
+
+    model = nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    kwargs = _checkpoint_kwargs(model, optimizer)
+    checkpoint_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key not in {"run_fingerprint", "checkpoint_kind", "generation"}
+    }
+    store = PilotCheckpointStore(tmp_path, compatibility())
+    store.bind_run_fingerprint(kwargs["run_fingerprint"])
+    with store:
+        store.prepare()
+        store.publish_validation(
+            latest_kwargs=checkpoint_kwargs,
+            best_kwargs={
+                **checkpoint_kwargs,
+                "optimizer": None,
+                "optimizer_stage": None,
+            },
+        )
+        monkeypatch.setattr(
+            checkpoint_module,
+            "_durable_copy",
+            lambda *args: (_ for _ in ()).throw(OSError("backup copy failure")),
+        )
+        with pytest.raises(OSError, match="backup copy"):
+            store.publish_validation(
+                latest_kwargs=checkpoint_kwargs,
+                best_kwargs={
+                    **checkpoint_kwargs,
+                    "optimizer": None,
+                    "optimizer_stage": None,
+                },
+            )
+    assert store.metrics["backup_copy_attempt_count"] == 1
+    assert store.metrics["backup_copy_count"] == 0
+    assert store.metrics["backup_copy_failure_count"] == 1
+
+
 @pytest.mark.parametrize("latest_generation", [1, 2])
 def test_transaction_with_missing_required_best_backup_is_unrecoverable(
     tmp_path: Path, latest_generation: int

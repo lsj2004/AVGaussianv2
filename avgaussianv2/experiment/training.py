@@ -127,7 +127,7 @@ def _strict_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
+def _stage_text(path: Path, text: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
@@ -138,14 +138,41 @@ def _atomic_write_text(path: Path, text: str) -> None:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        return temporary
     except BaseException:
         temporary.unlink(missing_ok=True)
+        raise
+
+
+def _rewrite_staged_text(staged: Path, text: str) -> None:
+    with staged.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write(text)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _fsync_report_directory(path: Path) -> None:
+    directory = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _publish_staged_text(staged: Path, path: Path) -> None:
+    replaced = False
+    try:
+        os.replace(staged, path)
+        replaced = True
+        _fsync_report_directory(path.parent)
+    except BaseException as error:
+        if replaced:
+            try:
+                _fsync_report_directory(path.parent)
+            except OSError:
+                raise
+            if isinstance(error, Exception):
+                return
         raise
 
 
@@ -174,6 +201,98 @@ def _curve_text(history: Sequence[Mapping[str, object]]) -> str:
             }
         )
     return stream.getvalue()
+
+
+def _summary_payload(
+    *,
+    result: PilotTrainingResult,
+    history: Sequence[Mapping[str, object]],
+    validation_history: Sequence[Mapping[str, object]],
+    selector: BestSelector,
+    stopper: EarlyStopper,
+    checkpoint_store: PilotCheckpointStore | None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "variant": result.variant.value,
+        "completed_warmup_steps": result.completed_warmup_steps,
+        "completed_joint_steps": result.completed_joint_steps,
+        "best_step": result.best_step,
+        "stop_reason": result.stop_reason,
+        "training_history": list(history),
+        "validation_history": list(validation_history),
+        "selector_state": selector.state_dict(),
+        "stopper_state": stopper.state_dict(),
+    }
+    if checkpoint_store is not None:
+        payload["checkpoint_io"] = checkpoint_store.metrics
+    return payload
+
+
+def _summary_text(payload: Mapping[str, object]) -> str:
+    return json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+
+
+def _publish_final_reports(
+    *,
+    output: Path,
+    result: PilotTrainingResult,
+    selector: BestSelector,
+    stopper: EarlyStopper,
+    checkpoint_store: PilotCheckpointStore | None,
+    publish_complete: Callable[[], None] | None,
+) -> None:
+    history = result.training_history
+    validation_history = result.validation_history
+    curve_path = output / "training_curve.csv"
+    summary_path = output / "worker_summary.json"
+    curve_staged: Path | None = None
+    summary_staged: Path | None = None
+    try:
+        curve_staged = _stage_text(curve_path, _curve_text(history))
+        summary_staged = _stage_text(
+            summary_path,
+            _summary_text(
+                _summary_payload(
+                    result=result,
+                    history=history,
+                    validation_history=validation_history,
+                    selector=selector,
+                    stopper=stopper,
+                    checkpoint_store=checkpoint_store,
+                )
+            ),
+        )
+        if publish_complete is not None:
+            publish_complete()
+            # The successful complete checkpoint belongs to this invocation's
+            # metrics, so refresh only the noncanonical staged summary.
+            _rewrite_staged_text(
+                summary_staged,
+                _summary_text(
+                    _summary_payload(
+                        result=result,
+                        history=history,
+                        validation_history=validation_history,
+                        selector=selector,
+                        stopper=stopper,
+                        checkpoint_store=checkpoint_store,
+                    )
+                ),
+            )
+        # A previous/stale success declaration must not survive a failed curve
+        # publication. The complete checkpoint remains the finalize source.
+        summary_path.unlink(missing_ok=True)
+        _fsync_report_directory(output)
+        _publish_staged_text(curve_staged, curve_path)
+        curve_staged = None
+        # The summary is the success declaration and is always published last.
+        _publish_staged_text(summary_staged, summary_path)
+        summary_staged = None
+    finally:
+        if curve_staged is not None:
+            curve_staged.unlink(missing_ok=True)
+        if summary_staged is not None:
+            summary_staged.unlink(missing_ok=True)
 
 
 def _inspect_canonical_best(
@@ -388,6 +507,7 @@ class PilotTrainer:
                     indices=indices,
                     expected_run_fingerprint=run_fingerprint,
                     model=model,
+                    allow_complete=True,
                 )
                 _inspect_canonical_best(
                     store=checkpoint_store,
@@ -486,6 +606,30 @@ class PilotTrainer:
         checkpoint_stop_requested = (
             False if resume_state is None else resume_state.stop_requested
         )
+
+        if resume_state is not None and resume_state.stage == "complete":
+            if resume_state.stop_reason is None:
+                raise PilotResumeError(
+                    "complete checkpoint is missing its stop reason"
+                )
+            result = PilotTrainingResult(
+                variant=resolved_variant,
+                completed_warmup_steps=resume_state.completed_warmup_steps,
+                completed_joint_steps=resume_state.completed_joint_steps,
+                best_step=selector.best_step,
+                stop_reason=resume_state.stop_reason,
+                validation_history=tuple(validation_history),
+                training_history=tuple(history),
+            )
+            _publish_final_reports(
+                output=output,
+                result=result,
+                selector=selector,
+                stopper=stopper,
+                checkpoint_store=checkpoint_store,
+                publish_complete=None,
+            )
+            return result
 
         def checkpoint_kwargs(
             *,
@@ -779,30 +923,19 @@ class PilotTrainer:
             validation_history=tuple(validation_history),
             training_history=tuple(history),
         )
-        summary_payload = {
-            "variant": resolved_variant.value,
-            "completed_warmup_steps": result.completed_warmup_steps,
-            "completed_joint_steps": result.completed_joint_steps,
-            "best_step": result.best_step,
-            "stop_reason": result.stop_reason,
-            "training_history": history,
-            "validation_history": validation_history,
-            "selector_state": selector.state_dict(),
-            "stopper_state": stopper.state_dict(),
-        }
-        if checkpoint_store is not None:
-            summary_payload["checkpoint_io"] = checkpoint_store.metrics
-        _atomic_write_text(output / "training_curve.csv", _curve_text(history))
-        _atomic_write_text(
-            output / "worker_summary.json",
-            json.dumps(summary_payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        )
-        save_latest(
-            stage="complete",
-            optimizer=None,
-            optimizer_stage=None,
-            stop_reason=stop_reason,
-            stop_requested=stop_reason == "early_stop",
+        _publish_final_reports(
+            output=output,
+            result=result,
+            selector=selector,
+            stopper=stopper,
+            checkpoint_store=checkpoint_store,
+            publish_complete=lambda: save_latest(
+                stage="complete",
+                optimizer=None,
+                optimizer_stage=None,
+                stop_reason=stop_reason,
+                stop_requested=stop_reason == "early_stop",
+            ),
         )
         return result
 

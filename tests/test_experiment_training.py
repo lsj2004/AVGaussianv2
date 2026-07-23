@@ -607,6 +607,7 @@ def test_best_save_failure_leaves_latest_pending_and_resume_revalidates(
 def test_latest_preserves_earlier_best_evaluation_summary(tmp_path) -> None:
     model = TinyTrainFusion()
     model.condition_enabled = True
+    store = _store(tmp_path, _pilot_compatibility())
     PilotTrainer(
         PilotConfig(
             warmup_steps=0,
@@ -626,7 +627,7 @@ def test_latest_preserves_earlier_best_evaluation_summary(tmp_path) -> None:
         visual_baseline=_baseline(),
         audio_loss_fn=audio_loss,
         output_dir=tmp_path,
-        checkpoint_store=_store(tmp_path, _pilot_compatibility()),
+        checkpoint_store=store,
     )
     latest = torch.load(tmp_path / "latest.pt", weights_only=True)
     assert latest["best_evaluation_summary"]["audio_total"]["mean"] == 1.0
@@ -637,6 +638,8 @@ def test_latest_preserves_earlier_best_evaluation_summary(tmp_path) -> None:
         == summary["checkpoint_io"]["save_count"]
     )
     assert summary["checkpoint_io"]["failed_save_count"] == 0
+    assert summary["checkpoint_io"]["scope"] == "current_invocation"
+    assert summary["checkpoint_io"]["save_count"] == store.metrics["save_count"]
     assert summary["checkpoint_io"]["save_bytes"] > 0
     assert summary["checkpoint_io"]["save_duration_seconds"] > 0
     assert summary["checkpoint_io"]["cadence"] == "every_completed_optimizer_step"
@@ -728,17 +731,17 @@ def test_report_failure_leaves_active_finalize_only_resume(
         validation_interval=1,
         minimum_joint_steps=1,
     )
-    real_write = training_module._atomic_write_text
+    real_publish = training_module._publish_staged_text
     failed = False
 
-    def fail_report(path, text):
+    def fail_report(staged, path):
         nonlocal failed
         if path.name == report_name and not failed:
             failed = True
             raise OSError(f"injected {report_name} failure")
-        real_write(path, text)
+        real_publish(staged, path)
 
-    monkeypatch.setattr(training_module, "_atomic_write_text", fail_report)
+    monkeypatch.setattr(training_module, "_publish_staged_text", fail_report)
     model = TinyTrainFusion()
     model.condition_enabled = True
     with pytest.raises(OSError, match="injected"):
@@ -758,9 +761,14 @@ def test_report_failure_leaves_active_finalize_only_resume(
             output_dir=tmp_path,
             checkpoint_store=_store(tmp_path, _pilot_compatibility()),
         )
-    assert torch.load(tmp_path / "latest.pt", weights_only=True)["stage"] == "joint"
+    assert torch.load(tmp_path / "latest.pt", weights_only=True)["stage"] == "complete"
+    if report_name == "training_curve.csv":
+        assert not (tmp_path / "worker_summary.json").exists()
+    else:
+        assert (tmp_path / "training_curve.csv").is_file()
+        assert not (tmp_path / "worker_summary.json").exists()
 
-    monkeypatch.setattr(training_module, "_atomic_write_text", real_write)
+    monkeypatch.setattr(training_module, "_publish_staged_text", real_publish)
     resumed_evaluator = FakeEvaluator(())
     resumed = TinyTrainFusion()
     resumed.condition_enabled = True
@@ -786,6 +794,221 @@ def test_report_failure_leaves_active_finalize_only_resume(
     assert (tmp_path / "training_curve.csv").is_file()
     assert (tmp_path / "worker_summary.json").is_file()
     assert torch.load(tmp_path / "latest.pt", weights_only=True)["stage"] == "complete"
+
+
+def test_complete_save_failure_publishes_no_success_report_and_resume_finalizes(
+    tmp_path, monkeypatch
+) -> None:
+    import avgaussianv2.experiment.checkpoint as checkpoint_module
+
+    seen = []
+
+    def joint_step(model, sample, optimizer, *args, **kwargs):
+        seen.append(sample.frame_index)
+        return _stats(0.1)
+
+    config = PilotConfig(
+        warmup_steps=0,
+        joint_steps=1,
+        validation_interval=1,
+        minimum_joint_steps=1,
+    )
+    real_save = checkpoint_module.save_pilot_checkpoint
+
+    def fail_complete(path, **kwargs):
+        if kwargs["stage"] == "complete":
+            raise OSError("injected complete save failure")
+        real_save(path, **kwargs)
+
+    monkeypatch.setattr(
+        checkpoint_module, "save_pilot_checkpoint", fail_complete
+    )
+    model = TinyTrainFusion()
+    model.condition_enabled = True
+    with pytest.raises(OSError, match="complete save"):
+        PilotTrainer(
+            config,
+            FakeEvaluator((1.0,)),
+            joint_step_fn=joint_step,
+        ).run(
+            model=model,
+            train_samples=[_sample_with_frame(9)],
+            heldout_samples=[make_sample()],
+            indices=VariantIndices((), (0,)),
+            heldout_indices=(0,),
+            variant=Variant.JOINT_CONDITIONED,
+            visual_baseline=_baseline(),
+            audio_loss_fn=audio_loss,
+            output_dir=tmp_path,
+            checkpoint_store=_store(tmp_path, _pilot_compatibility()),
+        )
+    assert torch.load(tmp_path / "latest.pt", weights_only=True)["stage"] == "joint"
+    assert not (tmp_path / "training_curve.csv").exists()
+    assert not (tmp_path / "worker_summary.json").exists()
+
+    monkeypatch.setattr(checkpoint_module, "save_pilot_checkpoint", real_save)
+    evaluator = FakeEvaluator(())
+    resumed = TinyTrainFusion()
+    resumed.condition_enabled = True
+    result = PilotTrainer(
+        config,
+        evaluator,
+        joint_step_fn=joint_step,
+    ).run(
+        model=resumed,
+        train_samples=[_sample_with_frame(9)],
+        heldout_samples=[make_sample()],
+        indices=VariantIndices((), (0,)),
+        heldout_indices=(0,),
+        variant=Variant.JOINT_CONDITIONED,
+        visual_baseline=_baseline(),
+        audio_loss_fn=audio_loss,
+        output_dir=tmp_path,
+        checkpoint_store=_store(tmp_path, _pilot_compatibility(), resume=True),
+    )
+    assert seen == [9]
+    assert evaluator.calls == []
+    assert result.completed_joint_steps == 1
+    assert (tmp_path / "training_curve.csv").is_file()
+    assert (tmp_path / "worker_summary.json").is_file()
+
+
+def test_worker_summary_is_published_after_curve(tmp_path, monkeypatch) -> None:
+    import avgaussianv2.experiment.training as training_module
+
+    published = []
+    real_publish = training_module._publish_staged_text
+
+    def record_publish(staged, path):
+        published.append(path.name)
+        real_publish(staged, path)
+
+    monkeypatch.setattr(
+        training_module, "_publish_staged_text", record_publish
+    )
+    model = TinyTrainFusion()
+    model.condition_enabled = True
+    PilotTrainer(
+        PilotConfig(
+            warmup_steps=0,
+            joint_steps=1,
+            validation_interval=1,
+            minimum_joint_steps=1,
+        ),
+        FakeEvaluator((1.0,)),
+        joint_step_fn=lambda *args, **kwargs: _stats(0.1),
+    ).run(
+        model=model,
+        train_samples=[make_sample()],
+        heldout_samples=[make_sample()],
+        indices=VariantIndices((), (0,)),
+        heldout_indices=(0,),
+        variant=Variant.JOINT_CONDITIONED,
+        visual_baseline=_baseline(),
+        audio_loss_fn=audio_loss,
+        output_dir=tmp_path,
+        checkpoint_store=_store(tmp_path, _pilot_compatibility()),
+    )
+    assert published == ["training_curve.csv", "worker_summary.json"]
+
+
+def test_complete_resume_withdraws_stale_summary_before_curve_publish(
+    tmp_path, monkeypatch
+) -> None:
+    import avgaussianv2.experiment.training as training_module
+
+    config = PilotConfig(
+        warmup_steps=0,
+        joint_steps=1,
+        validation_interval=1,
+        minimum_joint_steps=1,
+    )
+    model = TinyTrainFusion()
+    model.condition_enabled = True
+    PilotTrainer(
+        config,
+        FakeEvaluator((1.0,)),
+        joint_step_fn=lambda *args, **kwargs: _stats(0.1),
+    ).run(
+        model=model,
+        train_samples=[make_sample()],
+        heldout_samples=[make_sample()],
+        indices=VariantIndices((), (0,)),
+        heldout_indices=(0,),
+        variant=Variant.JOINT_CONDITIONED,
+        visual_baseline=_baseline(),
+        audio_loss_fn=audio_loss,
+        output_dir=tmp_path,
+        checkpoint_store=_store(tmp_path, _pilot_compatibility()),
+    )
+    (tmp_path / "training_curve.csv").write_text("stale curve")
+    (tmp_path / "worker_summary.json").write_text("stale summary")
+
+    real_publish = training_module._publish_staged_text
+
+    def fail_curve(staged, path):
+        if path.name == "training_curve.csv":
+            raise OSError("injected retry curve failure")
+        real_publish(staged, path)
+
+    monkeypatch.setattr(training_module, "_publish_staged_text", fail_curve)
+    resumed = TinyTrainFusion()
+    resumed.condition_enabled = False
+    before = {
+        name: value.detach().clone()
+        for name, value in resumed.state_dict().items()
+    }
+    with pytest.raises(OSError, match="retry curve"):
+        PilotTrainer(
+            config,
+            FakeEvaluator(()),
+            joint_step_fn=lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("complete resume must not train")
+            ),
+        ).run(
+            model=resumed,
+            train_samples=[make_sample()],
+            heldout_samples=[make_sample()],
+            indices=VariantIndices((), (0,)),
+            heldout_indices=(0,),
+            variant=Variant.JOINT_CONDITIONED,
+            visual_baseline=_baseline(),
+            audio_loss_fn=audio_loss,
+            output_dir=tmp_path,
+            checkpoint_store=_store(
+                tmp_path, _pilot_compatibility(), resume=True
+            ),
+        )
+    assert not (tmp_path / "worker_summary.json").exists()
+    assert resumed.condition_enabled is False
+    for name, value in resumed.state_dict().items():
+        assert torch.equal(value, before[name])
+
+    monkeypatch.setattr(training_module, "_publish_staged_text", real_publish)
+    result = PilotTrainer(
+        config,
+        FakeEvaluator(()),
+        joint_step_fn=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("complete resume must not train")
+        ),
+    ).run(
+        model=resumed,
+        train_samples=[make_sample()],
+        heldout_samples=[make_sample()],
+        indices=VariantIndices((), (0,)),
+        heldout_indices=(0,),
+        variant=Variant.JOINT_CONDITIONED,
+        visual_baseline=_baseline(),
+        audio_loss_fn=audio_loss,
+        output_dir=tmp_path,
+        checkpoint_store=_store(
+            tmp_path, _pilot_compatibility(), resume=True
+        ),
+    )
+    summary = json.loads((tmp_path / "worker_summary.json").read_text())
+    assert result.completed_joint_steps == 1
+    assert summary["checkpoint_io"]["scope"] == "current_invocation"
+    assert summary["checkpoint_io"]["save_count"] == 0
 
 
 @pytest.mark.parametrize(

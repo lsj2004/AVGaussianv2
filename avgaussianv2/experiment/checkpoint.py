@@ -1086,7 +1086,11 @@ def _fsync_directory(path: Path) -> None:
 
 
 class PilotCheckpointStore:
-    """Own canonical latest/best paths and fresh/resume output policy."""
+    """Own canonical latest/best paths and fresh/resume output policy.
+
+    I/O counters are invocation-scoped: a new store starts from zero, including
+    a finalize-only resume that performs no checkpoint save.
+    """
 
     def __init__(
         self,
@@ -1122,6 +1126,8 @@ class PilotCheckpointStore:
         self.save_bytes = 0
         self.save_duration_seconds = 0.0
         self.backup_copy_count = 0
+        self.backup_copy_attempt_count = 0
+        self.backup_copy_failure_count = 0
         self.backup_copy_bytes = 0
         self.backup_copy_duration_seconds = 0.0
         self._lock_stream: Any | None = None
@@ -1134,7 +1140,10 @@ class PilotCheckpointStore:
             "failed_save_count": self.failed_save_count,
             "save_bytes": self.save_bytes,
             "save_duration_seconds": self.save_duration_seconds,
+            "scope": "current_invocation",
             "backup_copy_count": self.backup_copy_count,
+            "backup_copy_attempt_count": self.backup_copy_attempt_count,
+            "backup_copy_failure_count": self.backup_copy_failure_count,
             "backup_copy_bytes": self.backup_copy_bytes,
             "backup_copy_duration_seconds": self.backup_copy_duration_seconds,
             "cadence": "every_completed_optimizer_step",
@@ -1244,12 +1253,18 @@ class PilotCheckpointStore:
     def _backup_best(self) -> None:
         started = time.perf_counter()
         size = 0
+        succeeded = False
         try:
             size = self.best_path.stat().st_size
             _durable_copy(self.best_path, self.backup_path)
+            succeeded = True
         finally:
-            self.backup_copy_count += 1
-            self.backup_copy_bytes += size
+            self.backup_copy_attempt_count += 1
+            if succeeded:
+                self.backup_copy_count += 1
+                self.backup_copy_bytes += size
+            else:
+                self.backup_copy_failure_count += 1
             self.backup_copy_duration_seconds += time.perf_counter() - started
 
     def publish_latest(self, **kwargs: object) -> None:
@@ -1300,7 +1315,7 @@ class PilotCheckpointStore:
             )
             self.generation = generation
             self.best_generation = generation
-        except BaseException:
+        except BaseException as error:
             latest_generation = self._read_generation_safely(self.latest_path)
             if latest_generation == generation:
                 try:
@@ -1308,10 +1323,19 @@ class PilotCheckpointStore:
                 except OSError:
                     # The canonical pair may be committed, but durability is
                     # ambiguous. Preserve the journal and backup for prepare().
+                    if not isinstance(error, Exception):
+                        raise error
                     raise
                 self.generation = generation
                 self.best_generation = generation
-                self._clear_transaction()
+                try:
+                    self._clear_transaction()
+                except BaseException:
+                    if not isinstance(error, Exception):
+                        raise error
+                    raise
+                if not isinstance(error, Exception):
+                    raise
                 return
             if latest_generation is not None and latest_generation < generation:
                 self._rollback_transaction(had_best)
