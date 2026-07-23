@@ -205,6 +205,7 @@ def _checkpoint_kwargs(model, optimizer):
             }
         ],
         maximum_positive_audio_visual_gradient=0.25,
+        best_generation=0,
         validation_summary={
             "audio_total": {"mean": 1.0},
             "rgb_psnr": {"mean": 30.0},
@@ -676,6 +677,32 @@ def test_checkpoint_enabled_lambda_requires_explicit_identity() -> None:
         )
 
 
+def test_explicit_component_identity_changes_run_fingerprint() -> None:
+    common = {
+        "pilot_config": PilotConfig(),
+        "train_config": TrainConfig(),
+        "visual_baseline": {
+            "rgb_psnr": {"mean": 30.0},
+            "rgb_ssim": {"mean": 0.95},
+        },
+        "model": nn.Linear(2, 1),
+        "warmup_optimizer_factory": compatibility,
+        "joint_optimizer_factory": compatibility,
+        "warmup_step_fn": compatibility,
+        "joint_step_fn": compatibility,
+        "audio_loss_fn": compatibility,
+    }
+    first = build_run_fingerprint(
+        **common,
+        component_identities={"joint_step_fn": "pilot.joint_step.v1"},
+    )
+    second = build_run_fingerprint(
+        **common,
+        component_identities={"joint_step_fn": "pilot.joint_step.v2"},
+    )
+    assert first["sha256"] != second["sha256"]
+
+
 def test_baseexception_restore_rolls_back_model_and_optimizer(tmp_path: Path) -> None:
     class Abort(BaseException):
         pass
@@ -741,6 +768,216 @@ def test_prepare_rolls_back_ahead_best_from_incomplete_transaction(
     assert best.read_bytes() == old_best
     assert not (tmp_path / ".pilot-validation-transaction.json").exists()
     assert not (tmp_path / ".pilot-best-backup.pt").exists()
+
+
+def test_validation_commit_survives_one_shot_directory_sync_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import avgaussianv2.experiment.checkpoint as checkpoint_module
+
+    model = nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    kwargs = _checkpoint_kwargs(model, optimizer)
+    store = PilotCheckpointStore(tmp_path, compatibility())
+    store.bind_run_fingerprint(kwargs["run_fingerprint"])
+    with store:
+        store.prepare()
+        checkpoint_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in {"run_fingerprint", "checkpoint_kind", "generation"}
+        }
+        store.publish_validation(
+            latest_kwargs=checkpoint_kwargs,
+            best_kwargs={
+                **checkpoint_kwargs,
+                "optimizer": None,
+                "optimizer_stage": None,
+            },
+        )
+        real_open = checkpoint_module.os.open
+        latest_replaced = False
+        failed = False
+        real_replace = checkpoint_module.os.replace
+
+        def track_replace(source, destination):
+            nonlocal latest_replaced
+            real_replace(source, destination)
+            if Path(destination) == store.latest_path:
+                latest_replaced = True
+
+        def fail_first_directory_open(path, flags, *args, **named):
+            nonlocal failed
+            if latest_replaced and not failed and Path(path) == tmp_path:
+                failed = True
+                raise OSError("injected directory open failure")
+            return real_open(path, flags, *args, **named)
+
+        monkeypatch.setattr(checkpoint_module.os, "replace", track_replace)
+        monkeypatch.setattr(checkpoint_module.os, "open", fail_first_directory_open)
+        store.publish_validation(
+            latest_kwargs=checkpoint_kwargs,
+            best_kwargs={
+                **checkpoint_kwargs,
+                "optimizer": None,
+                "optimizer_stage": None,
+            },
+        )
+
+    latest = torch.load(store.latest_path, weights_only=True)
+    best = torch.load(store.best_path, weights_only=True)
+    assert latest["generation"] == best["generation"] == 2
+    assert not store.journal_path.exists()
+    assert not store.backup_path.exists()
+    assert store.metrics["backup_copy_count"] == 1
+    assert store.metrics["backup_copy_bytes"] > 0
+
+
+def test_validation_commit_retains_journal_when_durability_is_ambiguous(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import avgaussianv2.experiment.checkpoint as checkpoint_module
+
+    model = nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    kwargs = _checkpoint_kwargs(model, optimizer)
+    checkpoint_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key not in {"run_fingerprint", "checkpoint_kind", "generation"}
+    }
+    store = PilotCheckpointStore(tmp_path, compatibility())
+    store.bind_run_fingerprint(kwargs["run_fingerprint"])
+    with store:
+        store.prepare()
+        store.publish_validation(
+            latest_kwargs=checkpoint_kwargs,
+            best_kwargs={
+                **checkpoint_kwargs,
+                "optimizer": None,
+                "optimizer_stage": None,
+            },
+        )
+        real_open = checkpoint_module.os.open
+        real_replace = checkpoint_module.os.replace
+        latest_replaced = False
+
+        def track_replace(source, destination):
+            nonlocal latest_replaced
+            real_replace(source, destination)
+            if Path(destination) == store.latest_path:
+                latest_replaced = True
+
+        def fail_directory_open(path, flags, *args, **named):
+            if latest_replaced and Path(path) == tmp_path:
+                raise OSError("persistent directory open failure")
+            return real_open(path, flags, *args, **named)
+
+        monkeypatch.setattr(checkpoint_module.os, "replace", track_replace)
+        monkeypatch.setattr(checkpoint_module.os, "open", fail_directory_open)
+        with pytest.raises(OSError, match="persistent directory"):
+            store.publish_validation(
+                latest_kwargs=checkpoint_kwargs,
+                best_kwargs={
+                    **checkpoint_kwargs,
+                    "optimizer": None,
+                    "optimizer_stage": None,
+                },
+            )
+        assert store.journal_path.is_file()
+
+    monkeypatch.setattr(checkpoint_module.os, "open", real_open)
+    resumed = PilotCheckpointStore(tmp_path, compatibility(), resume=True)
+    with resumed:
+        resumed.prepare()
+    latest = torch.load(resumed.latest_path, weights_only=True)
+    best = torch.load(resumed.best_path, weights_only=True)
+    assert latest["generation"] == best["generation"] == 2
+    assert not resumed.journal_path.exists()
+
+
+@pytest.mark.parametrize("latest_generation", [1, 2])
+def test_transaction_with_missing_required_best_backup_is_unrecoverable(
+    tmp_path: Path, latest_generation: int
+) -> None:
+    model = nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    kwargs = _checkpoint_kwargs(model, optimizer)
+    save_pilot_checkpoint(
+        tmp_path / "latest.pt", generation=latest_generation, **kwargs
+    )
+    (tmp_path / ".pilot-validation-transaction.json").write_text(
+        json.dumps({"generation": 2, "had_best": True})
+    )
+    store = PilotCheckpointStore(tmp_path, compatibility(), resume=True)
+    with store, pytest.raises(PilotResumeError, match="backup"):
+        store.prepare()
+    assert store.journal_path.is_file()
+    assert (tmp_path / "latest.pt").is_file()
+
+
+def test_transaction_recovery_rejects_ahead_latest_and_retains_journal(
+    tmp_path: Path,
+) -> None:
+    model = nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    kwargs = _checkpoint_kwargs(model, optimizer)
+    save_pilot_checkpoint(tmp_path / "latest.pt", generation=3, **kwargs)
+    (tmp_path / ".pilot-validation-transaction.json").write_text(
+        json.dumps({"generation": 2, "had_best": False})
+    )
+    store = PilotCheckpointStore(tmp_path, compatibility(), resume=True)
+    with store, pytest.raises(PilotResumeError, match="ahead"):
+        store.prepare()
+    assert store.journal_path.is_file()
+    assert torch.load(store.latest_path, weights_only=True)["generation"] == 3
+
+
+def test_rollback_sync_failure_retains_retryable_journal_and_backup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import avgaussianv2.experiment.checkpoint as checkpoint_module
+
+    model = nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    kwargs = _checkpoint_kwargs(model, optimizer)
+    latest = tmp_path / "latest.pt"
+    best = tmp_path / "best.pt"
+    backup = tmp_path / ".pilot-best-backup.pt"
+    journal = tmp_path / ".pilot-validation-transaction.json"
+    save_pilot_checkpoint(latest, generation=1, **kwargs)
+    save_pilot_checkpoint(best, generation=1, **kwargs)
+    backup.write_bytes(best.read_bytes())
+    with torch.no_grad():
+        model.weight.add_(10)
+    save_pilot_checkpoint(best, generation=2, **kwargs)
+    journal.write_text(json.dumps({"generation": 2, "had_best": True}))
+
+    real_fsync_directory = checkpoint_module._fsync_directory
+    failed = False
+
+    def fail_once(path):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected rollback sync failure")
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(checkpoint_module, "_fsync_directory", fail_once)
+    store = PilotCheckpointStore(tmp_path, compatibility(), resume=True)
+    with store, pytest.raises(PilotResumeError, match="rollback sync"):
+        store.prepare()
+    assert journal.is_file()
+    assert backup.is_file()
+
+    monkeypatch.setattr(
+        checkpoint_module, "_fsync_directory", real_fsync_directory
+    )
+    retry = PilotCheckpointStore(tmp_path, compatibility(), resume=True)
+    with retry:
+        retry.prepare()
+    assert not journal.exists()
+    assert not backup.exists()
 
 
 def test_derived_stopper_corruption_is_rejected(tmp_path: Path) -> None:

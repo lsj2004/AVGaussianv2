@@ -632,6 +632,11 @@ def test_latest_preserves_earlier_best_evaluation_summary(tmp_path) -> None:
     assert latest["best_evaluation_summary"]["audio_total"]["mean"] == 1.0
     summary = json.loads((tmp_path / "worker_summary.json").read_text())
     assert summary["checkpoint_io"]["save_count"] >= 5
+    assert (
+        summary["checkpoint_io"]["save_attempt_count"]
+        == summary["checkpoint_io"]["save_count"]
+    )
+    assert summary["checkpoint_io"]["failed_save_count"] == 0
     assert summary["checkpoint_io"]["save_bytes"] > 0
     assert summary["checkpoint_io"]["save_duration_seconds"] > 0
     assert summary["checkpoint_io"]["cadence"] == "every_completed_optimizer_step"
@@ -700,6 +705,259 @@ def test_stop_decision_is_durable_before_callback_and_resume_does_not_train(
     assert evaluator.calls == []
     assert result.completed_joint_steps == 2
     assert result.stop_reason == "early_stop"
+
+
+@pytest.mark.parametrize(
+    "report_name",
+    ["training_curve.csv", "worker_summary.json"],
+)
+def test_report_failure_leaves_active_finalize_only_resume(
+    tmp_path, monkeypatch, report_name
+) -> None:
+    import avgaussianv2.experiment.training as training_module
+
+    seen = []
+
+    def joint_step(model, sample, optimizer, *args, **kwargs):
+        seen.append(sample.frame_index)
+        return _stats(0.1)
+
+    config = PilotConfig(
+        warmup_steps=0,
+        joint_steps=1,
+        validation_interval=1,
+        minimum_joint_steps=1,
+    )
+    real_write = training_module._atomic_write_text
+    failed = False
+
+    def fail_report(path, text):
+        nonlocal failed
+        if path.name == report_name and not failed:
+            failed = True
+            raise OSError(f"injected {report_name} failure")
+        real_write(path, text)
+
+    monkeypatch.setattr(training_module, "_atomic_write_text", fail_report)
+    model = TinyTrainFusion()
+    model.condition_enabled = True
+    with pytest.raises(OSError, match="injected"):
+        PilotTrainer(
+            config,
+            FakeEvaluator((1.0,)),
+            joint_step_fn=joint_step,
+        ).run(
+            model=model,
+            train_samples=[_sample_with_frame(7)],
+            heldout_samples=[make_sample()],
+            indices=VariantIndices((), (0,)),
+            heldout_indices=(0,),
+            variant=Variant.JOINT_CONDITIONED,
+            visual_baseline=_baseline(),
+            audio_loss_fn=audio_loss,
+            output_dir=tmp_path,
+            checkpoint_store=_store(tmp_path, _pilot_compatibility()),
+        )
+    assert torch.load(tmp_path / "latest.pt", weights_only=True)["stage"] == "joint"
+
+    monkeypatch.setattr(training_module, "_atomic_write_text", real_write)
+    resumed_evaluator = FakeEvaluator(())
+    resumed = TinyTrainFusion()
+    resumed.condition_enabled = True
+    result = PilotTrainer(
+        config,
+        resumed_evaluator,
+        joint_step_fn=joint_step,
+    ).run(
+        model=resumed,
+        train_samples=[_sample_with_frame(7)],
+        heldout_samples=[make_sample()],
+        indices=VariantIndices((), (0,)),
+        heldout_indices=(0,),
+        variant=Variant.JOINT_CONDITIONED,
+        visual_baseline=_baseline(),
+        audio_loss_fn=audio_loss,
+        output_dir=tmp_path,
+        checkpoint_store=_store(tmp_path, _pilot_compatibility(), resume=True),
+    )
+    assert seen == [7]
+    assert resumed_evaluator.calls == []
+    assert result.completed_joint_steps == 1
+    assert (tmp_path / "training_curve.csv").is_file()
+    assert (tmp_path / "worker_summary.json").is_file()
+    assert torch.load(tmp_path / "latest.pt", weights_only=True)["stage"] == "complete"
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["missing", "corrupt", "unrelated", "stale", "identity"],
+)
+def test_resume_rejects_noncanonical_best_before_training(
+    tmp_path, damage
+) -> None:
+    config = PilotConfig(
+        warmup_steps=0,
+        joint_steps=2,
+        validation_interval=1,
+        minimum_joint_steps=2,
+    )
+    model = TinyTrainFusion()
+    model.condition_enabled = True
+    with pytest.raises(RuntimeError, match="interrupt"):
+        PilotTrainer(
+            config,
+            FakeEvaluator((1.0,)),
+            joint_step_fn=lambda *args, **kwargs: _stats(0.1),
+        ).run(
+            model=model,
+            train_samples=[make_sample()],
+            heldout_samples=[make_sample()],
+            indices=VariantIndices((), (0, 0)),
+            heldout_indices=(0,),
+            variant=Variant.JOINT_CONDITIONED,
+            visual_baseline=_baseline(),
+            audio_loss_fn=audio_loss,
+            output_dir=tmp_path,
+            checkpoint_store=_store(tmp_path, _pilot_compatibility()),
+            on_validation=lambda event: (_ for _ in ()).throw(
+                RuntimeError("interrupt")
+            ),
+        )
+
+    best_path = tmp_path / "best.pt"
+    if damage == "missing":
+        best_path.unlink()
+    elif damage == "corrupt":
+        best_path.write_bytes(b"not a checkpoint")
+    elif damage == "unrelated":
+        best_path.write_bytes((tmp_path / "latest.pt").read_bytes())
+    elif damage == "stale":
+        payload = torch.load(best_path, weights_only=True)
+        payload["generation"] -= 1
+        torch.save(payload, best_path)
+    else:
+        payload = torch.load(best_path, weights_only=True)
+        payload["run_fingerprint"]["inputs"]["joint_step_fn"] = "other.step.v1"
+        encoded = json.dumps(
+            payload["run_fingerprint"]["inputs"],
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+        import hashlib
+
+        payload["run_fingerprint"]["sha256"] = hashlib.sha256(encoded).hexdigest()
+        torch.save(payload, best_path)
+
+    resumed = TinyTrainFusion()
+    resumed.condition_enabled = False
+    before = {
+        name: value.detach().clone()
+        for name, value in resumed.state_dict().items()
+    }
+    seen = []
+    with pytest.raises((PilotResumeError, FileNotFoundError)):
+        PilotTrainer(
+            config,
+            FakeEvaluator((0.9,)),
+            joint_step_fn=lambda *args, **kwargs: seen.append(True) or _stats(0.1),
+        ).run(
+            model=resumed,
+            train_samples=[make_sample()],
+            heldout_samples=[make_sample()],
+            indices=VariantIndices((), (0, 0)),
+            heldout_indices=(0,),
+            variant=Variant.JOINT_CONDITIONED,
+            visual_baseline=_baseline(),
+            audio_loss_fn=audio_loss,
+            output_dir=tmp_path,
+            checkpoint_store=_store(
+                tmp_path, _pilot_compatibility(), resume=True
+            ),
+        )
+    assert seen == []
+    assert resumed.condition_enabled is False
+    for name, value in resumed.state_dict().items():
+        assert torch.equal(value, before[name])
+
+
+def test_resume_rejects_stray_best_when_latest_has_no_selection(
+    tmp_path, monkeypatch
+) -> None:
+    import avgaussianv2.experiment.checkpoint as checkpoint_module
+
+    config = PilotConfig(
+        warmup_steps=0,
+        joint_steps=2,
+        validation_interval=2,
+        minimum_joint_steps=2,
+    )
+    real_save = checkpoint_module.save_pilot_checkpoint
+
+    def interrupt_after_first_step(path, **kwargs):
+        real_save(path, **kwargs)
+        if path.name == "latest.pt" and kwargs["next_joint_position"] == 1:
+            raise RuntimeError("interrupt first step")
+
+    monkeypatch.setattr(
+        checkpoint_module, "save_pilot_checkpoint", interrupt_after_first_step
+    )
+    model = TinyTrainFusion()
+    model.condition_enabled = True
+    with pytest.raises(RuntimeError, match="interrupt first"):
+        PilotTrainer(
+            config,
+            FakeEvaluator(()),
+            joint_step_fn=lambda *args, **kwargs: _stats(0.1),
+        ).run(
+            model=model,
+            train_samples=[make_sample()],
+            heldout_samples=[make_sample()],
+            indices=VariantIndices((), (0, 0)),
+            heldout_indices=(0,),
+            variant=Variant.JOINT_CONDITIONED,
+            visual_baseline=_baseline(),
+            audio_loss_fn=audio_loss,
+            output_dir=tmp_path,
+            checkpoint_store=_store(tmp_path, _pilot_compatibility()),
+        )
+    latest = torch.load(tmp_path / "latest.pt", weights_only=True)
+    assert latest["selector_state"]["best_step"] is None
+    stray = dict(latest)
+    stray["checkpoint_kind"] = "best"
+    stray["optimizer_stage"] = None
+    stray["optimizer_state_dict"] = None
+    torch.save(stray, tmp_path / "best.pt")
+    monkeypatch.setattr(checkpoint_module, "save_pilot_checkpoint", real_save)
+
+    resumed = TinyTrainFusion()
+    resumed.condition_enabled = False
+    before = {
+        name: value.detach().clone()
+        for name, value in resumed.state_dict().items()
+    }
+    with pytest.raises(PilotResumeError, match="stray best"):
+        PilotTrainer(
+            config,
+            FakeEvaluator((1.0,)),
+            joint_step_fn=lambda *args, **kwargs: _stats(0.1),
+        ).run(
+            model=resumed,
+            train_samples=[make_sample()],
+            heldout_samples=[make_sample()],
+            indices=VariantIndices((), (0, 0)),
+            heldout_indices=(0,),
+            variant=Variant.JOINT_CONDITIONED,
+            visual_baseline=_baseline(),
+            audio_loss_fn=audio_loss,
+            output_dir=tmp_path,
+            checkpoint_store=_store(
+                tmp_path, _pilot_compatibility(), resume=True
+            ),
+        )
+    assert resumed.condition_enabled is False
+    for name, value in resumed.state_dict().items():
+        assert torch.equal(value, before[name])
 
 
 def test_failed_optimizer_restore_rolls_back_model_and_preserves_reports(

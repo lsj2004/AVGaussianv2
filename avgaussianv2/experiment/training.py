@@ -176,6 +176,90 @@ def _curve_text(history: Sequence[Mapping[str, object]]) -> str:
     return stream.getvalue()
 
 
+def _inspect_canonical_best(
+    *,
+    store: PilotCheckpointStore,
+    latest: PilotResumeState,
+    indices: VariantIndices,
+    run_fingerprint: Mapping[str, object],
+    model: nn.Module,
+) -> None:
+    selected_step = latest.selector.best_step
+    if selected_step is None:
+        if latest.best_generation is not None:
+            raise PilotResumeError(
+                "latest checkpoint tracks a best generation without a selection"
+            )
+        if store.best_path.exists():
+            raise PilotResumeError(
+                "stray best checkpoint exists without a selected best"
+            )
+        return
+    if latest.best_generation is None:
+        raise PilotResumeError("latest selected best has no tracked best generation")
+    if not store.best_path.is_file():
+        raise PilotResumeError(
+            f"selected best checkpoint is missing: {store.best_path}"
+        )
+    best = inspect_pilot_checkpoint(
+        store.best_path,
+        expected_compatibility=store.compatibility,
+        indices=indices,
+        expected_run_fingerprint=run_fingerprint,
+        model=model,
+        active_resume=False,
+    )
+    if best.checkpoint_kind != "best":
+        raise PilotResumeError("canonical best path does not contain a best checkpoint")
+    if best.generation != latest.best_generation:
+        raise PilotResumeError(
+            "best checkpoint generation does not match latest best_generation"
+        )
+    if best.selector.best_step != selected_step:
+        raise PilotResumeError("best checkpoint selected step disagrees with latest")
+    if best.best_evaluation_summary != latest.best_evaluation_summary:
+        raise PilotResumeError("best checkpoint selected summary disagrees with latest")
+    selected_summary = next(
+        row["summary"]
+        for row in latest.validation_history
+        if row["step"] == selected_step
+    )
+    if best.validation_summary != selected_summary:
+        raise PilotResumeError(
+            "best checkpoint validation summary is not the selected row"
+        )
+    expected_validations = tuple(
+        row for row in latest.validation_history if row["step"] <= selected_step
+    )
+    expected_training = tuple(
+        row
+        for row in latest.training_history
+        if row["stage"] == "warmup"
+        or (row["stage"] == "joint" and row["step"] <= selected_step)
+    )
+    if (
+        best.next_joint_position != selected_step
+        or best.validation_history != expected_validations
+        or best.training_history != expected_training
+    ):
+        raise PilotResumeError(
+            "best checkpoint history does not identify the selected training state"
+        )
+    latest_selector = latest.selector.state_dict()
+    best_selector = best.selector.state_dict()
+    for name in (
+        "visual_baseline",
+        "psnr_tolerance_db",
+        "ssim_tolerance",
+        "best_step",
+        "best_audio_total",
+    ):
+        if best_selector[name] != latest_selector[name]:
+            raise PilotResumeError(
+                f"best checkpoint selector {name} disagrees with latest"
+            )
+
+
 class PilotTrainer:
     """Execute one variant using shared indices and periodic held-out validation."""
 
@@ -303,6 +387,13 @@ class PilotTrainer:
                     expected_compatibility=checkpoint_store.compatibility,
                     indices=indices,
                     expected_run_fingerprint=run_fingerprint,
+                    model=model,
+                )
+                _inspect_canonical_best(
+                    store=checkpoint_store,
+                    latest=resume_state,
+                    indices=indices,
+                    run_fingerprint=run_fingerprint,
                     model=model,
                 )
                 expected_selector = BestSelector(
@@ -688,13 +779,6 @@ class PilotTrainer:
             validation_history=tuple(validation_history),
             training_history=tuple(history),
         )
-        save_latest(
-            stage="complete",
-            optimizer=None,
-            optimizer_stage=None,
-            stop_reason=stop_reason,
-            stop_requested=stop_reason == "early_stop",
-        )
         summary_payload = {
             "variant": resolved_variant.value,
             "completed_warmup_steps": result.completed_warmup_steps,
@@ -712,6 +796,13 @@ class PilotTrainer:
         _atomic_write_text(
             output / "worker_summary.json",
             json.dumps(summary_payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        )
+        save_latest(
+            stage="complete",
+            optimizer=None,
+            optimizer_stage=None,
+            stop_reason=stop_reason,
+            stop_requested=stop_reason == "early_stop",
         )
         return result
 

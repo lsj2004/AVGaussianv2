@@ -1,4 +1,13 @@
-"""Strict, crash-safe checkpoints for bounded pilot experiments."""
+"""Strict, crash-safe checkpoints for bounded pilot experiments.
+
+Fingerprint discipline is part of the public checkpoint contract. Any change to
+pilot behavior or checkpoint meaning must bump ``ALGORITHM_IDENTITY`` and/or
+``SCHEMA_VERSION`` as appropriate. Callers that pass closures, dynamically
+generated callables, or behavior whose qualified name is not a complete stable
+identity must provide an explicit ``component_identities`` entry containing a
+versioned identity or configuration/code digest. Source inspection is
+intentionally avoided because it is fragile across packaging environments.
+"""
 
 from __future__ import annotations
 
@@ -26,9 +35,9 @@ from avgaussianv2.experiment.selection import BestSelector, EarlyStopper
 from avgaussianv2.config import TrainConfig
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 STAGES = frozenset({"warmup", "joint", "complete"})
-ALGORITHM_IDENTITY = "avgaussianv2.pilot-training-v3"
+ALGORITHM_IDENTITY = "avgaussianv2.pilot-training-v4"
 LOSS_STEP_API_VERSION = "avgaussianv2.loss-step-api-v1"
 
 
@@ -167,7 +176,13 @@ def build_run_fingerprint(
     audio_loss_fn: object,
     component_identities: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
-    """Build the canonical identity of every behavior-affecting pilot input."""
+    """Build the canonical identity of every behavior-affecting pilot input.
+
+    Behavior changes require an ``ALGORITHM_IDENTITY`` bump. Closures and
+    dynamic callables must use a versioned explicit identity/config digest in
+    ``component_identities``; qualified names alone are not sufficient for
+    behavior that can change without the name changing.
+    """
     overrides = {} if component_identities is None else dict(component_identities)
     allowed_overrides = {
         "model_class",
@@ -306,6 +321,7 @@ def _json_clone(value: object, name: str) -> Any:
 class PilotResumeState:
     checkpoint_kind: str
     generation: int
+    best_generation: int | None
     run_fingerprint: dict[str, object]
     stage: str
     next_warmup_position: int
@@ -390,6 +406,7 @@ def build_pilot_payload(
     maximum_positive_audio_visual_gradient: float,
     checkpoint_kind: str = "latest",
     generation: int = 0,
+    best_generation: int | None = None,
     pending_validation: bool = False,
     stop_requested: bool = False,
     stop_reason: str | None = None,
@@ -410,6 +427,11 @@ def build_pilot_payload(
     warmup = _positive_int("next_warmup_position", next_warmup_position, allow_zero=True)
     joint = _positive_int("next_joint_position", next_joint_position, allow_zero=True)
     generation_value = _positive_int("generation", generation, allow_zero=True)
+    best_generation_value = (
+        None
+        if best_generation is None
+        else _positive_int("best_generation", best_generation, allow_zero=True)
+    )
     fingerprint = _validate_run_fingerprint(run_fingerprint)
     if not isinstance(pending_validation, bool):
         raise TypeError("pending_validation must be a boolean")
@@ -419,6 +441,7 @@ def build_pilot_payload(
         "schema_version": SCHEMA_VERSION,
         "checkpoint_kind": checkpoint_kind,
         "generation": generation_value,
+        "best_generation": best_generation_value,
         "run_fingerprint": fingerprint,
         "compatibility": compatibility.to_mapping(),
         "provenance": {
@@ -514,7 +537,8 @@ def inspect_pilot_checkpoint(
 ) -> PilotResumeState:
     payload = _payload(path)
     required = {
-        "schema_version", "checkpoint_kind", "generation", "run_fingerprint",
+        "schema_version", "checkpoint_kind", "generation", "best_generation",
+        "run_fingerprint",
         "compatibility", "provenance",
         "stage", "variant",
         "next_warmup_position", "next_joint_position", "completed_warmup_steps",
@@ -531,6 +555,13 @@ def inspect_pilot_checkpoint(
             f"schema_version must be {SCHEMA_VERSION}, got {payload['schema_version']!r}"
         )
     generation = _resume_integer("generation", payload["generation"], allow_zero=True)
+    best_generation = payload["best_generation"]
+    if best_generation is not None:
+        best_generation = _resume_integer(
+            "best_generation", best_generation, allow_zero=True
+        )
+        if best_generation > generation:
+            raise PilotResumeError("best_generation cannot exceed generation")
     run_fingerprint = _validate_run_fingerprint(payload["run_fingerprint"])
     if expected_run_fingerprint is not None:
         expected_fingerprint = _validate_run_fingerprint(expected_run_fingerprint)
@@ -886,9 +917,18 @@ def inspect_pilot_checkpoint(
         raise PilotResumeError(
             "best_evaluation_summary must match the selected validation row"
         )
+    if selector.best_step is None and best_generation is not None:
+        raise PilotResumeError("best_generation requires a selected best")
+    if selector.best_step is not None and best_generation is None:
+        raise PilotResumeError("selected best requires best_generation")
+    if checkpoint_kind == "best" and best_generation != generation:
+        raise PilotResumeError(
+            "best checkpoint generation must equal best_generation"
+        )
     return PilotResumeState(
         checkpoint_kind=checkpoint_kind,
         generation=generation,
+        best_generation=best_generation,
         run_fingerprint=run_fingerprint,
         stage=stage,
         next_warmup_position=warmup,
@@ -1075,17 +1115,28 @@ class PilotCheckpointStore:
         self.backup_path = self.output_dir / ".pilot-best-backup.pt"
         self.run_fingerprint: dict[str, object] | None = None
         self.generation = 0
+        self.best_generation: int | None = None
         self.save_count = 0
+        self.save_attempt_count = 0
+        self.failed_save_count = 0
         self.save_bytes = 0
         self.save_duration_seconds = 0.0
+        self.backup_copy_count = 0
+        self.backup_copy_bytes = 0
+        self.backup_copy_duration_seconds = 0.0
         self._lock_stream: Any | None = None
 
     @property
     def metrics(self) -> dict[str, object]:
         return {
             "save_count": self.save_count,
+            "save_attempt_count": self.save_attempt_count,
+            "failed_save_count": self.failed_save_count,
             "save_bytes": self.save_bytes,
             "save_duration_seconds": self.save_duration_seconds,
+            "backup_copy_count": self.backup_copy_count,
+            "backup_copy_bytes": self.backup_copy_bytes,
+            "backup_copy_duration_seconds": self.backup_copy_duration_seconds,
             "cadence": "every_completed_optimizer_step",
         }
 
@@ -1144,14 +1195,19 @@ class PilotCheckpointStore:
         if self._lock_stream is None:
             raise RuntimeError("pilot checkpoint store must be acquired")
 
-    def _record_save(self, path: Path, started: float) -> None:
+    def _record_save(self, path: Path, started: float, *, succeeded: bool) -> None:
         duration = time.perf_counter() - started
-        try:
-            size = path.stat().st_size
-        except OSError:
-            size = 0
-        self.save_count += 1
-        self.save_bytes += size
+        size = 0
+        if succeeded:
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            self.save_count += 1
+            self.save_bytes += size
+        else:
+            self.failed_save_count += 1
+        self.save_attempt_count += 1
         self.save_duration_seconds += duration
         if self.checkpoint_hook is not None:
             try:
@@ -1160,7 +1216,9 @@ class PilotCheckpointStore:
                         "path": str(path),
                         "bytes": size,
                         "duration_seconds": duration,
+                        "succeeded": succeeded,
                         "save_count": self.save_count,
+                        "save_attempt_count": self.save_attempt_count,
                     }
                 )
             except Exception:
@@ -1171,12 +1229,28 @@ class PilotCheckpointStore:
         if self.run_fingerprint is None:
             raise RuntimeError("run_fingerprint must be bound before saving")
         started = time.perf_counter()
-        save_pilot_checkpoint(
-            path,
-            run_fingerprint=self.run_fingerprint,
-            **kwargs,
-        )
-        self._record_save(path, started)
+        succeeded = False
+        try:
+            kwargs.setdefault("best_generation", self.best_generation)
+            save_pilot_checkpoint(
+                path,
+                run_fingerprint=self.run_fingerprint,
+                **kwargs,
+            )
+            succeeded = True
+        finally:
+            self._record_save(path, started, succeeded=succeeded)
+
+    def _backup_best(self) -> None:
+        started = time.perf_counter()
+        size = 0
+        try:
+            size = self.best_path.stat().st_size
+            _durable_copy(self.best_path, self.backup_path)
+        finally:
+            self.backup_copy_count += 1
+            self.backup_copy_bytes += size
+            self.backup_copy_duration_seconds += time.perf_counter() - started
 
     def publish_latest(self, **kwargs: object) -> None:
         self._require_lock()
@@ -1202,40 +1276,90 @@ class PilotCheckpointStore:
         generation = self.generation + 1
         had_best = self.best_path.is_file()
         if had_best:
-            _durable_copy(self.best_path, self.backup_path)
+            self._backup_best()
         _atomic_json(
             self.journal_path,
             {"generation": generation, "had_best": had_best},
         )
         try:
+            best_payload = dict(best_kwargs)
+            best_payload["best_generation"] = generation
             self._save(
                 self.best_path,
                 checkpoint_kind="best",
                 generation=generation,
-                **dict(best_kwargs),
+                **best_payload,
             )
+            latest_payload = dict(latest_kwargs)
+            latest_payload["best_generation"] = generation
             self._save(
                 self.latest_path,
                 checkpoint_kind="latest",
                 generation=generation,
-                **dict(latest_kwargs),
+                **latest_payload,
             )
             self.generation = generation
+            self.best_generation = generation
         except BaseException:
-            self._rollback_transaction(had_best)
+            latest_generation = self._read_generation_safely(self.latest_path)
+            if latest_generation == generation:
+                try:
+                    _fsync_directory(self.output_dir)
+                except OSError:
+                    # The canonical pair may be committed, but durability is
+                    # ambiguous. Preserve the journal and backup for prepare().
+                    raise
+                self.generation = generation
+                self.best_generation = generation
+                self._clear_transaction()
+                return
+            if latest_generation is not None and latest_generation < generation:
+                self._rollback_transaction(had_best)
+            # Missing/corrupt/ahead latest is ambiguous: preserve recovery files.
             raise
         self._clear_transaction()
+
+    @staticmethod
+    def _read_generation_safely(path: Path) -> int | None:
+        if not path.is_file():
+            return -1
+        try:
+            return _resume_integer(
+                "generation", _payload(path).get("generation"), allow_zero=True
+            )
+        except (OSError, PilotResumeError):
+            return None
 
     def _clear_transaction(self) -> None:
         self.journal_path.unlink(missing_ok=True)
         self.backup_path.unlink(missing_ok=True)
+        for temporary in self.output_dir.glob(".pilot-best-restore.*.tmp"):
+            temporary.unlink(missing_ok=True)
         _fsync_directory(self.output_dir)
 
     def _rollback_transaction(self, had_best: bool) -> None:
-        if had_best and self.backup_path.is_file():
-            os.replace(self.backup_path, self.best_path)
+        if had_best:
+            if not self.backup_path.is_file():
+                raise PilotResumeError(
+                    "checkpoint transaction requires missing best backup"
+                )
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".pilot-best-restore.",
+                suffix=".tmp",
+                dir=self.output_dir,
+            )
+            os.close(descriptor)
+            temporary = Path(temporary_name)
+            try:
+                _durable_copy(self.backup_path, temporary)
+                os.replace(temporary, self.best_path)
+                _fsync_directory(self.output_dir)
+            finally:
+                temporary.unlink(missing_ok=True)
         elif not had_best:
             self.best_path.unlink(missing_ok=True)
+            _fsync_directory(self.output_dir)
+        # The rollback is durable before recovery metadata is removed.
         self.journal_path.unlink(missing_ok=True)
         self.backup_path.unlink(missing_ok=True)
         _fsync_directory(self.output_dir)
@@ -1253,13 +1377,26 @@ class PilotCheckpointStore:
             )
             if not isinstance(mapping["had_best"], bool):
                 raise PilotResumeError("transaction had_best must be boolean")
+            if mapping["had_best"] and not self.backup_path.is_file():
+                raise PilotResumeError(
+                    "checkpoint transaction requires missing best backup"
+                )
             latest_generation = None
             if self.latest_path.is_file():
-                latest_generation = _payload(self.latest_path).get("generation")
+                latest_generation = _resume_integer(
+                    "latest generation",
+                    _payload(self.latest_path).get("generation"),
+                    allow_zero=True,
+                )
             if latest_generation == generation:
+                _fsync_directory(self.output_dir)
                 self._clear_transaction()
-            else:
+            elif latest_generation is None or latest_generation < generation:
                 self._rollback_transaction(mapping["had_best"])
+            else:
+                raise PilotResumeError(
+                    "latest checkpoint generation is ahead of transaction journal"
+                )
         except (OSError, json.JSONDecodeError) as error:
             raise PilotResumeError(
                 f"cannot recover checkpoint transaction: {error}"
@@ -1276,6 +1413,14 @@ class PilotCheckpointStore:
             payload = _payload(self.latest_path)
             self.generation = _resume_integer(
                 "generation", payload.get("generation"), allow_zero=True
+            )
+            raw_best_generation = payload.get("best_generation")
+            self.best_generation = (
+                None
+                if raw_best_generation is None
+                else _resume_integer(
+                    "best_generation", raw_best_generation, allow_zero=True
+                )
             )
             if self.best_path.is_file():
                 best_payload = _payload(self.best_path)
@@ -1314,11 +1459,13 @@ class PilotCheckpointStore:
                 ".best.pt.*.tmp",
                 ".worker_summary.json.*.tmp",
                 ".training_curve.csv.*.tmp",
+                ".pilot-best-restore.*.tmp",
             ):
                 for temporary in self.output_dir.glob(pattern):
                     temporary.unlink(missing_ok=True)
             shutil.rmtree(self.output_dir / "validation", ignore_errors=True)
         self.generation = 0
+        self.best_generation = None
 
 
 __all__ = [
