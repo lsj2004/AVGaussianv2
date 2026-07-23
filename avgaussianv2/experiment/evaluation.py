@@ -4,6 +4,8 @@ import fcntl
 import json
 import math
 import os
+import shutil
+import stat
 import tempfile
 import warnings
 from collections.abc import Callable, Mapping, Sequence
@@ -109,25 +111,92 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
+def _open_pinned_output_directory(output_dir: Path) -> int:
+    parts = output_dir.parts
+    if len(parts) == 5 and parts[:4] == ("/", "proc", "self", "fd"):
+        try:
+            descriptor = os.dup(int(parts[4]))
+        except (ValueError, OSError) as error:
+            raise ValueError(f"invalid pinned metric directory: {output_dir}") from error
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            raise ValueError(f"metric output is not a directory: {output_dir}")
+        return descriptor
+    output_dir.mkdir(parents=True, exist_ok=True)
+    before = output_dir.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+        raise ValueError(
+            f"metric output must be a non-symlink directory: {output_dir}"
+        )
+    descriptor = os.open(
+        output_dir,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    after = os.fstat(descriptor)
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        os.close(descriptor)
+        raise ValueError(f"metric output directory identity changed: {output_dir}")
+    return descriptor
+
+
 def _snapshot_without_removing(destination: Path, suffix: str = ".backup") -> Path:
-    descriptor, backup_name = tempfile.mkstemp(
+    source_fd = os.open(
+        destination,
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0),
+    )
+    source_metadata = os.fstat(source_fd)
+    if (
+        not stat.S_ISREG(source_metadata.st_mode)
+        or source_metadata.st_nlink != 1
+    ):
+        os.close(source_fd)
+        raise ValueError(
+            f"metric backup source must be a single-link regular file: {destination}"
+        )
+    backup_fd, backup_name = tempfile.mkstemp(
         prefix=f".{destination.name}.", suffix=suffix, dir=destination.parent
     )
-    os.close(descriptor)
+    os.close(backup_fd)
     backup = Path(backup_name)
     backup.unlink()
     try:
-        os.link(destination, backup)
+        os.link(destination, backup, follow_symlinks=False)
+        backup_metadata = backup.lstat()
+        if (
+            not stat.S_ISREG(backup_metadata.st_mode)
+            or (backup_metadata.st_dev, backup_metadata.st_ino)
+            != (source_metadata.st_dev, source_metadata.st_ino)
+        ):
+            raise ValueError("metric backup source changed during hard-link snapshot")
     except OSError:
         try:
-            with destination.open("rb") as source, backup.open("xb") as target:
-                while chunk := source.read(1024 * 1024):
-                    target.write(chunk)
+            target_fd = os.open(
+                backup,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with (
+                os.fdopen(source_fd, "rb", closefd=False) as source,
+                os.fdopen(target_fd, "wb") as target,
+            ):
+                shutil.copyfileobj(source, target, length=1024 * 1024)
                 target.flush()
                 os.fsync(target.fileno())
         except BaseException:
             backup.unlink(missing_ok=True)
             raise
+    except BaseException:
+        backup.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(source_fd)
     return backup
 
 
@@ -162,6 +231,20 @@ def _publish_metric_pair(
     backups: dict[Path, Path] = {}
     installed: list[Path] = []
     try:
+        for destination in destinations:
+            try:
+                metadata = destination.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+            ):
+                raise ValueError(
+                    "metric destination must be a single-link "
+                    f"non-symlink regular file: {destination.name}"
+                )
         for destination, content in zip(destinations, contents):
             staged.append(_stage_text(destination, content))
         for destination in destinations:
@@ -227,11 +310,6 @@ def _write_metric_pair(output_dir: Path, rows: tuple[dict[str, object], ...], su
     atomic. Ordinary replacement failures are rolled back. No filesystem API can
     make two filenames crash-atomic, so a crash can expose mixed versions.
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    destinations = (
-        output_dir / "metrics_per_sample.jsonl",
-        output_dir / "metrics_summary.json",
-    )
     row_text = "".join(
         json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
         for row in rows
@@ -239,11 +317,30 @@ def _write_metric_pair(output_dir: Path, rows: tuple[dict[str, object], ...], su
     summary_text = json.dumps(
         summary, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False
     ) + "\n"
-    lock_path = output_dir / ".metrics-publication.lock"
+    directory_fd = _open_pinned_output_directory(output_dir)
+    pinned_output = Path(f"/proc/self/fd/{directory_fd}")
+    destinations = (
+        pinned_output / "metrics_per_sample.jsonl",
+        pinned_output / "metrics_summary.json",
+    )
+    lock_path = pinned_output / ".metrics-publication.lock"
     lock_descriptor: int | None = None
     primary: BaseException | None = None
     try:
-        lock_descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        lock_descriptor = os.open(
+            lock_path.name,
+            os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        lock_metadata = os.fstat(lock_descriptor)
+        if (
+            not stat.S_ISREG(lock_metadata.st_mode)
+            or lock_metadata.st_nlink != 1
+        ):
+            raise ValueError(
+                "metric publication lock must be a single-link regular file"
+            )
         try:
             fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
@@ -255,8 +352,8 @@ def _write_metric_pair(output_dir: Path, rows: tuple[dict[str, object], ...], su
         os.ftruncate(lock_descriptor, 0)
         os.write(lock_descriptor, f"pid={os.getpid()}\n".encode())
         os.fsync(lock_descriptor)
-        _fsync_directory(output_dir)
-        _publish_metric_pair(output_dir, destinations, (row_text, summary_text))
+        _fsync_directory(pinned_output)
+        _publish_metric_pair(pinned_output, destinations, (row_text, summary_text))
     except BaseException as error:
         primary = error
         raise
@@ -271,6 +368,10 @@ def _write_metric_pair(output_dir: Path, rows: tuple[dict[str, object], ...], su
                 os.close(lock_descriptor)
             except BaseException as error:
                 release_errors.append(error)
+        try:
+            os.close(directory_fd)
+        except BaseException as error:
+            release_errors.append(error)
         if release_errors:
             if primary is not None:
                 _record_recovery_errors(primary, release_errors)

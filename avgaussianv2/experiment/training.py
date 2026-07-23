@@ -7,8 +7,10 @@ import io
 import json
 import math
 import os
+import stat
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -177,6 +179,69 @@ def _publish_staged_text(staged: Path, path: Path) -> None:
         raise
 
 
+def _duplicate_pinned_directory(path: Path) -> int | None:
+    parts = path.parts
+    if len(parts) == 5 and parts[:4] == ("/", "proc", "self", "fd"):
+        try:
+            source_fd = int(parts[4])
+        except ValueError:
+            return None
+        descriptor = os.dup(source_fd)
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            raise ValueError(f"pinned output is not a directory: {path}")
+        return descriptor
+    return None
+
+
+def _open_child_directory(parent_fd: int, name: str) -> int:
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    descriptor = os.open(
+        name,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_fd,
+    )
+    metadata = os.fstat(descriptor)
+    path_metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino)
+        != (path_metadata.st_dev, path_metadata.st_ino)
+    ):
+        os.close(descriptor)
+        raise ValueError(f"unsafe validation directory: {name}")
+    return descriptor
+
+
+@contextmanager
+def _secure_validation_directory(output: Path, step: int):
+    parent_fd = _duplicate_pinned_directory(output)
+    if parent_fd is None:
+        parent_fd = os.open(
+            output,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    validation_fd: int | None = None
+    step_fd: int | None = None
+    try:
+        validation_fd = _open_child_directory(parent_fd, "validation")
+        step_fd = _open_child_directory(validation_fd, f"step_{step:06d}")
+        yield Path(f"/proc/self/fd/{step_fd}")
+    finally:
+        if step_fd is not None:
+            os.close(step_fd)
+        if validation_fd is not None:
+            os.close(validation_fd)
+        os.close(parent_fd)
+
+
 def _curve_text(history: Sequence[Mapping[str, object]]) -> str:
     stream = io.StringIO(newline="")
     writer = csv.DictWriter(
@@ -303,7 +368,7 @@ def _inspect_canonical_best(
     indices: VariantIndices,
     run_fingerprint: Mapping[str, object],
     model: nn.Module,
-) -> None:
+) -> PilotResumeState | None:
     selected_step = latest.selector.best_step
     if selected_step is None:
         if latest.best_generation is not None:
@@ -314,7 +379,7 @@ def _inspect_canonical_best(
             raise PilotResumeError(
                 "stray best checkpoint exists without a selected best"
             )
-        return
+        return None
     if latest.best_generation is None:
         raise PilotResumeError("latest selected best has no tracked best generation")
     if not store.best_path.is_file():
@@ -378,6 +443,7 @@ def _inspect_canonical_best(
             raise PilotResumeError(
                 f"best checkpoint selector {name} disagrees with latest"
             )
+    return best
 
 
 class PilotTrainer:
@@ -520,7 +586,7 @@ class PilotTrainer:
                     )
                 else:
                     validate_pilot_resume_model(resume_state, model)
-                _inspect_canonical_best(
+                checkpoint_store.inspected_best_state = _inspect_canonical_best(
                     store=checkpoint_store,
                     latest=resume_state,
                     indices=indices,
@@ -809,15 +875,14 @@ class PilotTrainer:
         def validate_joint(step: int, row: Mapping[str, object]) -> bool:
             nonlocal latest_validation_summary, best_evaluation_summary
             nonlocal checkpoint_pending_validation, checkpoint_stop_requested
-            validation_dir = output / "validation" / f"step_{step:06d}"
-            validation_dir.mkdir(parents=True, exist_ok=True)
-            evaluation = self.evaluator.evaluate(
-                heldout_samples,
-                heldout_indices,
-                system_name=f"{resolved_variant.value}_step_{step:06d}",
-                condition_enabled=bool(model.condition_enabled),
-                output_dir=validation_dir,
-            )
+            with _secure_validation_directory(output, step) as validation_dir:
+                evaluation = self.evaluator.evaluate(
+                    heldout_samples,
+                    heldout_indices,
+                    system_name=f"{resolved_variant.value}_step_{step:06d}",
+                    condition_enabled=bool(model.condition_enabled),
+                    output_dir=validation_dir,
+                )
             summary = json.loads(_strict_json(evaluation.summary))
             selected = selector.consider(step, summary)
             latest_validation_summary = summary

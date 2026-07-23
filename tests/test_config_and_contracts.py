@@ -49,6 +49,43 @@ train:
     assert config.train.crop_seconds == pytest.approx(0.5)
 
 
+def test_load_project_config_resolves_relative_paths_from_config_directory(
+    tmp_path: Path,
+) -> None:
+    config_dir = tmp_path / "configs" / "scene1"
+    config_dir.mkdir(parents=True)
+    path = config_dir / "scene.yaml"
+    path.write_text(
+        """
+scene:
+  id: scene1_opera
+  fps: 30
+  train_cameras: [cam00]
+  eval_cameras: [cam10]
+  camera_mapping: {cam00: 0, cam10: 10}
+paths:
+  visual_upstream_root: upstream/visual
+  audio_upstream_root: upstream/audio
+  visual_checkpoint: checkpoints/visual.pt
+  audio_checkpoint: checkpoints/audio.pt
+  manifest: manifests/scene.json
+  visual_memmap: cache/visual.dat
+model: {}
+train: {}
+""".strip()
+        + "\n"
+    )
+
+    config = load_project_config(path)
+
+    assert config.paths.visual_upstream_root == config_dir / "upstream/visual"
+    assert config.paths.audio_upstream_root == config_dir / "upstream/audio"
+    assert config.paths.visual_checkpoint == config_dir / "checkpoints/visual.pt"
+    assert config.paths.audio_checkpoint == config_dir / "checkpoints/audio.pt"
+    assert config.paths.manifest == config_dir / "manifests/scene.json"
+    assert config.paths.visual_memmap == config_dir / "cache/visual.dat"
+
+
 def test_load_project_config_rejects_nonpositive_crop(tmp_path: Path) -> None:
     path = tmp_path / "scene.yaml"
     path.write_text(

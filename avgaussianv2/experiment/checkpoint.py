@@ -41,6 +41,12 @@ STAGES = frozenset({"warmup", "joint", "complete"})
 ALGORITHM_IDENTITY = "avgaussianv2.pilot-training-v5"
 LOSS_STEP_API_VERSION = "avgaussianv2.loss-step-api-v1"
 MAX_PILOT_CHECKPOINT_BYTES = 256 * 1024 * 1024 * 1024
+MAX_CHECKPOINT_NESTING = 64
+MAX_CHECKPOINT_CONTAINER_ENTRIES = 2_000_000
+MAX_CHECKPOINT_TENSORS = 200_000
+MAX_CHECKPOINT_TENSOR_DIMENSIONS = 16
+MAX_CHECKPOINT_TENSOR_NUMEL = 1 << 40
+MAX_CHECKPOINT_LOGICAL_STORAGE_BYTES = MAX_PILOT_CHECKPOINT_BYTES
 
 
 class PilotResumeError(RuntimeError):
@@ -491,6 +497,114 @@ def save_pilot_checkpoint(path: str | Path, **kwargs: object) -> None:
     _atomic_torch_save(Path(path), build_pilot_payload(**kwargs))
 
 
+def _load_checkpoint_metadata(descriptor: int, source: Path) -> object:
+    try:
+        from torch._subclasses.fake_tensor import FakeTensorMode
+    except (ImportError, AttributeError) as error:
+        raise PilotResumeError(
+            "FakeTensorMode is required for allocation-safe checkpoint preflight"
+        ) from error
+    pinned = Path(f"/proc/self/fd/{descriptor}")
+    try:
+        with FakeTensorMode():
+            return torch.load(
+                pinned,
+                map_location="cpu",
+                weights_only=True,
+                mmap=True,
+            )
+    except Exception as error:
+        raise PilotResumeError(
+            f"cannot inspect pilot checkpoint metadata {source}: {error}"
+        ) from error
+
+
+def _load_checkpoint_real(descriptor: int) -> object:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    with os.fdopen(descriptor, "rb", closefd=False) as stream:
+        return torch.load(stream, map_location="cpu", weights_only=True)
+
+
+def _validate_checkpoint_metadata(value: object) -> None:
+    stack: list[tuple[object, int]] = [(value, 0)]
+    seen_containers: set[int] = set()
+    container_entries = 0
+    tensor_count = 0
+    logical_storage_bytes = 0
+    while stack:
+        item, depth = stack.pop()
+        if depth > MAX_CHECKPOINT_NESTING:
+            raise PilotResumeError("checkpoint metadata nesting limit exceeded")
+        if torch.is_tensor(item):
+            tensor_count += 1
+            if tensor_count > MAX_CHECKPOINT_TENSORS:
+                raise PilotResumeError("checkpoint tensor count limit exceeded")
+            if item.ndim > MAX_CHECKPOINT_TENSOR_DIMENSIONS:
+                raise PilotResumeError("checkpoint tensor dimension limit exceeded")
+            numel = item.numel()
+            if numel > MAX_CHECKPOINT_TENSOR_NUMEL:
+                raise PilotResumeError("checkpoint tensor numel limit exceeded")
+            try:
+                storage_bytes = item.untyped_storage().nbytes()
+            except (AttributeError, RuntimeError):
+                storage_bytes = numel * item.element_size()
+            logical_storage_bytes += int(storage_bytes)
+            if logical_storage_bytes > MAX_CHECKPOINT_LOGICAL_STORAGE_BYTES:
+                raise PilotResumeError(
+                    "checkpoint logical storage byte limit exceeded"
+                )
+            continue
+        if isinstance(item, Mapping):
+            identity = id(item)
+            if identity in seen_containers:
+                continue
+            seen_containers.add(identity)
+            container_entries += len(item)
+            if container_entries > MAX_CHECKPOINT_CONTAINER_ENTRIES:
+                raise PilotResumeError(
+                    "checkpoint metadata container entry limit exceeded"
+                )
+            for key, child in item.items():
+                stack.append((key, depth + 1))
+                stack.append((child, depth + 1))
+        elif isinstance(item, (list, tuple)):
+            identity = id(item)
+            if identity in seen_containers:
+                continue
+            seen_containers.add(identity)
+            container_entries += len(item)
+            if container_entries > MAX_CHECKPOINT_CONTAINER_ENTRIES:
+                raise PilotResumeError(
+                    "checkpoint metadata container entry limit exceeded"
+                )
+            stack.extend((child, depth + 1) for child in item)
+
+    if not isinstance(value, Mapping):
+        return
+    try:
+        pilot = value["run_fingerprint"]["inputs"]["pilot_config"]
+        warmup_steps = int(pilot["warmup_steps"])
+        joint_steps = int(pilot["joint_steps"])
+        validation_interval = int(pilot["validation_interval"])
+        training_history = value["training_history"]
+        validation_history = value["validation_history"]
+    except (KeyError, TypeError, ValueError):
+        return
+    if len(training_history) > warmup_steps + joint_steps:
+        raise PilotResumeError(
+            "checkpoint training history exceeds configured step count"
+        )
+    maximum_validations = (
+        (joint_steps + validation_interval - 1) // validation_interval
+        if validation_interval > 0
+        else 0
+    )
+    if len(validation_history) > maximum_validations:
+        raise PilotResumeError(
+            "checkpoint validation history exceeds configured step count"
+        )
+
+
 def _payload(path: str | Path) -> dict[str, Any]:
     source = Path(path)
     try:
@@ -517,8 +631,9 @@ def _payload(path: str | Path) -> dict[str, Any]:
                 "pilot checkpoint exceeds the configured "
                 f"{MAX_PILOT_CHECKPOINT_BYTES} byte limit: {source}"
             )
-        with os.fdopen(descriptor, "rb", closefd=False) as stream:
-            value = torch.load(stream, map_location="cpu", weights_only=True)
+        metadata_value = _load_checkpoint_metadata(descriptor, source)
+        _validate_checkpoint_metadata(metadata_value)
+        value = _load_checkpoint_real(descriptor)
     except Exception as error:
         raise PilotResumeError(f"cannot read pilot checkpoint {source}: {error}") from error
     finally:
@@ -1211,6 +1326,7 @@ class PilotCheckpointStore:
         self._lock_stream: Any | None = None
         self._directory_fd: int | None = None
         self._lock_depth = 0
+        self.inspected_best_state: PilotResumeState | None = None
 
     @property
     def pinned_output_dir(self) -> Path:

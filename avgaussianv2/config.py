@@ -202,6 +202,11 @@ def load_project_config_bytes(
     *,
     base_dir: str | Path,
 ) -> ProjectConfig:
+    """Parse config bytes, resolving relative paths against the config directory.
+
+    This preserves file-based loading semantics when callers migrate from
+    ``load_project_config(path)`` to a read-once byte snapshot.
+    """
     raw = yaml.safe_load(data.decode("utf-8"))
     if not isinstance(raw, Mapping):
         raise ValueError("configuration root must be a mapping")

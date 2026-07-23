@@ -900,6 +900,49 @@ def test_validation_commit_retains_journal_when_durability_is_ambiguous(
     assert not resumed.journal_path.exists()
 
 
+@pytest.mark.parametrize("case", ["depth", "tensor_count", "storage_bytes"])
+def test_checkpoint_metadata_limits_reject_before_real_materialization(
+    tmp_path, monkeypatch, case
+) -> None:
+    import avgaussianv2.experiment.checkpoint as checkpoint_module
+
+    checkpoint_path = tmp_path / "latest.pt"
+    checkpoint_path.write_bytes(b"metadata placeholder")
+    if case == "depth":
+        nested: object = 0
+        for _ in range(checkpoint_module.MAX_CHECKPOINT_NESTING + 1):
+            nested = [nested]
+        metadata = {"nested": nested}
+    elif case == "tensor_count":
+        monkeypatch.setattr(checkpoint_module, "MAX_CHECKPOINT_TENSORS", 1)
+        metadata = {"tensors": [torch.empty(0), torch.empty(0)]}
+    else:
+        monkeypatch.setattr(
+            checkpoint_module, "MAX_CHECKPOINT_LOGICAL_STORAGE_BYTES", 8
+        )
+        metadata = {"tensor": torch.empty(3, dtype=torch.float32)}
+
+    real_loads = []
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_load_checkpoint_metadata",
+        lambda descriptor, source: metadata,
+    )
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_load_checkpoint_real",
+        lambda descriptor: real_loads.append(True),
+    )
+
+    with pytest.raises(
+        checkpoint_module.PilotResumeError,
+        match="metadata|nesting|tensor|storage|limit",
+    ):
+        checkpoint_module._payload(checkpoint_path)
+
+    assert real_loads == []
+
+
 def test_committed_validation_reraises_keyboard_interrupt(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 from dataclasses import asdict
@@ -726,8 +727,12 @@ def test_resume_uses_canonical_manifest_semantics_not_whitespace(tmp_path) -> No
         runtime_factory=_fake_runtime,
         evaluator_factory=_FeasibleEvaluator,
     )
-    # Formatting-only changes preserve canonical validated semantics.
-    manifest.write_text(json.dumps(json.loads(manifest.read_text())))
+    # Formatting and equivalent JSON numeric spelling preserve validated semantics.
+    payload = json.loads(manifest.read_text())
+    payload["visual_baseline"]["summary"]["rgb_psnr"]["mean"] = int(
+        payload["visual_baseline"]["summary"]["rgb_psnr"]["mean"]
+    )
+    manifest.write_text(json.dumps(payload))
     calls = []
 
     def factory(*args):
@@ -925,7 +930,84 @@ def test_worker_releases_lock_when_runtime_factory_fails(tmp_path) -> None:
     assert result.best_step == 1
 
 
-def test_complete_resume_loads_latest_checkpoint_exactly_once(
+def test_worker_atomic_summary_replace_fsyncs_parent_directory(
+    tmp_path, monkeypatch
+) -> None:
+    import avgaussianv2.cli.pilot_worker as worker
+
+    directory_syncs = []
+    real_fsync = worker.os.fsync
+
+    def record_fsync(descriptor):
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            directory_syncs.append(True)
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(worker.os, "fsync", record_fsync)
+    worker._atomic_json(tmp_path / "worker_summary.json", {"ok": True})
+
+    assert directory_syncs == [True]
+
+
+def test_production_worker_refuses_missing_trust_before_artifact_hashing(
+    tmp_path, monkeypatch
+) -> None:
+    import avgaussianv2.cli.pilot_worker as worker
+
+    config, manifest, baseline, _ = _manifest_files(tmp_path)
+    snapshots = []
+    monkeypatch.setattr(
+        worker,
+        "_snapshot_file",
+        lambda path: snapshots.append(path) or (_ for _ in ()).throw(
+            AssertionError("artifact hashing must not run")
+        ),
+    )
+
+    with pytest.raises(PermissionError, match="trust-upstream-artifacts"):
+        worker.run_worker(
+            config,
+            Variant.FROZEN_VISUAL,
+            manifest,
+            baseline,
+            tmp_path / "run",
+            device="cpu",
+        )
+
+    assert snapshots == []
+
+
+def test_worker_rejects_unavailable_cuda_before_artifact_hashing(
+    tmp_path, monkeypatch
+) -> None:
+    import avgaussianv2.cli.pilot_worker as worker
+
+    config, manifest, baseline, _ = _manifest_files(tmp_path)
+    snapshots = []
+    monkeypatch.setattr(worker.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        worker,
+        "_snapshot_file",
+        lambda path: snapshots.append(path) or (_ for _ in ()).throw(
+            AssertionError("artifact hashing must not run")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="CUDA device is unavailable"):
+        worker.run_worker(
+            config,
+            Variant.FROZEN_VISUAL,
+            manifest,
+            baseline,
+            tmp_path / "run",
+            device="cuda:0",
+            trust_upstream_artifacts=True,
+        )
+
+    assert snapshots == []
+
+
+def test_complete_resume_loads_latest_and_best_checkpoint_exactly_once(
     tmp_path, monkeypatch
 ) -> None:
     import avgaussianv2.experiment.checkpoint as checkpoint
@@ -945,9 +1027,10 @@ def test_complete_resume_loads_latest_checkpoint_exactly_once(
     )
     original_load = checkpoint.torch.load
     latest_loads = 0
+    best_loads = 0
 
     def counting_load(path, *args, **kwargs):
-        nonlocal latest_loads
+        nonlocal latest_loads, best_loads
         loaded_path = (
             Path(os.readlink(f"/proc/self/fd/{path.fileno()}"))
             if hasattr(path, "fileno")
@@ -955,6 +1038,8 @@ def test_complete_resume_loads_latest_checkpoint_exactly_once(
         )
         if loaded_path == output / "latest.pt":
             latest_loads += 1
+        elif loaded_path == output / "best.pt":
+            best_loads += 1
         return original_load(path, *args, **kwargs)
 
     monkeypatch.setattr(checkpoint.torch, "load", counting_load)
@@ -970,6 +1055,7 @@ def test_complete_resume_loads_latest_checkpoint_exactly_once(
         evaluator_factory=_FeasibleEvaluator,
     )
     assert latest_loads == 1
+    assert best_loads == 1
 
 
 def test_resume_rejects_changed_trust_mode_before_runtime_factory(tmp_path) -> None:

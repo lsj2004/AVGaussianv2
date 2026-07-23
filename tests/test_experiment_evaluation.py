@@ -308,6 +308,41 @@ def test_preexisting_unlocked_writer_file_does_not_block(tmp_path) -> None:
     assert result.count == 1
 
 
+def test_metric_publication_rejects_lock_symlink_without_touching_target(
+    tmp_path,
+) -> None:
+    target = tmp_path / "outside.txt"
+    target.write_text("sentinel\n")
+    (tmp_path / ".metrics-publication.lock").symlink_to(target)
+
+    with pytest.raises(
+        (OSError, ValueError), match="symlink|symbolic|regular|secure"
+    ):
+        Evaluator(TinyModel(), audio_loss, "cpu").evaluate(
+            [sample(0)], [0], "x", True, tmp_path
+        )
+
+    assert target.read_text() == "sentinel\n"
+
+
+@pytest.mark.parametrize(
+    "name", ["metrics_per_sample.jsonl", "metrics_summary.json"]
+)
+def test_metric_publication_rejects_canonical_symlink_without_touching_target(
+    tmp_path, name
+) -> None:
+    target = tmp_path / "outside.txt"
+    target.write_text("sentinel\n")
+    (tmp_path / name).symlink_to(target)
+
+    with pytest.raises((OSError, ValueError), match="symlink|regular|secure"):
+        Evaluator(TinyModel(), audio_loss, "cpu").evaluate(
+            [sample(0)], [0], "x", True, tmp_path
+        )
+
+    assert target.read_text() == "sentinel\n"
+
+
 def test_genuinely_held_writer_lock_is_rejected(tmp_path) -> None:
     lock_path = tmp_path / ".metrics-publication.lock"
     descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -328,7 +363,7 @@ def test_backup_falls_back_to_durable_copy_when_hardlinks_are_unavailable(
     source = tmp_path / "metrics.json"
     source.write_text("original\n")
 
-    def unsupported_hardlink(source, target):
+    def unsupported_hardlink(source, target, **kwargs):
         raise OSError("unsupported")
 
     monkeypatch.setattr(os, "link", unsupported_hardlink)
@@ -343,18 +378,15 @@ def test_backup_falls_back_to_durable_copy_when_hardlinks_are_unavailable(
 def test_failed_backup_copy_cleans_partial_artifact(monkeypatch, tmp_path) -> None:
     source = tmp_path / "metrics.json"
     source.write_text("original\n")
-    real_open = Path.open
-
-    def fail_backup_target(path, mode="r", *args, **kwargs):
-        if path.suffix == ".backup" and "x" in mode:
-            raise OSError("copy failed")
-        return real_open(path, mode, *args, **kwargs)
-
-    def unsupported_hardlink(source, target):
+    def unsupported_hardlink(source, target, **kwargs):
         raise OSError("unsupported")
 
     monkeypatch.setattr(os, "link", unsupported_hardlink)
-    monkeypatch.setattr(Path, "open", fail_backup_target)
+    monkeypatch.setattr(
+        evaluation_module.shutil,
+        "copyfileobj",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("copy failed")),
+    )
     with pytest.raises(OSError, match="copy failed"):
         evaluation_module._snapshot_without_removing(source)
 

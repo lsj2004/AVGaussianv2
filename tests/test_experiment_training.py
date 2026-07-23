@@ -143,7 +143,15 @@ class FakeEvaluator:
         self.calls = []
 
     def evaluate(self, samples, indices, system_name, condition_enabled, output_dir):
-        self.calls.append((samples, tuple(indices), system_name, condition_enabled, output_dir))
+        self.calls.append(
+            (
+                samples,
+                tuple(indices),
+                system_name,
+                condition_enabled,
+                output_dir.resolve(),
+            )
+        )
         audio = next(self.audios)
         summary = {
             "audio_total": {"mean": audio},
@@ -1454,6 +1462,50 @@ def test_pilot_uses_persistent_optimizers_exact_order_and_final_validation(tmp_p
     summary = json.loads((tmp_path / "worker_summary.json").read_text())
     assert summary["completed_joint_steps"] == 3
     assert [row["step"] for row in summary["validation_history"]] == [2, 3]
+
+
+@pytest.mark.parametrize("symlink_level", ["validation", "step"])
+def test_pilot_rejects_validation_tree_symlink_before_evaluator(
+    tmp_path, symlink_level
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    validation = tmp_path / "validation"
+    if symlink_level == "validation":
+        validation.symlink_to(outside, target_is_directory=True)
+    else:
+        validation.mkdir()
+        (validation / "step_000001").symlink_to(
+            outside, target_is_directory=True
+        )
+    evaluator = FakeEvaluator((1.0,))
+    model = TinyTrainFusion()
+    model.condition_enabled = True
+
+    with pytest.raises((OSError, ValueError), match="validation|symlink|directory"):
+        PilotTrainer(
+            PilotConfig(
+                warmup_steps=0,
+                joint_steps=1,
+                validation_interval=1,
+                minimum_joint_steps=1,
+            ),
+            evaluator,
+            joint_step_fn=lambda *args, **kwargs: _stats(0.1),
+        ).run(
+            model=model,
+            train_samples=[make_sample()],
+            heldout_samples=[make_sample()],
+            indices=VariantIndices((), (0,)),
+            heldout_indices=(0,),
+            variant=Variant.JOINT_CONDITIONED,
+            visual_baseline=_baseline(),
+            audio_loss_fn=audio_loss,
+            output_dir=tmp_path,
+        )
+
+    assert evaluator.calls == []
+    assert list(outside.iterdir()) == []
     assert not list(tmp_path.glob("*.pt"))
 
 

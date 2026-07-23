@@ -218,6 +218,22 @@ def _strict_json(path: Path, limit: int = MAX_SMALL_INPUT_BYTES) -> object:
     return _strict_json_bytes(_read_bounded_regular_bytes(path, limit), str(path))
 
 
+def _normalized_manifest_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _normalized_manifest_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_normalized_manifest_value(item) for item in value]
+    if isinstance(value, Integral) and not isinstance(value, bool):
+        return int(value)
+    if isinstance(value, Real) and not isinstance(value, bool):
+        number = float(value)
+        return int(number) if number.is_integer() else number
+    return value
+
+
 def _pilot_config(value: object) -> PilotConfig:
     mapping = _exact(value, set(PilotConfig.__dataclass_fields__), "pilot_config")
     integer_fields = {
@@ -492,7 +508,7 @@ def load_worker_manifest(
     )
     return WorkerManifest(
         path=source.resolve(),
-        sha256=hash_index_manifest(raw),
+        sha256=hash_index_manifest(_normalized_manifest_value(raw)),
         scene_id=scene_id,
         seed=seed,
         pilot_config=pilot,
@@ -665,6 +681,14 @@ def _atomic_json(path: Path, value: Mapping[str, object]) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -809,10 +833,6 @@ def _run_worker_locked(
     trainer_factory: Callable[..., Any],
     artifact_snapshots: Sequence[FileSnapshot],
 ) -> PilotTrainingResult:
-    if device.type == "cuda":
-        index = 0 if device.index is None else device.index
-        if not torch.cuda.is_available() or index >= torch.cuda.device_count():
-            raise ValueError(f"CUDA device is unavailable: {device}")
     store.bind_run_fingerprint(expected_run_fingerprint)
     resume_state = None
     if resume:
@@ -921,14 +941,22 @@ def _run_worker_locked(
             allow_complete=True,
             active_resume=False,
         )
-    best = inspect_pilot_checkpoint(
-        store.best_path,
-        expected_compatibility=store.compatibility,
-        indices=indices,
-        expected_run_fingerprint=store.run_fingerprint,
-        model=bundle.model,
-        active_resume=False,
-    )
+    if (
+        resume
+        and preflight_stage == "complete"
+        and store.save_count == 0
+        and store.inspected_best_state is not None
+    ):
+        best = store.inspected_best_state
+    else:
+        best = inspect_pilot_checkpoint(
+            store.best_path,
+            expected_compatibility=store.compatibility,
+            indices=indices,
+            expected_run_fingerprint=store.run_fingerprint,
+            model=bundle.model,
+            active_resume=False,
+        )
     if latest is None or latest.stage != "complete":
         raise RuntimeError("pilot did not publish a complete readable checkpoint")
 
@@ -976,6 +1004,15 @@ def run_worker(
     config = load_project_config_bytes(
         config_bytes, base_dir=config_source.parent
     )
+    if runtime_factory is None and not trust_upstream_artifacts:
+        raise PermissionError(
+            "production runtime requires --trust-upstream-artifacts because "
+            "configured upstream Python and unsafe legacy pickle are loaded"
+        )
+    if resolved_device.type == "cuda":
+        index = 0 if resolved_device.index is None else resolved_device.index
+        if not torch.cuda.is_available() or index >= torch.cuda.device_count():
+            raise ValueError(f"CUDA device is unavailable: {resolved_device}")
     artifact_snapshots = (
         _snapshot_file(config.paths.visual_checkpoint),
         _snapshot_file(config.paths.audio_checkpoint),
