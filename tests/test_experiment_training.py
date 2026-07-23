@@ -16,6 +16,10 @@ from avgaussianv2.experiment.contracts import (
     VariantIndices,
 )
 from avgaussianv2.experiment.evaluation import Evaluator
+from avgaussianv2.experiment.checkpoint import (
+    PilotCheckpointStore,
+    PilotCompatibility,
+)
 from avgaussianv2.experiment.training import PilotTrainer, configure_variant
 from avgaussianv2.train import DisconnectedAudioVisualGradient, TrainStepStats
 
@@ -166,6 +170,193 @@ def _sample_with_frame(frame: int):
 
 def _baseline():
     return {"rgb_psnr": {"mean": 30.0}, "rgb_ssim": {"mean": 0.95}}
+
+
+def _pilot_compatibility(variant=Variant.JOINT_CONDITIONED):
+    return PilotCompatibility(
+        scene_id="scene1_opera",
+        variant=variant.value,
+        seed=1,
+        index_hash="1" * 64,
+        visual_checkpoint_sha256="2" * 64,
+        audio_checkpoint_sha256="3" * 64,
+        camera_mapping_sha256="4" * 64,
+        n_fft=512,
+        hop_length=128,
+        win_length=512,
+        sample_rate=48_000,
+    )
+
+
+def test_checkpoint_resume_after_validation_does_not_replay_joint_step(tmp_path) -> None:
+    seen = []
+
+    def joint_step(model, sample, optimizer, *args, **kwargs):
+        seen.append(sample.frame_index)
+        with torch.no_grad():
+            next(model.parameters()).add_(1)
+        return _stats(0.1)
+
+    model = TinyTrainFusion()
+    model.condition_enabled = True
+    config = PilotConfig(
+        warmup_steps=0,
+        joint_steps=3,
+        validation_interval=1,
+        minimum_joint_steps=3,
+    )
+    store = PilotCheckpointStore(tmp_path, _pilot_compatibility())
+    trainer = PilotTrainer(config, FakeEvaluator((1.0, 0.9, 0.8)), joint_step_fn=joint_step)
+
+    with pytest.raises(RuntimeError, match="interrupt"):
+        trainer.run(
+            model=model,
+            train_samples=[_sample_with_frame(i) for i in range(3)],
+            heldout_samples=[make_sample()],
+            indices=VariantIndices((), (0, 1, 2)),
+            heldout_indices=(0,),
+            variant=Variant.JOINT_CONDITIONED,
+            visual_baseline=_baseline(),
+            audio_loss_fn=audio_loss,
+            output_dir=tmp_path,
+            checkpoint_store=store,
+            on_validation=lambda event: (
+                (_ for _ in ()).throw(RuntimeError("interrupt"))
+                if event.step == 1
+                else None
+            ),
+        )
+
+    resumed = TinyTrainFusion()
+    resumed.condition_enabled = True
+    result = PilotTrainer(
+        config, FakeEvaluator((0.9, 0.8)), joint_step_fn=joint_step
+    ).run(
+        model=resumed,
+        train_samples=[_sample_with_frame(i) for i in range(3)],
+        heldout_samples=[make_sample()],
+        indices=VariantIndices((), (0, 1, 2)),
+        heldout_indices=(0,),
+        variant=Variant.JOINT_CONDITIONED,
+        visual_baseline=_baseline(),
+        audio_loss_fn=audio_loss,
+        output_dir=tmp_path,
+        checkpoint_store=PilotCheckpointStore(
+            tmp_path, _pilot_compatibility(), resume=True
+        ),
+    )
+
+    assert seen == [0, 1, 2]
+    assert result.completed_joint_steps == 3
+    assert (tmp_path / "latest.pt").is_file()
+    assert (tmp_path / "best.pt").is_file()
+    assert torch.load(tmp_path / "latest.pt", weights_only=False)["stage"] == "complete"
+    best = torch.load(tmp_path / "best.pt", weights_only=False)
+    assert best["evaluation_summary"]["audio_total"]["mean"] == 0.8
+    assert best["optimizer_state_dict"] is None
+    for name, value in resumed.state_dict().items():
+        assert torch.equal(best["model_state_dict"][name], value)
+
+
+def test_checkpoint_condition_off_keeps_warmup_position_zero(tmp_path) -> None:
+    variant = Variant.CONDITION_OFF
+    model = TinyTrainFusion()
+    model.condition_enabled = True
+    PilotTrainer(
+        PilotConfig(warmup_steps=2, joint_steps=1, validation_interval=1, minimum_joint_steps=1),
+        FakeEvaluator((1.0,)),
+        joint_step_fn=lambda *args, **kwargs: _stats(),
+    ).run(
+        model=model,
+        train_samples=[make_sample()],
+        heldout_samples=[make_sample()],
+        indices=VariantIndices((), (0,)),
+        heldout_indices=(0,),
+        variant=variant,
+        visual_baseline=_baseline(),
+        audio_loss_fn=audio_loss,
+        output_dir=tmp_path,
+        checkpoint_store=PilotCheckpointStore(
+            tmp_path, _pilot_compatibility(variant)
+        ),
+    )
+    payload = torch.load(tmp_path / "latest.pt", weights_only=False)
+    assert payload["next_warmup_position"] == 0
+
+
+def test_checkpoint_resume_after_warmup_save_does_not_replay_step(
+    tmp_path, monkeypatch
+) -> None:
+    import avgaussianv2.experiment.training as training_module
+
+    seen = []
+    real_save = training_module.save_pilot_checkpoint
+    saves = 0
+
+    def interrupt_after_first_save(*args, **kwargs):
+        nonlocal saves
+        real_save(*args, **kwargs)
+        saves += 1
+        if saves == 1:
+            raise RuntimeError("interrupt")
+
+    def warmup_step(model, sample, optimizer, criterion):
+        seen.append(sample.frame_index)
+        with torch.no_grad():
+            next(model.parameters()).add_(1)
+        return _stats()
+
+    config = PilotConfig(
+        warmup_steps=2,
+        joint_steps=1,
+        validation_interval=1,
+        minimum_joint_steps=1,
+    )
+    monkeypatch.setattr(training_module, "save_pilot_checkpoint", interrupt_after_first_save)
+    model = TinyTrainFusion()
+    model.condition_enabled = True
+    with pytest.raises(RuntimeError, match="interrupt"):
+        PilotTrainer(
+            config,
+            FakeEvaluator((1.0,)),
+            warmup_step_fn=warmup_step,
+            joint_step_fn=lambda *args, **kwargs: _stats(0.1),
+        ).run(
+            model=model,
+            train_samples=[_sample_with_frame(10), _sample_with_frame(11)],
+            heldout_samples=[make_sample()],
+            indices=VariantIndices((0, 1), (0,)),
+            heldout_indices=(0,),
+            variant=Variant.JOINT_CONDITIONED,
+            visual_baseline=_baseline(),
+            audio_loss_fn=audio_loss,
+            output_dir=tmp_path,
+            checkpoint_store=PilotCheckpointStore(tmp_path, _pilot_compatibility()),
+        )
+
+    monkeypatch.setattr(training_module, "save_pilot_checkpoint", real_save)
+    resumed = TinyTrainFusion()
+    resumed.condition_enabled = True
+    PilotTrainer(
+        config,
+        FakeEvaluator((1.0,)),
+        warmup_step_fn=warmup_step,
+        joint_step_fn=lambda *args, **kwargs: _stats(0.1),
+    ).run(
+        model=resumed,
+        train_samples=[_sample_with_frame(10), _sample_with_frame(11)],
+        heldout_samples=[make_sample()],
+        indices=VariantIndices((0, 1), (0,)),
+        heldout_indices=(0,),
+        variant=Variant.JOINT_CONDITIONED,
+        visual_baseline=_baseline(),
+        audio_loss_fn=audio_loss,
+        output_dir=tmp_path,
+        checkpoint_store=PilotCheckpointStore(
+            tmp_path, _pilot_compatibility(), resume=True
+        ),
+    )
+    assert seen == [10, 11]
 
 
 def test_pilot_rejects_evaluator_bound_to_different_model_before_mutation(tmp_path) -> None:
