@@ -14,6 +14,7 @@ from avgaussianv2.experiment.report import (
     REQUIRED_SYSTEMS,
     SystemReportInput,
     build_comparison,
+    decide_long_training,
     paired_audio_deltas,
 )
 from avgaussianv2.experiment import PilotDecision as ExportedPilotDecision
@@ -199,6 +200,25 @@ def test_build_comparison_ready_and_writes_exact_deterministic_files(tmp_path):
     assert [row["system"] for row in rows] == list(REQUIRED_SYSTEMS)
     assert "# Pilot comparison: READY" in (tmp_path / "comparison.md").read_text()
     assert "Lower is better" in (tmp_path / "comparison.md").read_text()
+    payload = json.loads((tmp_path / "comparison.json").read_text())
+    comparison = payload["descriptive_comparisons"][
+        "condition_off_vs_joint_conditioned_off"
+    ]
+    assert comparison == {
+        "condition_off_audio_total_mean": pytest.approx(0.96),
+        "joint_conditioned_off_audio_total_mean": pytest.approx(0.91),
+        "audio_total_mean_delta": pytest.approx(0.05),
+        "delta_definition": "condition_off - joint_conditioned_off",
+        "interpretation": "negative favors separately trained condition_off",
+        "decision_gate": False,
+    }
+    markdown = (tmp_path / "comparison.md").read_text()
+    assert (
+        "Separately trained condition_off vs joint_conditioned_off: audio_total "
+        "mean 0.96 vs 0.91; signed delta (condition_off - "
+        "joint_conditioned_off) 0.05. Negative favors separately trained "
+        "condition_off. This is descriptive and is not a decision gate."
+    ) in markdown
     before = {name: (tmp_path / name).read_bytes() for name in expected}
     build_comparison(list(reversed(_ready_systems())), tmp_path)
     assert before == {name: (tmp_path / name).read_bytes() for name in expected}
@@ -314,6 +334,28 @@ def test_malformed_contracts_are_rejected(tmp_path, mutation, match):
     mutation(systems)
     with pytest.raises((TypeError, ValueError), match=match):
         build_comparison(systems, tmp_path)
+
+
+def test_zero_minimum_steps_worker_summary_is_valid(tmp_path):
+    systems = _ready_systems()
+    for system in systems[1:]:
+        system.worker_summary["stopper_state"]["minimum_steps"] = 0
+    assert build_comparison(systems, tmp_path).decision.ready
+
+
+def test_rows_must_match_each_system_provenance_scene_even_when_all_agree(tmp_path):
+    systems = _ready_systems()
+    for system in systems:
+        for row in system.evaluation.rows:
+            row["scene_id"] = "consistently_wrong"
+    decision = decide_long_training(systems)
+    assert not decision.ready
+    assert decision.reasons == (
+        "comparison data is missing, nonfinite, or inconsistent",
+    )
+    with pytest.raises(ValueError, match="row scene.*provenance"):
+        build_comparison(systems, tmp_path)
+    assert not (tmp_path / "comparison.json").exists()
 
 
 def test_metric_deltas_follow_documented_direction(tmp_path):

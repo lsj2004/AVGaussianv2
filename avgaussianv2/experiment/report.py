@@ -139,6 +139,7 @@ class ComparisonResult:
     systems: dict[str, dict[str, object]]
     rows: dict[str, tuple[dict[str, object], ...]]
     paired_condition: dict[str, object]
+    descriptive_comparisons: dict[str, dict[str, object]]
     decision: PilotDecision
 
     @property
@@ -457,12 +458,15 @@ def _validate_worker(
     stopper = _exact(
         value["stopper_state"], _STOPPER_FIELDS, f"{system_name}.stopper_state"
     )
-    for field in ("minimum_steps", "patience"):
-        _integer(
-            stopper[field],
-            f"{system_name}.stopper_state.{field}",
-            minimum=1,
-        )
+    _integer(
+        stopper["minimum_steps"],
+        f"{system_name}.stopper_state.minimum_steps",
+    )
+    _integer(
+        stopper["patience"],
+        f"{system_name}.stopper_state.patience",
+        minimum=1,
+    )
     _integer(stopper["stale"], f"{system_name}.stopper_state.stale")
     relative_delta = _scalar(
         stopper["relative_delta"],
@@ -528,6 +532,8 @@ def _validate_worker(
         "best_step": best_step,
         "stop_reason": stop_reason,
         "max_audio_to_visual_grad_norm": max(gradients),
+        "config_sha256": identity["config_sha256"],
+        "manifest_sha256": identity["manifest_sha256"],
     }
 
 
@@ -647,6 +653,10 @@ def _normalize_systems(
         item = by_name[name]
         summary, system_rows = _validate_evaluation(item.evaluation, name)
         provenance = _validate_provenance(item.provenance, name)
+        if any(row["scene_id"] != provenance["scene_id"] for row in system_rows):
+            raise ValueError(
+                f"{name} row scene_id does not match provenance scene_id"
+            )
         if name == "baseline_imported":
             if item.worker_summary is not None:
                 raise ValueError("baseline_imported worker_summary must be None")
@@ -692,6 +702,13 @@ def _normalize_systems(
             "joint_conditioned_on/off must use the same checkpoint SHA-256 "
             "and checkpoint generation"
         )
+    trained_workers = [
+        normalized[name]["worker"] for name in REQUIRED_SYSTEMS[1:]
+    ]
+    if len({worker["config_sha256"] for worker in trained_workers}) != 1:
+        raise ValueError("trained worker config identity mismatch")
+    if len({worker["manifest_sha256"] for worker in trained_workers}) != 1:
+        raise ValueError("trained worker manifest identity mismatch")
     return normalized, rows
 
 
@@ -804,6 +821,23 @@ def _system_output(
     return result
 
 
+def _descriptive_comparisons(
+    systems: Mapping[str, Mapping[str, object]],
+) -> dict[str, dict[str, object]]:
+    condition_off = systems["condition_off"]["summary"]["audio_total"]["mean"]
+    joint_off = systems["joint_conditioned_off"]["summary"]["audio_total"]["mean"]
+    return {
+        "condition_off_vs_joint_conditioned_off": {
+            "condition_off_audio_total_mean": condition_off,
+            "joint_conditioned_off_audio_total_mean": joint_off,
+            "audio_total_mean_delta": condition_off - joint_off,
+            "delta_definition": "condition_off - joint_conditioned_off",
+            "interpretation": "negative favors separately trained condition_off",
+            "decision_gate": False,
+        }
+    }
+
+
 def _json_text(value: object, *, indent: int | None = 2) -> str:
     return json.dumps(
         value,
@@ -868,6 +902,7 @@ def _csv_text(systems: Mapping[str, Mapping[str, object]]) -> str:
 def _markdown_text(
     systems: Mapping[str, Mapping[str, object]],
     paired: Mapping[str, object],
+    descriptive: Mapping[str, Mapping[str, object]],
     decision: PilotDecision,
 ) -> str:
     status = "READY" if decision.ready else "NOT READY"
@@ -903,7 +938,7 @@ def _markdown_text(
         )
     joint = systems["joint_conditioned_on"]
     frozen = systems["frozen_visual_on"]
-    separate = systems["condition_off"]
+    separate_comparison = descriptive["condition_off_vs_joint_conditioned_off"]
     lines.extend(
         [
             "",
@@ -920,8 +955,13 @@ def _markdown_text(
             f"Frozen visual vs joint audio_total mean: "
             f"{frozen['summary']['audio_total']['mean']:.12g} vs "
             f"{joint['summary']['audio_total']['mean']:.12g}.",
-            f"Separately trained condition-off audio_total mean: "
-            f"{separate['summary']['audio_total']['mean']:.12g}. "
+            "Separately trained condition_off vs joint_conditioned_off: "
+            f"audio_total mean "
+            f"{separate_comparison['condition_off_audio_total_mean']:.12g} vs "
+            f"{separate_comparison['joint_conditioned_off_audio_total_mean']:.12g}; "
+            "signed delta (condition_off - joint_conditioned_off) "
+            f"{separate_comparison['audio_total_mean_delta']:.12g}. "
+            "Negative favors separately trained condition_off. "
             "This is descriptive and is not a decision gate.",
             "",
             f"## Decision: {status}",
@@ -1024,11 +1064,13 @@ def build_comparison(
         rows["joint_conditioned_on"], rows["joint_conditioned_off"]
     )
     output_systems = _system_output(normalized)
+    descriptive = _descriptive_comparisons(output_systems)
     decision = _decide_normalized(output_systems, paired)
     result = ComparisonResult(
         systems=output_systems,
         rows=rows,
         paired_condition=paired,
+        descriptive_comparisons=descriptive,
         decision=decision,
     )
     json_payload: dict[str, Any] = {
@@ -1037,6 +1079,7 @@ def build_comparison(
         "systems": output_systems,
         "rows": {name: list(rows[name]) for name in REQUIRED_SYSTEMS},
         "paired_condition": paired,
+        "descriptive_comparisons": descriptive,
         "decision": {
             "ready": decision.ready,
             "reasons": list(decision.reasons),
@@ -1050,7 +1093,9 @@ def build_comparison(
         {
             "comparison.json": _json_text(json_payload),
             "comparison.csv": _csv_text(output_systems),
-            "comparison.md": _markdown_text(output_systems, paired, decision),
+            "comparison.md": _markdown_text(
+                output_systems, paired, descriptive, decision
+            ),
             "paired_condition_deltas.jsonl": paired_jsonl,
         },
     )
