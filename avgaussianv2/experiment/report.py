@@ -163,6 +163,16 @@ class EvaluationArtifactProvenance:
 
 
 @dataclass(frozen=True)
+class WorkerArtifactProvenance:
+    worker_summary_path: Path
+    worker_summary_sha256: str
+    latest_checkpoint_path: Path
+    latest_checkpoint_sha256: str
+    latest_checkpoint_generation: int
+    run_fingerprint: Mapping[str, object]
+
+
+@dataclass(frozen=True)
 class CheckpointArtifactIdentity:
     checkpoint_kind: str
     generation: int
@@ -171,6 +181,7 @@ class CheckpointArtifactIdentity:
     visual_baseline: Mapping[str, object]
     psnr_tolerance_db: float
     ssim_tolerance: float
+    best_evaluation_summary: Mapping[str, object]
 
 
 @dataclass(frozen=True)
@@ -179,6 +190,7 @@ class SystemReportInput:
     evaluation: EvaluationResult
     worker_summary: Mapping[str, object] | None
     provenance: EvaluationArtifactProvenance
+    worker_provenance: WorkerArtifactProvenance | None
 
 
 @dataclass(frozen=True)
@@ -202,6 +214,12 @@ class ComparisonResult:
     @property
     def pair_records(self) -> tuple[dict[str, object], ...]:
         return tuple(self.paired_condition["records"])
+
+
+@dataclass(frozen=True)
+class ResolvedReport:
+    generation_path: Path
+    durability_warnings: tuple[str, ...]
 
 
 def _exact(value: object, fields: set[str], name: str) -> Mapping[str, object]:
@@ -483,6 +501,7 @@ def resolve_pilot_checkpoint_identity(
         visual_baseline=selector_state["visual_baseline"],
         psnr_tolerance_db=float(selector_state["psnr_tolerance_db"]),
         ssim_tolerance=float(selector_state["ssim_tolerance"]),
+        best_evaluation_summary=state.best_evaluation_summary,
     )
 
 
@@ -642,7 +661,12 @@ def _validate_worker(
         step = _integer(row["step"], f"{system_name}.training_history[{index}].step", minimum=1)
         observed_stage_steps.append((str(stage), step))
         _integer(row["sample_index"], f"{system_name}.training_history[{index}].sample_index")
-        _scalar(row["total"], f"{system_name}.training_history[{index}].total")
+        if _scalar(
+            row["total"], f"{system_name}.training_history[{index}].total"
+        ) < 0:
+            raise ValueError(
+                f"{system_name}.training_history[{index}].total must be nonnegative"
+            )
         gradient = _scalar(
             row["audio_to_visual_grad_norm"],
             f"{system_name}.training_history[{index}].audio_to_visual_grad_norm",
@@ -1035,6 +1059,7 @@ def _validate_provenance(
         "evaluation_run_id": run_id,
     }
     if system_name != "baseline_imported":
+        result["_checkpoint_identity"] = identity
         result["_checkpoint_best_step"] = identity.best_step
         result["_checkpoint_visual_baseline"] = identity.visual_baseline
         result["_checkpoint_psnr_tolerance_db"] = identity.psnr_tolerance_db
@@ -1125,6 +1150,233 @@ def _load_evaluation_artifact(
     if _digest(value.manifest_sha256, f"{system_name}.manifest_sha256") != expected_manifest:
         raise ValueError(f"{system_name} evaluation manifest hash mismatch")
     return EvaluationResult(system_name, count, rows, summary), value.checkpoint
+
+
+def _load_worker_summary_artifact(
+    value: WorkerArtifactProvenance,
+    system_name: str,
+    cache: dict[Path, tuple[str, tuple[int, int, int, int, int], dict[str, object]]],
+) -> tuple[dict[str, object], Path]:
+    if not isinstance(value.worker_summary_path, Path):
+        raise TypeError(f"{system_name} worker_summary_path must be a Path")
+    path = Path(os.path.abspath(value.worker_summary_path))
+    expected_sha = _digest(
+        value.worker_summary_sha256,
+        f"{system_name}.worker_summary_sha256",
+    )
+    identity = _artifact_identity_tuple(path)
+    resolved = path.resolve(strict=True)
+    cached = cache.get(resolved)
+    if cached is None:
+        data = _read_verified_artifact(
+            path,
+            expected_sha,
+            limit=64 * 1024 * 1024,
+            name=f"{system_name} worker_summary.json",
+        )
+        try:
+            parsed = json.loads(
+                data.decode("utf-8"),
+                parse_constant=lambda token: (_ for _ in ()).throw(
+                    ValueError(f"non-finite JSON constant {token}")
+                ),
+            )
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"{system_name} worker_summary.json is invalid JSON"
+            ) from error
+        if not isinstance(parsed, dict):
+            raise TypeError(f"{system_name} worker_summary.json must be an object")
+        cache[resolved] = (expected_sha, identity, parsed)
+    else:
+        cached_sha, cached_identity, parsed = cached
+        if cached_sha != expected_sha or cached_identity != identity:
+            raise ValueError(
+                f"{system_name} worker summary identity disagrees between uses"
+            )
+    return parsed, resolved
+
+
+def _strict_json_equal(left: object, right: object) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _strict_json_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _strict_json_equal(a, b) for a, b in zip(left, right)
+        )
+    return left == right
+
+
+def _load_latest_checkpoint_artifact(
+    value: WorkerArtifactProvenance,
+    checkpoint: EvaluationProvenance,
+    system_name: str,
+    cache: dict[
+        Path,
+        tuple[
+            str,
+            tuple[int, int, int, int, int],
+            object,
+        ],
+    ],
+) -> tuple[object, Path]:
+    if not isinstance(value.latest_checkpoint_path, Path):
+        raise TypeError(f"{system_name} latest_checkpoint_path must be a Path")
+    if checkpoint.compatibility is None or checkpoint.variant_indices is None:
+        raise ValueError(f"{system_name} latest checkpoint expectations are incomplete")
+    path = Path(os.path.abspath(value.latest_checkpoint_path))
+    expected_sha = _digest(
+        value.latest_checkpoint_sha256,
+        f"{system_name}.latest_checkpoint_sha256",
+    )
+    generation = _integer(
+        value.latest_checkpoint_generation,
+        f"{system_name}.latest_checkpoint_generation",
+    )
+    run_fingerprint = _run_fingerprint(
+        value.run_fingerprint, f"{system_name}.worker run_fingerprint"
+    )
+    if run_fingerprint != _run_fingerprint(
+        checkpoint.run_fingerprint, f"{system_name}.checkpoint run_fingerprint"
+    ):
+        raise ValueError(f"{system_name} latest/best run_fingerprint mismatch")
+    before = _artifact_identity_tuple(path)
+    resolved = path.resolve(strict=True)
+    cached = cache.get(resolved)
+    if cached is None:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != before[:2]:
+                raise ValueError(f"{system_name} latest checkpoint identity changed")
+            actual_sha = _hash_fd(descriptor)
+            if actual_sha != expected_sha:
+                raise ValueError(f"{system_name} latest checkpoint SHA-256 mismatch")
+            state = inspect_pilot_checkpoint(
+                Path(f"/proc/self/fd/{descriptor}"),
+                expected_compatibility=checkpoint.compatibility,
+                indices=checkpoint.variant_indices,
+                expected_run_fingerprint=run_fingerprint,
+                active_resume=False,
+            )
+            after = os.fstat(descriptor)
+            after_identity = (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            if after_identity != before:
+                raise ValueError(
+                    f"{system_name} latest checkpoint changed during inspection"
+                )
+        finally:
+            os.close(descriptor)
+        cache[resolved] = (actual_sha, before, state)
+    else:
+        cached_sha, cached_identity, state = cached
+        if cached_sha != expected_sha or cached_identity != before:
+            raise ValueError(
+                f"{system_name} latest checkpoint identity disagrees between uses"
+            )
+    if state.checkpoint_kind != "latest":
+        raise ValueError(f"{system_name} complete checkpoint must have kind latest")
+    if state.stage != "complete":
+        raise ValueError(f"{system_name} latest checkpoint stage must be complete")
+    if state.generation != generation:
+        raise ValueError(f"{system_name} latest checkpoint generation mismatch")
+    if _run_fingerprint(
+        state.run_fingerprint, f"{system_name} inspected latest run_fingerprint"
+    ) != run_fingerprint:
+        raise ValueError(f"{system_name} inspected latest run_fingerprint mismatch")
+    return state, resolved
+
+
+def _bind_verified_worker_evidence(
+    *,
+    system_name: str,
+    in_memory: Mapping[str, object],
+    provenance: WorkerArtifactProvenance,
+    checkpoint_provenance: EvaluationProvenance,
+    best_identity: CheckpointArtifactIdentity,
+    scene_id: str,
+    worker_cache: dict[
+        Path, tuple[str, tuple[int, int, int, int, int], dict[str, object]]
+    ],
+    latest_cache: dict[
+        Path, tuple[str, tuple[int, int, int, int, int], object]
+    ],
+) -> tuple[dict[str, object], tuple[object, ...]]:
+    actual_worker, worker_path = _load_worker_summary_artifact(
+        provenance, system_name, worker_cache
+    )
+    if not _strict_json_equal(dict(in_memory), actual_worker):
+        raise ValueError(
+            f"{system_name} in-memory worker summary disagrees with hashed artifact"
+        )
+    worker = _validate_worker(actual_worker, system_name, scene_id)
+    latest, latest_path = _load_latest_checkpoint_artifact(
+        provenance,
+        checkpoint_provenance,
+        system_name,
+        latest_cache,
+    )
+    expected_variant = _EXPECTED_VARIANTS[system_name]
+    if latest.checkpoint_kind != "latest" or latest.stage != "complete":
+        raise ValueError(f"{system_name} latest checkpoint is not complete")
+    if checkpoint_provenance.compatibility.variant != expected_variant:
+        raise ValueError(f"{system_name} latest checkpoint variant mismatch")
+    exact_pairs = (
+        ("completed_warmup_steps", latest.completed_warmup_steps),
+        ("completed_joint_steps", latest.completed_joint_steps),
+        ("best_step", latest.selector.best_step),
+        ("stop_reason", latest.stop_reason),
+        ("training_history", list(latest.training_history)),
+        ("validation_history", list(latest.validation_history)),
+        ("selector_state", latest.selector.state_dict()),
+        ("stopper_state", latest.stopper.state_dict()),
+    )
+    for field, expected in exact_pairs:
+        if actual_worker[field] != expected:
+            raise ValueError(
+                f"{system_name} worker/latest {field} mismatch"
+            )
+    if latest.best_generation != best_identity.generation:
+        raise ValueError(f"{system_name} latest/best generation mismatch")
+    if latest.best_evaluation_summary != best_identity.best_evaluation_summary:
+        raise ValueError(f"{system_name} latest/best summary mismatch")
+    gradients = [
+        _scalar(
+            row["audio_to_visual_grad_norm"],
+            f"{system_name} latest joint gradient",
+        )
+        for row in latest.training_history
+        if row["stage"] == "joint"
+    ]
+    if not gradients:
+        raise ValueError(f"{system_name} latest checkpoint has no joint history")
+    if latest.maximum_positive_audio_visual_gradient != max(gradients):
+        raise ValueError(
+            f"{system_name} latest checkpoint gradient summary mismatch"
+        )
+    worker["max_audio_to_visual_grad_norm"] = max(gradients)
+    identity = (
+        worker_path,
+        provenance.worker_summary_sha256,
+        latest_path,
+        provenance.latest_checkpoint_sha256,
+        provenance.latest_checkpoint_generation,
+        _run_fingerprint(provenance.run_fingerprint, "worker run_fingerprint"),
+    )
+    return worker, identity
 
 
 def paired_audio_deltas(
@@ -1225,6 +1477,13 @@ def _normalize_systems(
         Path, tuple[str, tuple[int, int, int, int, int]]
     ] = {}
     identity_cache: dict[Path, CheckpointArtifactIdentity] = {}
+    worker_cache: dict[
+        Path, tuple[str, tuple[int, int, int, int, int], dict[str, object]]
+    ] = {}
+    latest_cache: dict[
+        Path, tuple[str, tuple[int, int, int, int, int], object]
+    ] = {}
+    worker_identities: dict[str, tuple[object, ...]] = {}
     for name in REQUIRED_SYSTEMS:
         item = by_name[name]
         artifact_evaluation, checkpoint_provenance = _load_evaluation_artifact(
@@ -1251,13 +1510,27 @@ def _normalize_systems(
         if name == "baseline_imported":
             if item.worker_summary is not None:
                 raise ValueError("baseline_imported worker_summary must be None")
+            if item.worker_provenance is not None:
+                raise ValueError("baseline_imported worker_provenance must be None")
             worker = None
         else:
             if item.worker_summary is None:
                 raise ValueError(f"{name} requires a worker summary")
-            worker = _validate_worker(
-                item.worker_summary, name, str(provenance["scene_id"])
+            if not isinstance(item.worker_provenance, WorkerArtifactProvenance):
+                raise TypeError(
+                    f"{name} requires a WorkerArtifactProvenance"
+                )
+            worker, worker_identity = _bind_verified_worker_evidence(
+                system_name=name,
+                in_memory=item.worker_summary,
+                provenance=item.worker_provenance,
+                checkpoint_provenance=checkpoint_provenance,
+                best_identity=provenance["_checkpoint_identity"],
+                scene_id=str(provenance["scene_id"]),
+                worker_cache=worker_cache,
+                latest_cache=latest_cache,
             )
+            worker_identities[name] = worker_identity
             if worker["best_step"] != provenance["_checkpoint_best_step"]:
                 raise ValueError(f"{name} worker/checkpoint best_step mismatch")
             if (
@@ -1278,6 +1551,7 @@ def _normalize_systems(
                 )
             for internal_field in (
                 "_checkpoint_best_step",
+                "_checkpoint_identity",
                 "_checkpoint_visual_baseline",
                 "_checkpoint_psnr_tolerance_db",
                 "_checkpoint_ssim_tolerance",
@@ -1289,6 +1563,14 @@ def _normalize_systems(
             "worker": worker,
         }
         rows[name] = system_rows
+
+    if (
+        worker_identities["joint_conditioned_on"]
+        != worker_identities["joint_conditioned_off"]
+    ):
+        raise ValueError(
+            "joint conditioned on/off must share identical worker/latest artifacts"
+        )
 
     baseline_rows = {str(row["sample_id"]): row for row in rows["baseline_imported"]}
     baseline_scene = normalized["baseline_imported"]["provenance"]["scene_id"]
@@ -2007,20 +2289,163 @@ def _publish_generation(
         if temporary_name is not None and generations_fd is not None:
             _remove_temporary_generation(generations_fd, temporary_name)
         if generations_fd is not None:
-            os.close(generations_fd)
+            if committed:
+                try:
+                    os.close(generations_fd)
+                except Exception as error:
+                    durability_warnings.append(
+                        f"current pointer committed but generations fd close failed: {error}"
+                    )
+            else:
+                os.close(generations_fd)
         if lock_fd is not None:
+            if committed:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except Exception as error:
+                    durability_warnings.append(
+                        f"current pointer committed but lock release failed: {error}"
+                    )
+                try:
+                    os.close(lock_fd)
+                except Exception as error:
+                    durability_warnings.append(
+                        f"current pointer committed but lock fd close failed: {error}"
+                    )
+            else:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
+        if committed:
             try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            finally:
-                os.close(lock_fd)
-        os.close(output_fd)
+                os.close(output_fd)
+            except Exception as error:
+                durability_warnings.append(
+                    f"current pointer committed but output fd close failed: {error}"
+                )
+        else:
+            os.close(output_fd)
     generation_path = absolute_output / ".report-generations" / digest
     if not committed:
         raise RuntimeError("report publication returned without committing current")
+    if durability_warnings:
+        try:
+            _persist_durability_warnings(
+                absolute_output, digest, tuple(durability_warnings)
+            )
+        except Exception as error:
+            durability_warnings.append(
+                f"current pointer committed but durability warning persistence "
+                f"failed: {error}"
+            )
     return digest, generation_path, tuple(durability_warnings)
 
 
-def resolve_current_report(output_dir: str | Path) -> Path:
+def _persist_durability_warnings(
+    output_dir: Path, digest: str, warnings: tuple[str, ...]
+) -> None:
+    output_fd, _ = _open_secure_directory(output_dir, create=False)
+    warnings_fd: int | None = None
+    temporary: str | None = None
+    failure: Exception | None = None
+    try:
+        warnings_fd = _open_or_create_directory(output_fd, ".report-warnings")
+        temporary = f".{digest}.{uuid.uuid4().hex}.tmp"
+        payload = _json_text(
+            {
+                "schema": "avgaussianv2.report-durability-warnings",
+                "version": 1,
+                "content_digest": digest,
+                "warnings": list(warnings),
+            }
+        ).encode("utf-8")
+        _write_generation_file(warnings_fd, temporary, payload)
+        os.rename(
+            temporary,
+            f"{digest}.json",
+            src_dir_fd=warnings_fd,
+            dst_dir_fd=warnings_fd,
+        )
+        temporary = None
+        os.fsync(warnings_fd)
+        os.fsync(output_fd)
+    except Exception as error:
+        failure = error
+    finally:
+        if temporary is not None and warnings_fd is not None:
+            try:
+                os.unlink(temporary, dir_fd=warnings_fd)
+            except Exception as error:
+                if failure is None:
+                    failure = error
+        if warnings_fd is not None:
+            try:
+                os.close(warnings_fd)
+            except Exception as error:
+                if failure is None:
+                    failure = error
+        try:
+            os.close(output_fd)
+        except Exception as error:
+            if failure is None:
+                failure = error
+    if failure is not None:
+        raise failure
+
+
+def _read_durability_warnings(output_fd: int, digest: str) -> tuple[str, ...]:
+    try:
+        warnings_fd = os.open(
+            ".report-warnings",
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=output_fd,
+        )
+    except FileNotFoundError:
+        return ()
+    descriptor: int | None = None
+    try:
+        try:
+            descriptor = os.open(
+                f"{digest}.json",
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=warnings_fd,
+            )
+        except FileNotFoundError:
+            return ()
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024 * 1024:
+            raise ValueError("durability warning sidecar is unsafe")
+        data = b""
+        while block := os.read(descriptor, 64 * 1024):
+            data += block
+            if len(data) > 1024 * 1024:
+                raise ValueError("durability warning sidecar is too large")
+        payload = json.loads(data.decode("utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema")
+            != "avgaussianv2.report-durability-warnings"
+            or payload.get("version") != 1
+            or payload.get("content_digest") != digest
+            or not isinstance(payload.get("warnings"), list)
+            or any(not isinstance(item, str) for item in payload["warnings"])
+        ):
+            raise ValueError("durability warning sidecar is invalid")
+        return tuple(payload["warnings"])
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("durability warning sidecar is invalid") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(warnings_fd)
+
+
+def resolve_current_report(
+    output_dir: str | Path, *, include_warnings: bool = False
+) -> Path | ResolvedReport:
     """Pin and verify the authoritative immutable report generation."""
     output_fd, absolute_output = _open_secure_directory(
         Path(output_dir), create=False
@@ -2054,7 +2479,13 @@ def resolve_current_report(output_dir: str | Path) -> Path:
         )
         _verify_generation(generation_fd, digest)
         _verify_output_identity(output_fd, absolute_output)
-        return absolute_output / target
+        generation_path = absolute_output / target
+        if include_warnings:
+            return ResolvedReport(
+                generation_path=generation_path,
+                durability_warnings=_read_durability_warnings(output_fd, digest),
+            )
+        return generation_path
     finally:
         if generation_fd is not None:
             os.close(generation_fd)
@@ -2130,7 +2561,9 @@ __all__ = [
     "EvaluationProvenance",
     "PilotDecision",
     "REQUIRED_SYSTEMS",
+    "ResolvedReport",
     "SystemReportInput",
+    "WorkerArtifactProvenance",
     "build_comparison",
     "build_evaluation_manifest_sha256",
     "build_evaluation_run_id",

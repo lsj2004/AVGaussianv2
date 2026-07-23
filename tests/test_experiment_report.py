@@ -19,6 +19,7 @@ from avgaussianv2.experiment.report import (
     EvaluationProvenance,
     REQUIRED_SYSTEMS,
     SystemReportInput,
+    WorkerArtifactProvenance,
     build_comparison,
     build_evaluation_manifest_sha256,
     build_evaluation_run_id,
@@ -26,9 +27,14 @@ from avgaussianv2.experiment.report import (
     paired_audio_deltas,
     resolve_current_report,
 )
+
+
+def test_worker_artifact_provenance_contract_is_exported():
+    assert hasattr(report_module, "WorkerArtifactProvenance")
 from avgaussianv2.config import TrainConfig
 from avgaussianv2.experiment.checkpoint import (
     PilotCompatibility,
+    PilotResumeError,
     build_pilot_payload,
     build_run_fingerprint,
     hash_index_manifest,
@@ -170,6 +176,8 @@ def _system(
     audio,
     provenance: EvaluationProvenance,
     *,
+    worker_summary=None,
+    worker_provenance=None,
     psnr=30.0,
     ssim=0.95,
     grad=0.2,
@@ -187,16 +195,21 @@ def _system(
         name=name,
         evaluation=_evaluation(name, tuple(audio), psnr=psnr, ssim=ssim),
         worker_summary=(
-            None
-            if name == "baseline_imported"
-            else _worker(
+            worker_summary
+            if worker_summary is not None
+            else (
+                None
+                if name == "baseline_imported"
+                else _worker(
                 variants[name],
                 grad,
                 quick_psnr=quick_psnr,
                 quick_ssim=quick_ssim,
             )
+            )
         ),
         provenance=provenance,
+        worker_provenance=worker_provenance,
     )
 
 
@@ -334,6 +347,77 @@ def _provenance(
     )
 
 
+def _worker_artifacts(
+    root: Path,
+    checkpoint: EvaluationProvenance,
+    worker: dict[str, object],
+    *,
+    label: str,
+) -> WorkerArtifactProvenance:
+    artifact_dir = root / "worker-artifacts" / label
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    worker_path = artifact_dir / "worker_summary.json"
+    worker_path.write_text(
+        json.dumps(worker, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    )
+    selector = BestSelector(
+        worker["selector_state"]["visual_baseline"],
+        worker["selector_state"]["psnr_tolerance_db"],
+        worker["selector_state"]["ssim_tolerance"],
+    )
+    stopper = EarlyStopper(
+        worker["stopper_state"]["minimum_steps"],
+        worker["stopper_state"]["patience"],
+        worker["stopper_state"]["relative_delta"],
+    )
+    for validation in worker["validation_history"]:
+        selector.consider(validation["step"], validation["summary"])
+        stopper.update(
+            validation["step"],
+            validation["summary"]["audio_total"]["mean"],
+        )
+    latest_path = artifact_dir / "latest.pt"
+    latest_generation = checkpoint.checkpoint_generation + 1
+    model = nn.Linear(2, 1)
+    torch.save(
+        build_pilot_payload(
+            model=model,
+            compatibility=checkpoint.compatibility,
+            run_fingerprint=checkpoint.run_fingerprint,
+            stage="complete",
+            next_warmup_position=worker["completed_warmup_steps"],
+            next_joint_position=worker["completed_joint_steps"],
+            optimizer=None,
+            optimizer_stage=None,
+            selector=selector,
+            stopper=stopper,
+            training_history=worker["training_history"],
+            validation_history=worker["validation_history"],
+            maximum_positive_audio_visual_gradient=max(
+                row["audio_to_visual_grad_norm"]
+                for row in worker["training_history"]
+                if row["stage"] == "joint"
+            ),
+            checkpoint_kind="latest",
+            generation=latest_generation,
+            best_generation=checkpoint.checkpoint_generation,
+            stop_requested=worker["stop_reason"] == "early_stop",
+            stop_reason=worker["stop_reason"],
+            validation_summary=worker["validation_history"][-1]["summary"],
+            best_evaluation_summary=worker["validation_history"][-1]["summary"],
+        ),
+        latest_path,
+    )
+    return WorkerArtifactProvenance(
+        worker_summary_path=worker_path,
+        worker_summary_sha256=sha256_file(worker_path),
+        latest_checkpoint_path=latest_path,
+        latest_checkpoint_sha256=sha256_file(latest_path),
+        latest_checkpoint_generation=latest_generation,
+        run_fingerprint=checkpoint.run_fingerprint,
+    )
+
+
 def _ready_systems(tmp_path: Path):
     baseline = _provenance(
         tmp_path / "baseline.bin",
@@ -364,12 +448,53 @@ def _ready_systems(tmp_path: Path):
         pilot=True,
         variant="condition_off",
     )
+    joint_worker = _worker("joint_conditioned")
+    frozen_worker = _worker("frozen_visual")
+    condition_off_worker = _worker("condition_off")
+    joint_artifacts = _worker_artifacts(
+        tmp_path, joint, joint_worker, label="joint"
+    )
+    frozen_artifacts = _worker_artifacts(
+        tmp_path, frozen, frozen_worker, label="frozen"
+    )
+    condition_off_artifacts = _worker_artifacts(
+        tmp_path, condition_off, condition_off_worker, label="condition-off"
+    )
     systems = [
-        _system("baseline_imported", [1.0, 1.0, 1.0], baseline),
-        _system("joint_conditioned_on", [0.6, 0.7, 0.8], joint),
-        _system("joint_conditioned_off", [0.9, 0.9, 0.9], joint_off),
-        _system("frozen_visual_on", [0.75, 0.8, 0.85], frozen),
-        _system("condition_off", [0.95, 0.95, 0.95], condition_off),
+        _system(
+            "baseline_imported",
+            [1.0, 1.0, 1.0],
+            baseline,
+            worker_provenance=None,
+        ),
+        _system(
+            "joint_conditioned_on",
+            [0.6, 0.7, 0.8],
+            joint,
+            worker_summary=joint_worker,
+            worker_provenance=joint_artifacts,
+        ),
+        _system(
+            "joint_conditioned_off",
+            [0.9, 0.9, 0.9],
+            joint_off,
+            worker_summary=copy.deepcopy(joint_worker),
+            worker_provenance=joint_artifacts,
+        ),
+        _system(
+            "frozen_visual_on",
+            [0.75, 0.8, 0.85],
+            frozen,
+            worker_summary=frozen_worker,
+            worker_provenance=frozen_artifacts,
+        ),
+        _system(
+            "condition_off",
+            [0.95, 0.95, 0.95],
+            condition_off,
+            worker_summary=condition_off_worker,
+            worker_provenance=condition_off_artifacts,
+        ),
     ]
     return [_bind_evaluation_artifact(system, tmp_path) for system in systems]
 
@@ -473,6 +598,84 @@ def _replace_system(
         updated,
         system.provenance.metrics_per_sample_path.parents[2],
     )
+
+
+def _rebind_worker_run(
+    systems: list[SystemReportInput],
+    index: int,
+) -> None:
+    system = systems[index]
+    worker = copy.deepcopy(system.worker_summary)
+    checkpoint = system.provenance.checkpoint
+    root = system.worker_provenance.worker_summary_path.parents[2]
+    label = system.worker_provenance.worker_summary_path.parent.name
+    provenance = _worker_artifacts(
+        root,
+        checkpoint,
+        worker,
+        label=label,
+    )
+    if system.name.startswith("joint_conditioned_"):
+        for joint_index in (1, 2):
+            systems[joint_index] = replace(
+                systems[joint_index],
+                worker_summary=copy.deepcopy(worker),
+                worker_provenance=provenance,
+            )
+    else:
+        systems[index] = replace(
+            system,
+            worker_summary=worker,
+            worker_provenance=provenance,
+        )
+
+
+def _set_verified_joint_gradient(
+    systems: list[SystemReportInput], gradient: float
+) -> None:
+    systems[1] = _replace_system(
+        systems[1], [0.6, 0.7, 0.8], grad=gradient
+    )
+    _rebind_worker_run(systems, 1)
+
+
+def _rewrite_joint_worker_artifact(
+    systems: list[SystemReportInput], mutate
+) -> None:
+    worker = copy.deepcopy(systems[1].worker_summary)
+    mutate(worker)
+    provenance = systems[1].worker_provenance
+    provenance.worker_summary_path.write_text(
+        json.dumps(worker, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    )
+    provenance = replace(
+        provenance,
+        worker_summary_sha256=sha256_file(provenance.worker_summary_path),
+    )
+    for index in (1, 2):
+        systems[index] = replace(
+            systems[index],
+            worker_summary=copy.deepcopy(worker),
+            worker_provenance=provenance,
+        )
+
+
+def _rewrite_joint_latest_artifact(
+    systems: list[SystemReportInput], mutate
+) -> None:
+    provenance = systems[1].worker_provenance
+    payload = torch.load(provenance.latest_checkpoint_path, weights_only=True)
+    mutate(payload)
+    torch.save(payload, provenance.latest_checkpoint_path)
+    provenance = replace(
+        provenance,
+        latest_checkpoint_sha256=sha256_file(provenance.latest_checkpoint_path),
+    )
+    for index in (1, 2):
+        systems[index] = replace(
+            systems[index],
+            worker_provenance=provenance,
+        )
 
 
 def test_paired_audio_deltas_is_order_independent_and_sorted():
@@ -580,14 +783,10 @@ def test_build_comparison_ready_and_writes_exact_deterministic_files(tmp_path):
             ),
             "paired audio_total median delta is not strictly negative",
         ),
-        (
-            lambda systems: systems.__setitem__(
-                1, _replace_system(
-                    systems[1], [0.6, 0.7, 0.8], grad=0.0
-                )
+            (
+                lambda systems: _set_verified_joint_gradient(systems, 0.0),
+                "max_audio_to_visual_grad_norm is not strictly positive",
             ),
-            "max_audio_to_visual_grad_norm is not strictly positive",
-        ),
     ],
 )
 def test_each_gate_fails_independently(tmp_path, mutator, reason):
@@ -603,10 +802,9 @@ def test_multiple_failure_reasons_are_complete_and_boundary_is_inclusive_for_vis
     systems[1] = _replace_system(
         systems[1],
         [1.0, 1.0, 1.0],
-        quick_psnr=29.5,
-        quick_ssim=0.94,
         grad=0.0,
     )
+    _rebind_worker_run(systems, 1)
     result = build_comparison(systems, tmp_path)
     assert len(result.decision.reasons) == 3
     assert not any("PSNR" in reason or "SSIM" in reason for reason in result.decision.reasons)
@@ -634,7 +832,7 @@ def test_quick_infeasible_worker_is_corruption_even_when_full_split_is_feasible(
         systems[1], [0.6, 0.7, 0.8], quick_psnr=29.49
     )
     assert not decide_long_training(systems).ready
-    with pytest.raises(ValueError, match="selector_state does not replay"):
+    with pytest.raises(ValueError, match="in-memory worker summary disagrees"):
         build_comparison(systems, tmp_path / "report")
 
 
@@ -646,7 +844,7 @@ def test_widened_worker_visual_tolerance_can_never_create_false_ready(tmp_path):
         mean=29.2, median=29.2
     )
     assert not decide_long_training(systems).ready
-    with pytest.raises(ValueError, match="PSNR tolerance must equal 0.5"):
+    with pytest.raises(ValueError, match="in-memory worker summary disagrees"):
         build_comparison(systems, tmp_path / "report")
 
 
@@ -654,6 +852,7 @@ def test_negative_loss_and_gradient_norm_evidence_is_rejected(tmp_path):
     systems = _ready_systems(tmp_path)
     worker = systems[1].worker_summary
     worker["training_history"][0]["losses"]["audio"] = -0.1
+    _rebind_worker_run(systems, 1)
     with pytest.raises(ValueError, match="must be nonnegative"):
         build_comparison(systems, tmp_path / "negative-loss")
 
@@ -662,6 +861,7 @@ def test_negative_loss_and_gradient_norm_evidence_is_rejected(tmp_path):
     systems = _ready_systems(gradient_root)
     worker = systems[1].worker_summary
     worker["training_history"][0]["gradient_norms"]["visual"] = -0.1
+    _rebind_worker_run(systems, 1)
     with pytest.raises(ValueError, match="must be nonnegative"):
         build_comparison(systems, tmp_path / "negative-gradient")
 
@@ -670,6 +870,7 @@ def test_checkpoint_io_success_failure_attempt_counters_must_balance(tmp_path):
     systems = _ready_systems(tmp_path)
     worker = systems[1].worker_summary
     worker["checkpoint_io"]["save_attempt_count"] += 1
+    _rebind_worker_run(systems, 1)
     with pytest.raises(ValueError, match="save counters are incoherent"):
         build_comparison(systems, tmp_path / "report")
 
@@ -678,7 +879,111 @@ def test_worker_selector_baseline_is_bound_to_canonical_checkpoint(tmp_path):
     systems = _ready_systems(tmp_path)
     worker = systems[1].worker_summary
     worker["selector_state"]["visual_baseline"]["rgb_ssim"]["mean"] = 0.94
-    with pytest.raises(ValueError, match="worker/checkpoint visual baseline mismatch"):
+    _rebind_worker_run(systems, 1)
+    with pytest.raises(
+        (ValueError, PilotResumeError), match="visual_baseline.*disagrees"
+    ):
+        build_comparison(systems, tmp_path / "report")
+
+
+def test_in_memory_worker_summary_cannot_override_hashed_worker_artifact(tmp_path):
+    systems = _ready_systems(tmp_path)
+    systems[1].worker_summary["worker"]["device"] = "forged-device"
+    with pytest.raises(ValueError, match="in-memory worker summary disagrees"):
+        build_comparison(systems, tmp_path / "report")
+
+
+def test_worker_summary_file_tampering_with_stale_hash_is_rejected(tmp_path):
+    systems = _ready_systems(tmp_path)
+    path = systems[1].worker_provenance.worker_summary_path
+    path.write_text(path.read_text().replace("cuda:0", "forged"))
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        build_comparison(systems, tmp_path / "report")
+
+
+@pytest.mark.parametrize(
+    "mutate,match",
+    [
+        (
+            lambda worker: worker["training_history"][-1].__setitem__(
+                "audio_to_visual_grad_norm", 0.1
+            ),
+            "worker/latest training_history mismatch",
+        ),
+        (
+            lambda worker: worker["training_history"][-1].__setitem__(
+                "total", 0.1
+            ),
+            "worker/latest training_history mismatch",
+        ),
+        (
+            lambda worker: worker.__setitem__("stop_reason", "early_stop"),
+            "stop_reason",
+        ),
+        (
+            lambda worker: worker.__setitem__("completed_joint_steps", 2),
+            "completed",
+        ),
+    ],
+)
+def test_resigned_worker_gradient_history_stop_and_counts_cannot_override_latest(
+    tmp_path, mutate, match
+):
+    systems = _ready_systems(tmp_path)
+    _rewrite_joint_worker_artifact(systems, mutate)
+    with pytest.raises(ValueError, match=match):
+        build_comparison(systems, tmp_path / "report")
+
+
+def test_zero_gradient_latest_cannot_be_overridden_by_positive_worker(tmp_path):
+    systems = _ready_systems(tmp_path)
+
+    def zero_latest(payload):
+        for row in payload["training_history"]:
+            if row["stage"] == "joint":
+                row["audio_to_visual_grad_norm"] = 0.0
+                row["gradient_norms"]["visual"] = 0.0
+        payload["maximum_positive_audio_visual_gradient"] = 0.0
+
+    _rewrite_joint_latest_artifact(systems, zero_latest)
+    with pytest.raises(ValueError, match="worker/latest training_history mismatch"):
+        build_comparison(systems, tmp_path / "report")
+
+
+def test_latest_gradient_summary_must_equal_verified_joint_history(tmp_path):
+    systems = _ready_systems(tmp_path)
+    _rewrite_joint_latest_artifact(
+        systems,
+        lambda payload: payload.__setitem__(
+            "maximum_positive_audio_visual_gradient", 0.0
+        ),
+    )
+    with pytest.raises(ValueError, match="gradient summary mismatch"):
+        build_comparison(systems, tmp_path / "report")
+
+
+def test_joint_conditions_must_share_exact_worker_and_latest_identity(tmp_path):
+    systems = _ready_systems(tmp_path)
+    separate = _worker_artifacts(
+        tmp_path,
+        systems[2].provenance.checkpoint,
+        copy.deepcopy(systems[2].worker_summary),
+        label="joint-separate",
+    )
+    systems[2] = replace(systems[2], worker_provenance=separate)
+    with pytest.raises(ValueError, match="share identical worker/latest"):
+        build_comparison(systems, tmp_path / "report")
+
+
+def test_training_row_total_must_be_nonnegative(tmp_path):
+    systems = _ready_systems(tmp_path)
+    _rewrite_joint_worker_artifact(
+        systems,
+        lambda worker: worker["training_history"][-1].__setitem__(
+            "total", -0.1
+        ),
+    )
+    with pytest.raises(ValueError, match="total must be nonnegative"):
         build_comparison(systems, tmp_path / "report")
 
 
@@ -718,23 +1023,23 @@ def test_exact_system_names_and_same_checkpoint_pair_are_required(tmp_path):
         ),
         (
             lambda systems: systems[1].worker_summary["training_history"].clear(),
-            "training_history",
+            "in-memory worker summary disagrees",
         ),
         (
             lambda systems: systems[1].worker_summary["checkpoint_io"].__setitem__(
                 "save_count", True
             ),
-            "save_count",
+            "in-memory worker summary disagrees",
         ),
         (
             lambda systems: systems[1].worker_summary["validation_history"][0][
                 "summary"
             ]["audio_total"].__setitem__("mean", float("inf")),
-            "finite",
+            "in-memory worker summary disagrees",
         ),
         (
             lambda systems: systems[1].worker_summary.update(extra=True),
-            "worker summary fields",
+            "in-memory worker summary disagrees",
         ),
         (
             lambda systems: systems.__setitem__(
@@ -798,21 +1103,21 @@ def test_artifact_path_is_verified_instead_of_trusting_stamped_identity(tmp_path
             lambda worker: worker["training_history"].__setitem__(
                 0, worker["training_history"][1]
             ),
-            "contiguous warmup then joint",
+            "in-memory worker summary disagrees",
         ),
         (
             lambda worker: worker["selector_state"].__setitem__(
                 "best_audio_total", 0.4
             ),
-            "selector_state does not replay",
+            "in-memory worker summary disagrees",
         ),
         (
             lambda worker: worker["stopper_state"].__setitem__("stale", 1),
-            "stopper_state does not replay",
+            "in-memory worker summary disagrees",
         ),
         (
             lambda worker: worker["validation_history"].reverse(),
-            "validation steps",
+            "in-memory worker summary disagrees",
         ),
     ],
 )
@@ -957,20 +1262,97 @@ def test_post_current_fault_reports_committed_generation(
     published = build_comparison(systems, report_dir)
     assert published.committed is True
     assert published.generation_path != previous.generation_path
-    assert len(published.durability_warnings) == 1
+    expected_warning_count = 2 if persistent and fault == "fsync" else 1
+    assert len(published.durability_warnings) == expected_warning_count
     assert fault in published.durability_warnings[0]
+    if expected_warning_count == 2:
+        assert "warning persistence failed" in published.durability_warnings[1]
 
     monkeypatch.setattr(report_module.os, "fsync", original_fsync)
     monkeypatch.setattr(
         report_module, "_verify_output_identity", original_identity
     )
     assert resolve_current_report(report_dir) == published.generation_path
+    resolved = resolve_current_report(report_dir, include_warnings=True)
+    assert resolved.generation_path == published.generation_path
+    if persistent and fault == "fsync":
+        assert resolved.durability_warnings == ()
+    else:
+        assert resolved.durability_warnings == published.durability_warnings
+
+
+@pytest.mark.parametrize(
+    "fault,close_number,warning_text",
+    [
+        ("unlock", None, "lock release failed"),
+        ("close", 1, "generations fd close failed"),
+        ("close", 2, "lock fd close failed"),
+        ("close", 3, "output fd close failed"),
+    ],
+)
+def test_all_post_current_cleanup_failures_are_nonraising_and_persisted(
+    tmp_path, monkeypatch, fault, close_number, warning_text
+):
+    report_dir = tmp_path / "report"
+    build_comparison(_ready_systems(tmp_path), report_dir)
+    next_root = tmp_path / "next-cleanup"
+    next_root.mkdir()
+    systems = _ready_systems(next_root)
+    systems[1] = _replace_system(systems[1], [1.0, 1.0, 1.0])
+    state = {"committed": False, "close_count": 0, "raised": False}
+    original_rename = report_module.os.rename
+    original_close = report_module.os.close
+    original_flock = report_module.fcntl.flock
+
+    def tracking_rename(source, destination, **kwargs):
+        result = original_rename(source, destination, **kwargs)
+        if destination == "current":
+            state["committed"] = True
+        return result
+
+    def failing_close(descriptor):
+        if state["committed"]:
+            state["close_count"] += 1
+            if (
+                fault == "close"
+                and state["close_count"] == close_number
+                and not state["raised"]
+            ):
+                state["raised"] = True
+                raise OSError("forced post-current close failure")
+        return original_close(descriptor)
+
+    def failing_flock(descriptor, operation):
+        if (
+            fault == "unlock"
+            and state["committed"]
+            and operation == report_module.fcntl.LOCK_UN
+            and not state["raised"]
+        ):
+            state["raised"] = True
+            raise OSError("forced post-current unlock failure")
+        return original_flock(descriptor, operation)
+
+    monkeypatch.setattr(report_module.os, "rename", tracking_rename)
+    monkeypatch.setattr(report_module.os, "close", failing_close)
+    monkeypatch.setattr(report_module.fcntl, "flock", failing_flock)
+    published = build_comparison(systems, report_dir)
+    assert published.committed is True
+    assert any(warning_text in item for item in published.durability_warnings)
+
+    monkeypatch.setattr(report_module.os, "close", original_close)
+    monkeypatch.setattr(report_module.fcntl, "flock", original_flock)
+    resolved = resolve_current_report(report_dir, include_warnings=True)
+    assert resolved.generation_path == published.generation_path
+    assert resolved.durability_warnings == published.durability_warnings
 
 
 def test_distinct_artifacts_are_hashed_and_inspected_once(tmp_path, monkeypatch):
     hash_calls = []
+    worker_read_calls = []
     identity_calls = []
     original_hash = report_module._hash_fd
+    original_read = report_module._read_verified_artifact
     original_identity = report_module.resolve_pilot_checkpoint_identity
 
     def counting_hash(descriptor):
@@ -982,13 +1364,24 @@ def test_distinct_artifacts_are_hashed_and_inspected_once(tmp_path, monkeypatch)
         identity_calls.append(Path(path).resolve())
         return original_identity(path, provenance)
 
+    def counting_read(path, expected_sha256, *, limit, name):
+        if Path(path).name == "worker_summary.json":
+            worker_read_calls.append(Path(path).resolve())
+        return original_read(
+            path, expected_sha256, limit=limit, name=name
+        )
+
     monkeypatch.setattr(report_module, "_hash_fd", counting_hash)
+    monkeypatch.setattr(
+        report_module, "_read_verified_artifact", counting_read
+    )
     build_comparison(
         _ready_systems(tmp_path),
         tmp_path / "report",
         checkpoint_identity_resolver=counting_identity,
     )
-    assert len(hash_calls) == len(set(hash_calls)) == 4
+    assert len(hash_calls) == len(set(hash_calls)) == 7
+    assert len(worker_read_calls) == len(set(worker_read_calls)) == 3
     assert len(identity_calls) == len(set(identity_calls)) == 3
 
 
