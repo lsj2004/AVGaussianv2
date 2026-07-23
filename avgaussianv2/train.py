@@ -258,6 +258,7 @@ def run_joint_finetune(
             config,
             audio_loss_fn,
             anchor,
+            probe_audio_visual_gradient=require_audio_visual_gradient,
         )
         if require_audio_visual_gradient and (step + 1) % config.gradient_probe_interval == 0:
             consecutive_zero = consecutive_zero + 1 if stats.audio_to_visual_grad_norm == 0 else 0

@@ -205,6 +205,8 @@ class PilotTrainer:
         on_validation: ValidationCallback | None = None,
         on_best_candidate: ValidationCallback | None = None,
     ) -> PilotTrainingResult:
+        if hasattr(self.evaluator, "model") and self.evaluator.model is not model:
+            raise ValueError("evaluator must be bound to the same model passed to PilotTrainer.run")
         self.config.validate()
         self.train_config.validate()
         resolved_variant = Variant(variant)

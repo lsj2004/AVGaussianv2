@@ -15,6 +15,7 @@ from avgaussianv2.experiment.contracts import (
     Variant,
     VariantIndices,
 )
+from avgaussianv2.experiment.evaluation import Evaluator
 from avgaussianv2.experiment.training import PilotTrainer, configure_variant
 from avgaussianv2.train import DisconnectedAudioVisualGradient, TrainStepStats
 
@@ -143,6 +144,12 @@ class FakeEvaluator:
         return EvaluationResult(system_name, len(indices), (), summary)
 
 
+class BoundFakeEvaluator(FakeEvaluator):
+    def __init__(self, model, audios=(1.0, 0.9)) -> None:
+        super().__init__(audios)
+        self.model = model
+
+
 def _stats(probe: float = 0.0) -> TrainStepStats:
     return TrainStepStats(
         total=1.0,
@@ -159,6 +166,133 @@ def _sample_with_frame(frame: int):
 
 def _baseline():
     return {"rgb_psnr": {"mean": 30.0}, "rgb_ssim": {"mean": 0.95}}
+
+
+def test_pilot_rejects_evaluator_bound_to_different_model_before_mutation(tmp_path) -> None:
+    model = TinyTrainFusion()
+    model.condition_enabled = False
+    before = {
+        name: (parameter.detach().clone(), parameter.requires_grad)
+        for name, parameter in model.named_parameters()
+    }
+    evaluator = BoundFakeEvaluator(TinyTrainFusion(), (1.0,))
+    trainer = PilotTrainer(
+        PilotConfig(
+            warmup_steps=0,
+            joint_steps=1,
+            validation_interval=1,
+            minimum_joint_steps=1,
+        ),
+        evaluator,
+    )
+
+    with pytest.raises(ValueError, match="evaluator.*same model"):
+        trainer.run(
+            model=model,
+            train_samples=[make_sample()],
+            heldout_samples=[make_sample()],
+            indices=VariantIndices((), (0,)),
+            heldout_indices=(0,),
+            variant=Variant.JOINT_CONDITIONED,
+            visual_baseline=_baseline(),
+            audio_loss_fn=audio_loss,
+            output_dir=tmp_path / "must_not_exist",
+        )
+
+    assert model.condition_enabled is False
+    for name, parameter in model.named_parameters():
+        old_value, old_requires_grad = before[name]
+        assert torch.equal(parameter, old_value)
+        assert parameter.requires_grad is old_requires_grad
+    assert evaluator.calls == []
+    assert not (tmp_path / "must_not_exist").exists()
+
+
+def test_pilot_accepts_evaluator_bound_to_same_model(tmp_path) -> None:
+    model = TinyTrainFusion()
+    model.condition_enabled = True
+    evaluator = BoundFakeEvaluator(model, (1.0,))
+    trainer = PilotTrainer(
+        PilotConfig(
+            warmup_steps=0,
+            joint_steps=1,
+            validation_interval=1,
+            minimum_joint_steps=1,
+        ),
+        evaluator,
+        joint_step_fn=lambda *args, **kwargs: _stats(0.1),
+    )
+
+    result = trainer.run(
+        model=model,
+        train_samples=[make_sample()],
+        heldout_samples=[make_sample()],
+        indices=VariantIndices((), (0,)),
+        heldout_indices=(0,),
+        variant=Variant.JOINT_CONDITIONED,
+        visual_baseline=_baseline(),
+        audio_loss_fn=audio_loss,
+        output_dir=tmp_path,
+    )
+
+    assert result.completed_joint_steps == 1
+    assert len(evaluator.calls) == 1
+
+
+def test_pilot_runs_real_training_and_same_model_evaluation_end_to_end(tmp_path) -> None:
+    model = TinyTrainFusion()
+    model.condition_enabled = True
+    before = {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+    }
+
+    def complete_audio_loss(predicted, target):
+        error = predicted - target
+        return {
+            "total_loss": error.square().mean(),
+            "mono_loss": error.mean().abs(),
+            "diff_loss": (error[:, 0] - error[:, 1]).abs().mean(),
+        }
+
+    trainer = PilotTrainer(
+        PilotConfig(
+            warmup_steps=1,
+            joint_steps=1,
+            validation_interval=1,
+            minimum_joint_steps=1,
+        ),
+        Evaluator(model, complete_audio_loss, "cpu"),
+        train_config=TrainConfig(
+            condition_lr=0.01,
+            audio_lr=0.01,
+            visual_lr=0.01,
+        ),
+    )
+
+    result = trainer.run(
+        model=model,
+        train_samples=[make_sample()],
+        heldout_samples=[make_sample()],
+        indices=VariantIndices((0,), (0,)),
+        heldout_indices=(0,),
+        variant=Variant.JOINT_CONDITIONED,
+        visual_baseline={
+            "rgb_psnr": {"mean": 0.0},
+            "rgb_ssim": {"mean": 0.0},
+        },
+        audio_loss_fn=complete_audio_loss,
+        output_dir=tmp_path,
+    )
+
+    assert result.completed_warmup_steps == 1
+    assert result.completed_joint_steps == 1
+    assert result.best_step == 1
+    assert any(
+        not torch.equal(parameter, before[name])
+        for name, parameter in model.named_parameters()
+    )
+    assert (tmp_path / "validation" / "step_000001" / "metrics_summary.json").exists()
 
 
 def test_pilot_uses_persistent_optimizers_exact_order_and_final_validation(tmp_path) -> None:

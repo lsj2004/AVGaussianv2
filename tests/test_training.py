@@ -12,6 +12,7 @@ from avgaussianv2.train import (
     condition_warmup_step,
     joint_train_step,
     run_condition_warmup,
+    run_joint_finetune,
 )
 
 
@@ -237,3 +238,23 @@ def test_joint_step_can_skip_audio_visual_gradient_probe(monkeypatch) -> None:
     )
     assert stats.audio_to_visual_grad_norm == 0
     assert not model.visual.value.requires_grad
+
+
+def test_legacy_joint_finetune_skips_probe_when_not_required(monkeypatch) -> None:
+    model = TinyTrainFusion()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("autograd.grad must not be called")
+
+    monkeypatch.setattr(torch.autograd, "grad", forbidden)
+    history = run_joint_finetune(
+        model,
+        [make_sample()],
+        steps=1,
+        config=TrainConfig(),
+        audio_loss_fn=audio_loss,
+        require_audio_visual_gradient=False,
+    )
+
+    assert len(history) == 1
+    assert history[0].audio_to_visual_grad_norm == 0
