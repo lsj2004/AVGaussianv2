@@ -495,6 +495,89 @@ def test_resume_finishes_pending_validation_without_replaying_joint_step(
     ]
 
 
+def test_best_save_failure_leaves_latest_pending_and_resume_revalidates(
+    tmp_path, monkeypatch
+) -> None:
+    import avgaussianv2.experiment.training as training_module
+
+    real_save = training_module.save_pilot_checkpoint
+
+    def fail_best(path, **kwargs):
+        if path.name == "best.pt":
+            raise OSError("injected best failure")
+        real_save(path, **kwargs)
+
+    config = PilotConfig(
+        warmup_steps=0,
+        joint_steps=2,
+        validation_interval=1,
+        minimum_joint_steps=2,
+    )
+    monkeypatch.setattr(training_module, "save_pilot_checkpoint", fail_best)
+    model = TinyTrainFusion()
+    model.condition_enabled = True
+    callbacks = []
+    with pytest.raises(OSError, match="best failure"):
+        PilotTrainer(
+            config,
+            FakeEvaluator((1.0,)),
+            joint_step_fn=lambda *args, **kwargs: _stats(0.1),
+        ).run(
+            model=model,
+            train_samples=[make_sample()],
+            heldout_samples=[make_sample()],
+            indices=VariantIndices((), (0, 0)),
+            heldout_indices=(0,),
+            variant=Variant.JOINT_CONDITIONED,
+            visual_baseline=_baseline(),
+            audio_loss_fn=audio_loss,
+            output_dir=tmp_path,
+            checkpoint_store=PilotCheckpointStore(tmp_path, _pilot_compatibility()),
+            on_validation=lambda event: callbacks.append("validation"),
+            on_best_candidate=lambda event: callbacks.append("best"),
+        )
+    latest = torch.load(tmp_path / "latest.pt", weights_only=True)
+    assert latest["next_joint_position"] == 1
+    assert latest["validation_history"] == []
+    assert latest["selector_state"]["last_step"] is None
+    assert callbacks == []
+
+    monkeypatch.setattr(training_module, "save_pilot_checkpoint", real_save)
+    resumed = TinyTrainFusion()
+    resumed.condition_enabled = True
+    resume_callbacks = []
+    PilotTrainer(
+        config,
+        FakeEvaluator((1.0, 0.9)),
+        joint_step_fn=lambda *args, **kwargs: _stats(0.1),
+    ).run(
+        model=resumed,
+        train_samples=[make_sample()],
+        heldout_samples=[make_sample()],
+        indices=VariantIndices((), (0, 0)),
+        heldout_indices=(0,),
+        variant=Variant.JOINT_CONDITIONED,
+        visual_baseline=_baseline(),
+        audio_loss_fn=audio_loss,
+        output_dir=tmp_path,
+        checkpoint_store=PilotCheckpointStore(
+            tmp_path, _pilot_compatibility(), resume=True
+        ),
+        on_validation=lambda event: resume_callbacks.append(
+            ("validation", event.step)
+        ),
+        on_best_candidate=lambda event: resume_callbacks.append(("best", event.step)),
+    )
+    assert resume_callbacks == [
+        ("validation", 1),
+        ("best", 1),
+        ("validation", 2),
+        ("best", 2),
+    ]
+    best = torch.load(tmp_path / "best.pt", weights_only=True)
+    assert best["best_evaluation_summary"]["audio_total"]["mean"] == 0.9
+
+
 def test_latest_preserves_earlier_best_evaluation_summary(tmp_path) -> None:
     model = TinyTrainFusion()
     model.condition_enabled = True

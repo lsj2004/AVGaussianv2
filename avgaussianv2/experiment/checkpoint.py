@@ -308,8 +308,27 @@ def _payload(path: str | Path) -> dict[str, Any]:
         value = torch.load(source, map_location="cpu", weights_only=True)
     except Exception as error:
         raise PilotResumeError(f"cannot read pilot checkpoint {source}: {error}") from error
+    _validate_safe_checkpoint_value(value)
     if not isinstance(value, dict):
         raise PilotResumeError("pilot checkpoint root must be a mapping")
+    return value
+
+
+def _require_exact_keys(
+    value: object, expected: set[str], name: str
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise PilotResumeError(f"{name} must be a mapping")
+    actual = set(value)
+    missing = sorted(expected - actual, key=repr)
+    unexpected = sorted(actual - expected, key=repr)
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append(f"missing={missing}")
+        if unexpected:
+            details.append(f"unexpected={unexpected}")
+        raise PilotResumeError(f"{name} keys mismatch: " + ", ".join(details))
     return value
 
 
@@ -333,15 +352,16 @@ def inspect_pilot_checkpoint(
         "maximum_positive_audio_visual_gradient", "stop_reason",
         "validation_summary", "best_evaluation_summary",
     }
-    missing = sorted(required - payload.keys())
-    if missing:
-        raise PilotResumeError(f"pilot checkpoint is missing {missing[0]}")
+    _require_exact_keys(payload, required, "pilot checkpoint root")
     if payload["schema_version"] != SCHEMA_VERSION:
         raise PilotResumeError(
             f"schema_version must be {SCHEMA_VERSION}, got {payload['schema_version']!r}"
         )
     actual = PilotCompatibility.from_mapping(payload["compatibility"])
     validate_compatibility(actual, expected_compatibility)
+    _require_exact_keys(
+        payload["provenance"], {"compatibility", "variant"}, "provenance"
+    )
     expected_provenance = {
         "compatibility": actual.to_mapping(),
         "variant": actual.variant,
@@ -397,6 +417,9 @@ def inspect_pilot_checkpoint(
             or not isinstance(optimizer_state.get("param_groups"), list)
         ):
             raise PilotResumeError("optimizer state must contain state and param_groups")
+        _require_exact_keys(
+            optimizer_state, {"state", "param_groups"}, "optimizer_state_dict"
+        )
         for group in optimizer_state["param_groups"]:
             if (
                 not isinstance(group, dict)
@@ -413,6 +436,23 @@ def inspect_pilot_checkpoint(
         if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
             raise PilotResumeError(f"{name} must be a list of mappings")
         histories.append(tuple(_json_clone(value, name)))
+    training_row_keys = {
+        "stage",
+        "step",
+        "sample_index",
+        "total",
+        "audio_to_visual_grad_norm",
+        "losses",
+        "gradient_norms",
+    }
+    for index, row in enumerate(histories[0]):
+        _require_exact_keys(
+            row, training_row_keys, f"training_history[{index}]"
+        )
+    for index, row in enumerate(histories[1]):
+        _require_exact_keys(
+            row, {"step", "summary"}, f"validation_history[{index}]"
+        )
     expected_rows = [
         ("warmup", position + 1, indices.warmup[position])
         for position in range(warmup)
@@ -449,6 +489,42 @@ def inspect_pilot_checkpoint(
     if validation_steps != sorted(set(validation_steps)):
         raise PilotResumeError("validation_history steps must be strictly increasing")
     try:
+        _require_exact_keys(
+            payload["selector_state"],
+            {
+                "visual_baseline",
+                "psnr_tolerance_db",
+                "ssim_tolerance",
+                "best_step",
+                "best_audio_total",
+                "last_step",
+            },
+            "selector_state",
+        )
+        selector_baseline = payload["selector_state"]["visual_baseline"]
+        _require_exact_keys(
+            selector_baseline,
+            {"rgb_psnr", "rgb_ssim"},
+            "selector_state.visual_baseline",
+        )
+        for metric in ("rgb_psnr", "rgb_ssim"):
+            _require_exact_keys(
+                selector_baseline[metric],
+                {"mean"},
+                f"selector_state.visual_baseline.{metric}",
+            )
+        _require_exact_keys(
+            payload["stopper_state"],
+            {
+                "minimum_steps",
+                "patience",
+                "relative_delta",
+                "best",
+                "stale",
+                "last_step",
+            },
+            "stopper_state",
+        )
         selector = BestSelector.from_state_dict(payload["selector_state"])
         stopper = EarlyStopper.from_state_dict(payload["stopper_state"])
     except (KeyError, TypeError, ValueError) as error:

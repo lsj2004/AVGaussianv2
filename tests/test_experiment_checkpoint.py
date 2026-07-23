@@ -390,6 +390,57 @@ def test_save_rejects_custom_object_in_optimizer_state(tmp_path: Path) -> None:
     assert not (tmp_path / "unsafe.pt").exists()
 
 
+def test_loaded_checkpoint_rejects_nonprimitive_allowlisted_extra(
+    tmp_path: Path,
+) -> None:
+    model = nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    path = tmp_path / "device-extra.pt"
+    save_pilot_checkpoint(path, **_checkpoint_kwargs(model, optimizer))
+    payload = torch.load(path, weights_only=True)
+    payload["unexpected_device"] = torch.device("cpu")
+    torch.save(payload, path)
+    with pytest.raises(PilotResumeError, match="safe primitive"):
+        inspect_pilot_checkpoint(
+            path,
+            expected_compatibility=compatibility(),
+            indices=VariantIndices((0, 1), (4, 5, 6)),
+        )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload.__setitem__("unexpected_scalar", 1),
+        lambda payload: payload["provenance"].__setitem__("unexpected_scalar", 1),
+        lambda payload: payload["selector_state"].__setitem__("unexpected_scalar", 1),
+        lambda payload: payload["stopper_state"].__setitem__("unexpected_scalar", 1),
+        lambda payload: payload["training_history"][0].__setitem__(
+            "unexpected_scalar", 1
+        ),
+        lambda payload: payload["validation_history"][0].__setitem__(
+            "unexpected_scalar", 1
+        ),
+    ],
+)
+def test_loaded_checkpoint_rejects_unexpected_schema_keys(
+    tmp_path: Path, mutate
+) -> None:
+    model = nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    path = tmp_path / "unexpected.pt"
+    save_pilot_checkpoint(path, **_checkpoint_kwargs(model, optimizer))
+    payload = torch.load(path, weights_only=True)
+    mutate(payload)
+    torch.save(payload, path)
+    with pytest.raises(PilotResumeError, match="unexpected"):
+        inspect_pilot_checkpoint(
+            path,
+            expected_compatibility=compatibility(),
+            indices=VariantIndices((0, 1), (4, 5, 6)),
+        )
+
+
 def test_best_checkpoint_self_inspects_but_cannot_be_active_resume(tmp_path: Path) -> None:
     model = nn.Linear(2, 1)
     path = tmp_path / "best.pt"

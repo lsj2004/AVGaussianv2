@@ -489,11 +489,6 @@ class PilotTrainer:
                 should_stop=should_stop,
                 optimizer=joint_optimizer,
             )
-            save_latest(
-                stage="joint",
-                optimizer=joint_optimizer,
-                optimizer_stage="joint",
-            )
             if selected and checkpoint_store is not None:
                 save_pilot_checkpoint(
                     checkpoint_store.best_path,
@@ -513,6 +508,11 @@ class PilotTrainer:
                     validation_summary=summary,
                     best_evaluation_summary=best_evaluation_summary,
                 )
+            save_latest(
+                stage="joint",
+                optimizer=joint_optimizer,
+                optimizer_stage="joint",
+            )
             if on_validation is not None:
                 on_validation(event)
             if selected and on_best_candidate is not None:
