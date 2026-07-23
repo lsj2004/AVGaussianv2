@@ -12,24 +12,12 @@ import soundfile as sf
 import torch
 from torch import Tensor, nn
 
-from avgaussianv2.backends.audio_audiogs import AudioGSBackend
-from avgaussianv2.backends.visual_ftgspp import FTGSVisualBackend
 from avgaussianv2.checkpoint import build_checkpoint_state, save_checkpoint
 from avgaussianv2.config import ProjectConfig, load_project_config
 from avgaussianv2.contracts import AlignedAVSample
-from avgaussianv2.data.aligned import AlignedAVDataset
 from avgaussianv2.experiment.evaluation import move_sample
-from avgaussianv2.losses import AudioLoss
-from avgaussianv2.models.fusion import AVGaussianFusionV2
-from avgaussianv2.models.rgbd import RGBDConditionEncoder
+from avgaussianv2.runtime import TrainingBundle, build_runtime
 from avgaussianv2.train import TrainStepStats, run_condition_warmup, run_joint_finetune
-
-
-@dataclass(frozen=True)
-class TrainingBundle:
-    model: nn.Module
-    samples: Sequence[AlignedAVSample]
-    audio_loss_fn: AudioLoss
 
 
 @dataclass(frozen=True)
@@ -161,29 +149,7 @@ def _artifact_predictions(model: nn.Module, sample: AlignedAVSample):
         model.train(was_training)
 
 
-def _default_backend_factory(config: ProjectConfig, device: torch.device) -> TrainingBundle:
-    visual = FTGSVisualBackend.load(
-        config.paths.visual_checkpoint,
-        config.paths.visual_upstream_root,
-    )
-    audio = AudioGSBackend.load(
-        config.paths.audio_checkpoint,
-        embedding_dim=config.model.embedding_dim,
-        upstream_root=config.paths.audio_upstream_root,
-        model_class=config.model.audio_model_class,
-    )
-    model = AVGaussianFusionV2(
-        visual=visual,
-        condition_encoder=RGBDConditionEncoder(
-            embedding_dim=config.model.embedding_dim,
-            alpha_threshold=config.model.alpha_threshold,
-        ),
-        audio=audio,
-    ).to(device)
-    dataset = AlignedAVDataset(config, split="train")
-
-    criterion = audio.build_criterion().to(device)
-    return TrainingBundle(model=model, samples=dataset, audio_loss_fn=criterion)
+_default_backend_factory = build_runtime
 
 
 def _write_artifacts(
@@ -251,13 +217,13 @@ def run_training(
         device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
     )
     bundle = (backend_factory or _default_backend_factory)(config, resolved_device)
-    if not bundle.samples:
+    if not bundle.train_samples:
         raise ValueError("training dataset must not be empty")
     if condition_off:
         if not hasattr(bundle.model, "condition_enabled"):
             raise TypeError("condition-off ablation requires AVGaussianFusionV2")
         bundle.model.condition_enabled = False
-    samples = _DeviceSampleSequence(bundle.samples, resolved_device)
+    samples = _DeviceSampleSequence(bundle.train_samples, resolved_device)
     warmup_count = config.train.warmup_steps if warmup_steps is None else warmup_steps
     joint_count = config.train.joint_steps if joint_steps is None else joint_steps
     history: list[dict] = []
