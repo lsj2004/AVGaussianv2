@@ -27,9 +27,9 @@ from avgaussianv2.experiment.checkpoint import (
     PilotCheckpointStore,
     PilotResumeError,
     PilotResumeState,
+    build_run_fingerprint,
     inspect_pilot_checkpoint,
     restore_pilot_checkpoint,
-    save_pilot_checkpoint,
 )
 from avgaussianv2.experiment.selection import BestSelector, EarlyStopper
 from avgaussianv2.losses import AudioLoss, capture_visual_anchor
@@ -214,6 +214,41 @@ class PilotTrainer:
         on_best_candidate: ValidationCallback | None = None,
         checkpoint_store: PilotCheckpointStore | None = None,
     ) -> PilotTrainingResult:
+        arguments = {
+            "model": model,
+            "train_samples": train_samples,
+            "heldout_samples": heldout_samples,
+            "indices": indices,
+            "heldout_indices": heldout_indices,
+            "variant": variant,
+            "visual_baseline": visual_baseline,
+            "audio_loss_fn": audio_loss_fn,
+            "output_dir": output_dir,
+            "on_validation": on_validation,
+            "on_best_candidate": on_best_candidate,
+            "checkpoint_store": checkpoint_store,
+        }
+        if checkpoint_store is None:
+            return self._run_impl(**arguments)
+        with checkpoint_store:
+            return self._run_impl(**arguments)
+
+    def _run_impl(
+        self,
+        *,
+        model: nn.Module,
+        train_samples: Sequence[AlignedAVSample],
+        heldout_samples: Sequence[AlignedAVSample],
+        indices: VariantIndices,
+        heldout_indices: Sequence[int],
+        variant: Variant,
+        visual_baseline: object,
+        audio_loss_fn: AudioLoss,
+        output_dir: str | Path,
+        on_validation: ValidationCallback | None = None,
+        on_best_candidate: ValidationCallback | None = None,
+        checkpoint_store: PilotCheckpointStore | None = None,
+    ) -> PilotTrainingResult:
         if hasattr(self.evaluator, "model") and self.evaluator.model is not model:
             raise ValueError("evaluator must be bound to the same model passed to PilotTrainer.run")
         self.config.validate()
@@ -227,6 +262,8 @@ class PilotTrainer:
             raise ValueError(
                 f"variant indices contain {len(indices.warmup)} warmup steps; expected {expected_warmup}"
             )
+        if resolved_variant == Variant.CONDITION_OFF and indices.warmup:
+            raise ValueError("condition_off requires empty warmup indices")
         if len(indices.joint) != self.config.joint_steps:
             raise ValueError(
                 f"variant indices contain {len(indices.joint)} joint steps; expected {self.config.joint_steps}"
@@ -246,12 +283,26 @@ class PilotTrainer:
         if checkpoint_store is not None:
             if checkpoint_store.output_dir.resolve() != output.resolve():
                 raise ValueError("checkpoint store output_dir must match trainer output_dir")
+            run_fingerprint = build_run_fingerprint(
+                pilot_config=self.config,
+                train_config=self.train_config,
+                visual_baseline=visual_baseline,
+                model=model,
+                warmup_optimizer_factory=self.warmup_optimizer_factory,
+                joint_optimizer_factory=self.joint_optimizer_factory,
+                warmup_step_fn=self.warmup_step_fn,
+                joint_step_fn=self.joint_step_fn,
+                audio_loss_fn=audio_loss_fn,
+                component_identities=checkpoint_store.component_identities,
+            )
+            checkpoint_store.bind_run_fingerprint(run_fingerprint)
             checkpoint_store.prepare()
             if checkpoint_store.resume:
                 resume_state = inspect_pilot_checkpoint(
                     checkpoint_store.latest_path,
                     expected_compatibility=checkpoint_store.compatibility,
                     indices=indices,
+                    expected_run_fingerprint=run_fingerprint,
                     model=model,
                 )
                 expected_selector = BestSelector(
@@ -338,6 +389,42 @@ class PilotTrainer:
         best_evaluation_summary = (
             None if resume_state is None else resume_state.best_evaluation_summary
         )
+        checkpoint_pending_validation = (
+            False if resume_state is None else resume_state.pending_validation
+        )
+        checkpoint_stop_requested = (
+            False if resume_state is None else resume_state.stop_requested
+        )
+
+        def checkpoint_kwargs(
+            *,
+            stage: str,
+            optimizer: Any | None,
+            optimizer_stage: str | None,
+            stop_reason: str | None = None,
+            pending_validation: bool = False,
+            stop_requested: bool = False,
+        ) -> dict[str, object]:
+            assert checkpoint_store is not None
+            return {
+                "model": model,
+                "compatibility": checkpoint_store.compatibility,
+                "stage": stage,
+                "next_warmup_position": warmup_position,
+                "next_joint_position": joint_position,
+                "optimizer": optimizer,
+                "optimizer_stage": optimizer_stage,
+                "selector": selector,
+                "stopper": stopper,
+                "training_history": history,
+                "validation_history": validation_history,
+                "maximum_positive_audio_visual_gradient": maximum_positive_probe,
+                "stop_reason": stop_reason,
+                "validation_summary": latest_validation_summary,
+                "best_evaluation_summary": best_evaluation_summary,
+                "pending_validation": pending_validation,
+                "stop_requested": stop_requested,
+            }
 
         def save_latest(
             *,
@@ -345,28 +432,35 @@ class PilotTrainer:
             optimizer: Any | None,
             optimizer_stage: str | None,
             stop_reason: str | None = None,
+            pending_validation: bool = False,
+            stop_requested: bool = False,
         ) -> None:
             if checkpoint_store is None:
                 return
-            save_pilot_checkpoint(
-                checkpoint_store.latest_path,
-                model=model,
-                compatibility=checkpoint_store.compatibility,
-                checkpoint_kind="latest",
-                stage=stage,
-                next_warmup_position=warmup_position,
-                next_joint_position=joint_position,
-                optimizer=optimizer,
-                optimizer_stage=optimizer_stage,
-                selector=selector,
-                stopper=stopper,
-                training_history=history,
-                validation_history=validation_history,
-                maximum_positive_audio_visual_gradient=maximum_positive_probe,
-                stop_reason=stop_reason,
-                validation_summary=latest_validation_summary,
-                best_evaluation_summary=best_evaluation_summary,
+            checkpoint_store.publish_latest(
+                **checkpoint_kwargs(
+                    stage=stage,
+                    optimizer=optimizer,
+                    optimizer_stage=optimizer_stage,
+                    stop_reason=stop_reason,
+                    pending_validation=pending_validation,
+                    stop_requested=stop_requested,
+                )
             )
+
+        def validate_optimizer_identity(optimizer: Any, stage: str) -> None:
+            if checkpoint_store is None or checkpoint_store.run_fingerprint is None:
+                return
+            optimizer_type = optimizer.__class__
+            actual = f"{optimizer_type.__module__}.{optimizer_type.__qualname__}"
+            expected = checkpoint_store.run_fingerprint["inputs"][
+                f"{stage}_optimizer_class"
+            ]
+            if actual != expected:
+                raise PilotResumeError(
+                    f"{stage} optimizer class mismatch: "
+                    f"actual={actual!r}, expected={expected!r}"
+                )
 
         if expected_warmup and (
             resume_state is None or resume_state.stage == "warmup"
@@ -376,6 +470,7 @@ class PilotTrainer:
                 optimizer = self.warmup_optimizer_factory(
                     model, self.train_config.condition_lr
                 )
+                validate_optimizer_identity(optimizer, "warmup")
             else:
                 original_model_state = {
                     name: value.detach().clone()
@@ -391,6 +486,7 @@ class PilotTrainer:
                     optimizer = self.warmup_optimizer_factory(
                         model, self.train_config.condition_lr
                     )
+                    validate_optimizer_identity(optimizer, "warmup")
                     restore_pilot_checkpoint(
                         resume_state,
                         model=model,
@@ -422,6 +518,7 @@ class PilotTrainer:
         if resume_state is None or resume_state.stage != "joint":
             configure_variant(model, resolved_variant, "joint")
             joint_optimizer = self.joint_optimizer_factory(model, self.train_config)
+            validate_optimizer_identity(joint_optimizer, "joint")
         else:
             original_model_state = {
                 name: value.detach().clone()
@@ -437,6 +534,7 @@ class PilotTrainer:
                 joint_optimizer = self.joint_optimizer_factory(
                     model, self.train_config
                 )
+                validate_optimizer_identity(joint_optimizer, "joint")
                 restore_pilot_checkpoint(
                     resume_state,
                     model=model,
@@ -453,11 +551,14 @@ class PilotTrainer:
         prepare_output()
         visual_anchor = capture_visual_anchor(model.visual)
         positive_probe_seen = maximum_positive_probe > 0
-        stop_reason = "max_steps"
+        stop_reason = (
+            "early_stop" if checkpoint_stop_requested else "max_steps"
+        )
         completed_joint_steps = joint_position
 
         def validate_joint(step: int, row: Mapping[str, object]) -> bool:
             nonlocal latest_validation_summary, best_evaluation_summary
+            nonlocal checkpoint_pending_validation, checkpoint_stop_requested
             validation_dir = output / "validation" / f"step_{step:06d}"
             validation_dir.mkdir(parents=True, exist_ok=True)
             evaluation = self.evaluator.evaluate(
@@ -474,6 +575,8 @@ class PilotTrainer:
                 best_evaluation_summary = summary
             audio_total = summary["audio_total"]["mean"]
             should_stop = stopper.update(step, audio_total)
+            checkpoint_pending_validation = False
+            checkpoint_stop_requested = should_stop
             validation_history.append({"step": step, "summary": summary})
             event = ValidationEvent(
                 variant=resolved_variant,
@@ -489,30 +592,29 @@ class PilotTrainer:
                 should_stop=should_stop,
                 optimizer=joint_optimizer,
             )
-            if selected and checkpoint_store is not None:
-                save_pilot_checkpoint(
-                    checkpoint_store.best_path,
-                    model=model,
-                    compatibility=checkpoint_store.compatibility,
-                    checkpoint_kind="best",
+            if checkpoint_store is not None:
+                latest_kwargs = checkpoint_kwargs(
                     stage="joint",
-                    next_warmup_position=warmup_position,
-                    next_joint_position=joint_position,
-                    optimizer=None,
-                    optimizer_stage=None,
-                    selector=selector,
-                    stopper=stopper,
-                    training_history=history,
-                    validation_history=validation_history,
-                    maximum_positive_audio_visual_gradient=maximum_positive_probe,
-                    validation_summary=summary,
-                    best_evaluation_summary=best_evaluation_summary,
+                    optimizer=joint_optimizer,
+                    optimizer_stage="joint",
+                    pending_validation=False,
+                    stop_requested=should_stop,
                 )
-            save_latest(
-                stage="joint",
-                optimizer=joint_optimizer,
-                optimizer_stage="joint",
-            )
+                best_kwargs = (
+                    checkpoint_kwargs(
+                        stage="joint",
+                        optimizer=None,
+                        optimizer_stage=None,
+                        pending_validation=False,
+                        stop_requested=should_stop,
+                    )
+                    if selected
+                    else None
+                )
+                checkpoint_store.publish_validation(
+                    latest_kwargs=latest_kwargs,
+                    best_kwargs=best_kwargs,
+                )
             if on_validation is not None:
                 on_validation(event)
             if selected and on_best_candidate is not None:
@@ -522,11 +624,8 @@ class PilotTrainer:
         last_validation_step = (
             None if not validation_history else validation_history[-1]["step"]
         )
-        pending_validation = joint_position > 0 and (
-            joint_position % self.config.validation_interval == 0
-            or joint_position == len(indices.joint)
-        ) and last_validation_step != joint_position
-        stop_requested = False
+        pending_validation = checkpoint_pending_validation
+        stop_requested = checkpoint_stop_requested
         if pending_validation:
             stop_requested = validate_joint(joint_position, history[-1])
             if stop_requested:
@@ -556,15 +655,17 @@ class PilotTrainer:
                 maximum_positive_probe = max(
                     maximum_positive_probe, float(stats.audio_to_visual_grad_norm)
                 )
+            validate_now = (
+                step % self.config.validation_interval == 0
+                or step == len(indices.joint)
+            )
+            checkpoint_pending_validation = validate_now
+            checkpoint_stop_requested = False
             save_latest(
                 stage="joint",
                 optimizer=joint_optimizer,
                 optimizer_stage="joint",
-            )
-
-            validate_now = (
-                step % self.config.validation_interval == 0
-                or step == len(indices.joint)
+                pending_validation=validate_now,
             )
             if not validate_now:
                 continue
@@ -587,6 +688,13 @@ class PilotTrainer:
             validation_history=tuple(validation_history),
             training_history=tuple(history),
         )
+        save_latest(
+            stage="complete",
+            optimizer=None,
+            optimizer_stage=None,
+            stop_reason=stop_reason,
+            stop_requested=stop_reason == "early_stop",
+        )
         summary_payload = {
             "variant": resolved_variant.value,
             "completed_warmup_steps": result.completed_warmup_steps,
@@ -598,16 +706,12 @@ class PilotTrainer:
             "selector_state": selector.state_dict(),
             "stopper_state": stopper.state_dict(),
         }
+        if checkpoint_store is not None:
+            summary_payload["checkpoint_io"] = checkpoint_store.metrics
         _atomic_write_text(output / "training_curve.csv", _curve_text(history))
         _atomic_write_text(
             output / "worker_summary.json",
             json.dumps(summary_payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        )
-        save_latest(
-            stage="complete",
-            optimizer=None,
-            optimizer_stage=None,
-            stop_reason=stop_reason,
         )
         return result
 

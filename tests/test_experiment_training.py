@@ -193,6 +193,32 @@ def _pilot_compatibility(variant=Variant.JOINT_CONDITIONED):
     )
 
 
+def _store(
+    output_dir,
+    compatibility,
+    *,
+    resume=False,
+    overwrite=False,
+    identities=None,
+):
+    stable = {
+        "warmup_optimizer_factory": "tests.pilot.warmup_optimizer_factory",
+        "joint_optimizer_factory": "tests.pilot.joint_optimizer_factory",
+        "warmup_step_fn": "tests.pilot.warmup_step_fn",
+        "joint_step_fn": "tests.pilot.joint_step_fn",
+        "audio_loss_fn": "tests.pilot.audio_loss_fn",
+    }
+    if identities:
+        stable.update(identities)
+    return PilotCheckpointStore(
+        output_dir,
+        compatibility,
+        resume=resume,
+        overwrite=overwrite,
+        component_identities=stable,
+    )
+
+
 def test_checkpoint_resume_after_validation_does_not_replay_joint_step(tmp_path) -> None:
     seen = []
 
@@ -210,7 +236,7 @@ def test_checkpoint_resume_after_validation_does_not_replay_joint_step(tmp_path)
         validation_interval=1,
         minimum_joint_steps=3,
     )
-    store = PilotCheckpointStore(tmp_path, _pilot_compatibility())
+    store = _store(tmp_path, _pilot_compatibility())
     trainer = PilotTrainer(config, FakeEvaluator((1.0, 0.9, 0.8)), joint_step_fn=joint_step)
 
     with pytest.raises(RuntimeError, match="interrupt"):
@@ -246,7 +272,7 @@ def test_checkpoint_resume_after_validation_does_not_replay_joint_step(tmp_path)
         visual_baseline=_baseline(),
         audio_loss_fn=audio_loss,
         output_dir=tmp_path,
-        checkpoint_store=PilotCheckpointStore(
+        checkpoint_store=_store(
             tmp_path, _pilot_compatibility(), resume=True
         ),
     )
@@ -281,7 +307,7 @@ def test_checkpoint_condition_off_keeps_warmup_position_zero(tmp_path) -> None:
         visual_baseline=_baseline(),
         audio_loss_fn=audio_loss,
         output_dir=tmp_path,
-        checkpoint_store=PilotCheckpointStore(
+        checkpoint_store=_store(
             tmp_path, _pilot_compatibility(variant)
         ),
     )
@@ -292,10 +318,10 @@ def test_checkpoint_condition_off_keeps_warmup_position_zero(tmp_path) -> None:
 def test_checkpoint_resume_after_warmup_save_does_not_replay_step(
     tmp_path, monkeypatch
 ) -> None:
-    import avgaussianv2.experiment.training as training_module
+    import avgaussianv2.experiment.checkpoint as checkpoint_module
 
     seen = []
-    real_save = training_module.save_pilot_checkpoint
+    real_save = checkpoint_module.save_pilot_checkpoint
     saves = 0
 
     def interrupt_after_first_save(*args, **kwargs):
@@ -317,7 +343,7 @@ def test_checkpoint_resume_after_warmup_save_does_not_replay_step(
         validation_interval=1,
         minimum_joint_steps=1,
     )
-    monkeypatch.setattr(training_module, "save_pilot_checkpoint", interrupt_after_first_save)
+    monkeypatch.setattr(checkpoint_module, "save_pilot_checkpoint", interrupt_after_first_save)
     model = TinyTrainFusion()
     model.condition_enabled = True
     with pytest.raises(RuntimeError, match="interrupt"):
@@ -336,10 +362,10 @@ def test_checkpoint_resume_after_warmup_save_does_not_replay_step(
             visual_baseline=_baseline(),
             audio_loss_fn=audio_loss,
             output_dir=tmp_path,
-            checkpoint_store=PilotCheckpointStore(tmp_path, _pilot_compatibility()),
+            checkpoint_store=_store(tmp_path, _pilot_compatibility()),
         )
 
-    monkeypatch.setattr(training_module, "save_pilot_checkpoint", real_save)
+    monkeypatch.setattr(checkpoint_module, "save_pilot_checkpoint", real_save)
     resumed = TinyTrainFusion()
     resumed.condition_enabled = True
     PilotTrainer(
@@ -357,7 +383,7 @@ def test_checkpoint_resume_after_warmup_save_does_not_replay_step(
         visual_baseline=_baseline(),
         audio_loss_fn=audio_loss,
         output_dir=tmp_path,
-        checkpoint_store=PilotCheckpointStore(
+        checkpoint_store=_store(
             tmp_path, _pilot_compatibility(), resume=True
         ),
     )
@@ -367,10 +393,10 @@ def test_checkpoint_resume_after_warmup_save_does_not_replay_step(
 def test_checkpoint_resume_after_nonvalidation_joint_step_does_not_replay(
     tmp_path, monkeypatch
 ) -> None:
-    import avgaussianv2.experiment.training as training_module
+    import avgaussianv2.experiment.checkpoint as checkpoint_module
 
     seen = []
-    real_save = training_module.save_pilot_checkpoint
+    real_save = checkpoint_module.save_pilot_checkpoint
 
     def interrupt_after_first_joint(*args, **kwargs):
         real_save(*args, **kwargs)
@@ -389,7 +415,7 @@ def test_checkpoint_resume_after_nonvalidation_joint_step_does_not_replay(
         validation_interval=2,
         minimum_joint_steps=3,
     )
-    monkeypatch.setattr(training_module, "save_pilot_checkpoint", interrupt_after_first_joint)
+    monkeypatch.setattr(checkpoint_module, "save_pilot_checkpoint", interrupt_after_first_joint)
     model = TinyTrainFusion()
     model.condition_enabled = True
     with pytest.raises(RuntimeError, match="nonvalidation"):
@@ -405,10 +431,10 @@ def test_checkpoint_resume_after_nonvalidation_joint_step_does_not_replay(
             visual_baseline=_baseline(),
             audio_loss_fn=audio_loss,
             output_dir=tmp_path,
-            checkpoint_store=PilotCheckpointStore(tmp_path, _pilot_compatibility()),
+            checkpoint_store=_store(tmp_path, _pilot_compatibility()),
         )
 
-    monkeypatch.setattr(training_module, "save_pilot_checkpoint", real_save)
+    monkeypatch.setattr(checkpoint_module, "save_pilot_checkpoint", real_save)
     resumed = TinyTrainFusion()
     resumed.condition_enabled = True
     PilotTrainer(config, FakeEvaluator((1.0, 0.9)), joint_step_fn=joint_step).run(
@@ -421,7 +447,7 @@ def test_checkpoint_resume_after_nonvalidation_joint_step_does_not_replay(
         visual_baseline=_baseline(),
         audio_loss_fn=audio_loss,
         output_dir=tmp_path,
-        checkpoint_store=PilotCheckpointStore(
+        checkpoint_store=_store(
             tmp_path, _pilot_compatibility(), resume=True
         ),
     )
@@ -431,10 +457,10 @@ def test_checkpoint_resume_after_nonvalidation_joint_step_does_not_replay(
 def test_resume_finishes_pending_validation_without_replaying_joint_step(
     tmp_path, monkeypatch
 ) -> None:
-    import avgaussianv2.experiment.training as training_module
+    import avgaussianv2.experiment.checkpoint as checkpoint_module
 
     seen = []
-    real_save = training_module.save_pilot_checkpoint
+    real_save = checkpoint_module.save_pilot_checkpoint
 
     def interrupt_before_validation(*args, **kwargs):
         real_save(*args, **kwargs)
@@ -452,7 +478,7 @@ def test_resume_finishes_pending_validation_without_replaying_joint_step(
         minimum_joint_steps=3,
     )
     first_evaluator = FakeEvaluator((1.0,))
-    monkeypatch.setattr(training_module, "save_pilot_checkpoint", interrupt_before_validation)
+    monkeypatch.setattr(checkpoint_module, "save_pilot_checkpoint", interrupt_before_validation)
     model = TinyTrainFusion()
     model.condition_enabled = True
     with pytest.raises(RuntimeError, match="before validation"):
@@ -466,11 +492,11 @@ def test_resume_finishes_pending_validation_without_replaying_joint_step(
             visual_baseline=_baseline(),
             audio_loss_fn=audio_loss,
             output_dir=tmp_path,
-            checkpoint_store=PilotCheckpointStore(tmp_path, _pilot_compatibility()),
+            checkpoint_store=_store(tmp_path, _pilot_compatibility()),
         )
     assert first_evaluator.calls == []
 
-    monkeypatch.setattr(training_module, "save_pilot_checkpoint", real_save)
+    monkeypatch.setattr(checkpoint_module, "save_pilot_checkpoint", real_save)
     resumed_evaluator = FakeEvaluator((1.0, 0.9))
     resumed = TinyTrainFusion()
     resumed.condition_enabled = True
@@ -484,7 +510,7 @@ def test_resume_finishes_pending_validation_without_replaying_joint_step(
         visual_baseline=_baseline(),
         audio_loss_fn=audio_loss,
         output_dir=tmp_path,
-        checkpoint_store=PilotCheckpointStore(
+        checkpoint_store=_store(
             tmp_path, _pilot_compatibility(), resume=True
         ),
     )
@@ -498,9 +524,9 @@ def test_resume_finishes_pending_validation_without_replaying_joint_step(
 def test_best_save_failure_leaves_latest_pending_and_resume_revalidates(
     tmp_path, monkeypatch
 ) -> None:
-    import avgaussianv2.experiment.training as training_module
+    import avgaussianv2.experiment.checkpoint as checkpoint_module
 
-    real_save = training_module.save_pilot_checkpoint
+    real_save = checkpoint_module.save_pilot_checkpoint
 
     def fail_best(path, **kwargs):
         if path.name == "best.pt":
@@ -513,7 +539,7 @@ def test_best_save_failure_leaves_latest_pending_and_resume_revalidates(
         validation_interval=1,
         minimum_joint_steps=2,
     )
-    monkeypatch.setattr(training_module, "save_pilot_checkpoint", fail_best)
+    monkeypatch.setattr(checkpoint_module, "save_pilot_checkpoint", fail_best)
     model = TinyTrainFusion()
     model.condition_enabled = True
     callbacks = []
@@ -532,7 +558,7 @@ def test_best_save_failure_leaves_latest_pending_and_resume_revalidates(
             visual_baseline=_baseline(),
             audio_loss_fn=audio_loss,
             output_dir=tmp_path,
-            checkpoint_store=PilotCheckpointStore(tmp_path, _pilot_compatibility()),
+            checkpoint_store=_store(tmp_path, _pilot_compatibility()),
             on_validation=lambda event: callbacks.append("validation"),
             on_best_candidate=lambda event: callbacks.append("best"),
         )
@@ -542,7 +568,7 @@ def test_best_save_failure_leaves_latest_pending_and_resume_revalidates(
     assert latest["selector_state"]["last_step"] is None
     assert callbacks == []
 
-    monkeypatch.setattr(training_module, "save_pilot_checkpoint", real_save)
+    monkeypatch.setattr(checkpoint_module, "save_pilot_checkpoint", real_save)
     resumed = TinyTrainFusion()
     resumed.condition_enabled = True
     resume_callbacks = []
@@ -560,7 +586,7 @@ def test_best_save_failure_leaves_latest_pending_and_resume_revalidates(
         visual_baseline=_baseline(),
         audio_loss_fn=audio_loss,
         output_dir=tmp_path,
-        checkpoint_store=PilotCheckpointStore(
+        checkpoint_store=_store(
             tmp_path, _pilot_compatibility(), resume=True
         ),
         on_validation=lambda event: resume_callbacks.append(
@@ -600,10 +626,80 @@ def test_latest_preserves_earlier_best_evaluation_summary(tmp_path) -> None:
         visual_baseline=_baseline(),
         audio_loss_fn=audio_loss,
         output_dir=tmp_path,
-        checkpoint_store=PilotCheckpointStore(tmp_path, _pilot_compatibility()),
+        checkpoint_store=_store(tmp_path, _pilot_compatibility()),
     )
     latest = torch.load(tmp_path / "latest.pt", weights_only=True)
     assert latest["best_evaluation_summary"]["audio_total"]["mean"] == 1.0
+    summary = json.loads((tmp_path / "worker_summary.json").read_text())
+    assert summary["checkpoint_io"]["save_count"] >= 5
+    assert summary["checkpoint_io"]["save_bytes"] > 0
+    assert summary["checkpoint_io"]["save_duration_seconds"] > 0
+    assert summary["checkpoint_io"]["cadence"] == "every_completed_optimizer_step"
+
+
+def test_stop_decision_is_durable_before_callback_and_resume_does_not_train(
+    tmp_path,
+) -> None:
+    seen = []
+
+    def step(model, sample, optimizer, *args, **kwargs):
+        seen.append(sample.frame_index)
+        return _stats(0.1)
+
+    config = PilotConfig(
+        warmup_steps=0,
+        joint_steps=3,
+        validation_interval=1,
+        minimum_joint_steps=0,
+        patience=1,
+        minimum_relative_improvement=0.1,
+    )
+    model = TinyTrainFusion()
+    model.condition_enabled = True
+    with pytest.raises(RuntimeError, match="stop callback"):
+        PilotTrainer(config, FakeEvaluator((1.0, 1.0)), joint_step_fn=step).run(
+            model=model,
+            train_samples=[_sample_with_frame(i) for i in range(3)],
+            heldout_samples=[make_sample()],
+            indices=VariantIndices((), (0, 1, 2)),
+            heldout_indices=(0,),
+            variant=Variant.JOINT_CONDITIONED,
+            visual_baseline=_baseline(),
+            audio_loss_fn=audio_loss,
+            output_dir=tmp_path,
+            checkpoint_store=_store(tmp_path, _pilot_compatibility()),
+            on_validation=lambda event: (
+                (_ for _ in ()).throw(RuntimeError("stop callback"))
+                if event.should_stop
+                else None
+            ),
+        )
+    latest = torch.load(tmp_path / "latest.pt", weights_only=True)
+    assert latest["next_joint_position"] == 2
+    assert latest["pending_validation"] is False
+    assert latest["stop_requested"] is True
+
+    resumed = TinyTrainFusion()
+    resumed.condition_enabled = True
+    evaluator = FakeEvaluator(())
+    result = PilotTrainer(config, evaluator, joint_step_fn=step).run(
+        model=resumed,
+        train_samples=[_sample_with_frame(i) for i in range(3)],
+        heldout_samples=[make_sample()],
+        indices=VariantIndices((), (0, 1, 2)),
+        heldout_indices=(0,),
+        variant=Variant.JOINT_CONDITIONED,
+        visual_baseline=_baseline(),
+        audio_loss_fn=audio_loss,
+        output_dir=tmp_path,
+        checkpoint_store=_store(
+            tmp_path, _pilot_compatibility(), resume=True
+        ),
+    )
+    assert seen == [0, 1]
+    assert evaluator.calls == []
+    assert result.completed_joint_steps == 2
+    assert result.stop_reason == "early_stop"
 
 
 def test_failed_optimizer_restore_rolls_back_model_and_preserves_reports(
@@ -632,7 +728,7 @@ def test_failed_optimizer_restore_rolls_back_model_and_preserves_reports(
             visual_baseline=_baseline(),
             audio_loss_fn=audio_loss,
             output_dir=tmp_path,
-            checkpoint_store=PilotCheckpointStore(tmp_path, _pilot_compatibility()),
+            checkpoint_store=_store(tmp_path, _pilot_compatibility()),
             on_validation=lambda event: (_ for _ in ()).throw(RuntimeError("interrupt")),
         )
     report = tmp_path / "worker_summary.json"
@@ -643,6 +739,9 @@ def test_failed_optimizer_restore_rolls_back_model_and_preserves_reports(
             with torch.no_grad():
                 self.param_groups[0]["params"][0].add_(99)
             raise RuntimeError("injected optimizer failure")
+
+    FailingOptimizer.__module__ = "torch.optim.adam"
+    FailingOptimizer.__qualname__ = "Adam"
 
     resumed = TinyTrainFusion()
     resumed.condition_enabled = False
@@ -668,7 +767,7 @@ def test_failed_optimizer_restore_rolls_back_model_and_preserves_reports(
             visual_baseline=_baseline(),
             audio_loss_fn=audio_loss,
             output_dir=tmp_path,
-            checkpoint_store=PilotCheckpointStore(
+            checkpoint_store=_store(
                 tmp_path, _pilot_compatibility(), resume=True
             ),
         )
@@ -787,7 +886,7 @@ def test_pilot_runs_real_training_and_same_model_evaluation_end_to_end(tmp_path)
         model=model,
         train_samples=[make_sample()],
         heldout_samples=[make_sample()],
-        indices=VariantIndices((0,), (0,)),
+            indices=VariantIndices((0,), (0,)),
         heldout_indices=(0,),
         variant=Variant.JOINT_CONDITIONED,
         visual_baseline={
@@ -898,7 +997,10 @@ def test_non_joint_variants_skip_probe_and_condition_off_skips_warmup(tmp_path, 
         model=model,
         train_samples=[make_sample()],
         heldout_samples=[make_sample()],
-        indices=VariantIndices((0,), (0,)),
+        indices=VariantIndices(
+            () if variant == Variant.CONDITION_OFF else (0,),
+            (0,),
+        ),
         heldout_indices=(0,),
         variant=variant,
         visual_baseline=_baseline(),

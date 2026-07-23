@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,6 +13,7 @@ from avgaussianv2.experiment.checkpoint import (
     PilotCheckpointStore,
     PilotCompatibility,
     PilotResumeError,
+    build_run_fingerprint,
     inspect_pilot_checkpoint,
     restore_pilot_checkpoint,
     save_pilot_checkpoint,
@@ -19,7 +22,9 @@ from avgaussianv2.experiment.checkpoint import (
     validate_compatibility,
 )
 from avgaussianv2.experiment.contracts import VariantIndices
+from avgaussianv2.experiment.contracts import PilotConfig
 from avgaussianv2.experiment.selection import BestSelector, EarlyStopper
+from avgaussianv2.config import TrainConfig
 
 
 class Dangerous:
@@ -128,9 +133,31 @@ def _checkpoint_kwargs(model, optimizer):
     )
     stopper = EarlyStopper(0, 2, 0.1)
     stopper.update(1, 1.0)
+    fingerprint = build_run_fingerprint(
+        pilot_config=PilotConfig(
+            warmup_steps=2,
+            joint_steps=3,
+            validation_interval=1,
+            minimum_joint_steps=0,
+            patience=2,
+            minimum_relative_improvement=0.1,
+        ),
+        train_config=TrainConfig(),
+        visual_baseline={
+            "rgb_psnr": {"mean": 30.0},
+            "rgb_ssim": {"mean": 0.95},
+        },
+        model=model,
+        warmup_optimizer_factory=compatibility,
+        joint_optimizer_factory=compatibility,
+        warmup_step_fn=compatibility,
+        joint_step_fn=compatibility,
+        audio_loss_fn=compatibility,
+    )
     return dict(
         model=model,
         compatibility=compatibility(),
+        run_fingerprint=fingerprint,
         stage="joint",
         next_warmup_position=2,
         next_joint_position=1,
@@ -167,10 +194,27 @@ def _checkpoint_kwargs(model, optimizer):
                 "gradient_norms": {"visual": 0.25},
             }
         ],
-        validation_history=[{"step": 1, "summary": {"audio_total": {"mean": 1.0}}}],
+        validation_history=[
+            {
+                "step": 1,
+                "summary": {
+                    "audio_total": {"mean": 1.0},
+                    "rgb_psnr": {"mean": 30.0},
+                    "rgb_ssim": {"mean": 0.95},
+                },
+            }
+        ],
         maximum_positive_audio_visual_gradient=0.25,
-        validation_summary={"audio_total": {"mean": 1.0}},
-        best_evaluation_summary={"audio_total": {"mean": 1.0}},
+        validation_summary={
+            "audio_total": {"mean": 1.0},
+            "rgb_psnr": {"mean": 30.0},
+            "rgb_ssim": {"mean": 0.95},
+        },
+        best_evaluation_summary={
+            "audio_total": {"mean": 1.0},
+            "rgb_psnr": {"mean": 30.0},
+            "rgb_ssim": {"mean": 0.95},
+        },
     )
 
 
@@ -248,20 +292,32 @@ def test_atomic_save_failure_preserves_old_checkpoint(tmp_path: Path, monkeypatc
 def test_store_enforces_fresh_resume_output_policy(tmp_path: Path) -> None:
     store = PilotCheckpointStore(tmp_path, compatibility())
     store.latest_path.write_bytes(b"old")
-    with pytest.raises(FileExistsError, match="refuses"):
+    with store, pytest.raises(FileExistsError, match="refuses"):
         store.prepare()
-    PilotCheckpointStore(tmp_path, compatibility(), overwrite=True).prepare()
-    store.latest_path.write_bytes(b"resume")
-    PilotCheckpointStore(tmp_path, compatibility(), resume=True).prepare()
-    with pytest.raises(FileNotFoundError, match="latest"):
-        PilotCheckpointStore(tmp_path / "missing", compatibility(), resume=True).prepare()
+    overwrite = PilotCheckpointStore(tmp_path, compatibility(), overwrite=True)
+    with overwrite:
+        overwrite.prepare()
+    model = nn.Linear(2, 1)
+    save_pilot_checkpoint(
+        store.latest_path,
+        **_checkpoint_kwargs(model, torch.optim.SGD(model.parameters(), lr=0.1)),
+    )
+    resume = PilotCheckpointStore(tmp_path, compatibility(), resume=True)
+    with resume:
+        resume.prepare()
+    missing = PilotCheckpointStore(tmp_path / "missing", compatibility(), resume=True)
+    with missing, pytest.raises(FileNotFoundError, match="latest"):
+        missing.prepare()
 
 
 def test_fresh_store_rejects_any_nonempty_output_directory(tmp_path: Path) -> None:
     (tmp_path / "unrelated.txt").write_text("occupied")
-    with pytest.raises(FileExistsError, match="nonempty"):
-        PilotCheckpointStore(tmp_path, compatibility()).prepare()
-    PilotCheckpointStore(tmp_path, compatibility(), overwrite=True).prepare()
+    fresh = PilotCheckpointStore(tmp_path, compatibility())
+    with fresh, pytest.raises(FileExistsError, match="nonempty"):
+        fresh.prepare()
+    overwrite = PilotCheckpointStore(tmp_path, compatibility(), overwrite=True)
+    with overwrite:
+        overwrite.prepare()
     assert (tmp_path / "unrelated.txt").read_text() == "occupied"
 
 
@@ -449,7 +505,6 @@ def test_best_checkpoint_self_inspects_but_cannot_be_active_resume(tmp_path: Pat
         checkpoint_kind="best",
         optimizer=None,
         optimizer_stage=None,
-        best_evaluation_summary={"audio_total": {"mean": 1.0}},
     )
     save_pilot_checkpoint(path, **kwargs)
     artifact = inspect_pilot_checkpoint(
@@ -459,10 +514,277 @@ def test_best_checkpoint_self_inspects_but_cannot_be_active_resume(tmp_path: Pat
         active_resume=False,
     )
     assert artifact.checkpoint_kind == "best"
-    assert artifact.best_evaluation_summary == {"audio_total": {"mean": 1.0}}
+    assert artifact.best_evaluation_summary["audio_total"] == {"mean": 1.0}
     with pytest.raises(PilotResumeError, match="best.*active"):
         inspect_pilot_checkpoint(
             path,
             expected_compatibility=compatibility(),
             indices=VariantIndices((0, 1), (4, 5, 6)),
         )
+
+
+def test_store_lock_rejects_concurrent_owner_and_stale_file_is_harmless(
+    tmp_path: Path,
+) -> None:
+    first = PilotCheckpointStore(tmp_path, compatibility())
+    second = PilotCheckpointStore(tmp_path, compatibility())
+    first.acquire()
+    try:
+        with pytest.raises(PilotResumeError, match="another process"):
+            second.acquire()
+    finally:
+        first.release()
+    second.acquire()
+    second.release()
+    assert (tmp_path / ".pilot.lock").is_file()
+
+
+def test_run_fingerprint_detects_behavior_changes_before_model_mutation(
+    tmp_path: Path,
+) -> None:
+    model = nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    path = tmp_path / "latest.pt"
+    kwargs = _checkpoint_kwargs(model, optimizer)
+    save_pilot_checkpoint(path, **kwargs)
+    changed = build_run_fingerprint(
+        pilot_config=PilotConfig(
+            warmup_steps=2,
+            joint_steps=3,
+            validation_interval=2,
+            minimum_joint_steps=0,
+            patience=2,
+            minimum_relative_improvement=0.1,
+        ),
+        train_config=TrainConfig(audio_lr=0.2, lambda_rgb=0.3),
+        visual_baseline={
+            "rgb_psnr": {"mean": 30.0},
+            "rgb_ssim": {"mean": 0.95},
+        },
+        model=nn.Sequential(nn.Linear(2, 1)),
+        warmup_optimizer_factory=compatibility,
+        joint_optimizer_factory=compatibility,
+        warmup_step_fn=compatibility,
+        joint_step_fn=compatibility,
+        audio_loss_fn=compatibility,
+    )
+    before = {name: value.clone() for name, value in model.state_dict().items()}
+    with pytest.raises(PilotResumeError, match="run_fingerprint"):
+        inspect_pilot_checkpoint(
+            path,
+            expected_compatibility=compatibility(),
+            expected_run_fingerprint=changed,
+            indices=VariantIndices((0, 1), (4, 5, 6)),
+            model=model,
+        )
+    for name, value in model.state_dict().items():
+        assert torch.equal(value, before[name])
+
+
+@pytest.mark.parametrize(
+    ("pilot_config", "train_config", "model", "joint_factory"),
+    [
+        (
+            PilotConfig(validation_interval=25),
+            TrainConfig(),
+            nn.Linear(2, 1),
+            compatibility,
+        ),
+        (
+            PilotConfig(),
+            TrainConfig(audio_lr=0.2),
+            nn.Linear(2, 1),
+            compatibility,
+        ),
+        (
+            PilotConfig(),
+            TrainConfig(lambda_rgb=0.3),
+            nn.Linear(2, 1),
+            compatibility,
+        ),
+        (
+            PilotConfig(),
+            TrainConfig(),
+            nn.Sequential(nn.Linear(2, 1)),
+            compatibility,
+        ),
+        (
+            PilotConfig(),
+            TrainConfig(),
+            nn.Linear(2, 1),
+            sha256_file,
+        ),
+    ],
+    ids=[
+        "validation_interval",
+        "learning_rate",
+        "loss_weight",
+        "model_identity",
+        "factory_identity",
+    ],
+)
+def test_run_fingerprint_changes_for_behavior_affecting_inputs(
+    pilot_config, train_config, model, joint_factory
+) -> None:
+    base = build_run_fingerprint(
+        pilot_config=PilotConfig(),
+        train_config=TrainConfig(),
+        visual_baseline={
+            "rgb_psnr": {"mean": 30.0},
+            "rgb_ssim": {"mean": 0.95},
+        },
+        model=nn.Linear(2, 1),
+        warmup_optimizer_factory=compatibility,
+        joint_optimizer_factory=compatibility,
+        warmup_step_fn=compatibility,
+        joint_step_fn=compatibility,
+        audio_loss_fn=compatibility,
+    )
+    changed = build_run_fingerprint(
+        pilot_config=pilot_config,
+        train_config=train_config,
+        visual_baseline={
+            "rgb_psnr": {"mean": 30.0},
+            "rgb_ssim": {"mean": 0.95},
+        },
+        model=model,
+        warmup_optimizer_factory=compatibility,
+        joint_optimizer_factory=joint_factory,
+        warmup_step_fn=compatibility,
+        joint_step_fn=compatibility,
+        audio_loss_fn=compatibility,
+    )
+    assert changed["sha256"] != base["sha256"]
+
+
+def test_checkpoint_enabled_lambda_requires_explicit_identity() -> None:
+    model = nn.Linear(2, 1)
+    with pytest.raises(ValueError, match="lambda.*explicit"):
+        build_run_fingerprint(
+            pilot_config=PilotConfig(),
+            train_config=TrainConfig(),
+            visual_baseline={
+                "rgb_psnr": {"mean": 30.0},
+                "rgb_ssim": {"mean": 0.95},
+            },
+            model=model,
+            warmup_optimizer_factory=compatibility,
+            joint_optimizer_factory=compatibility,
+            warmup_step_fn=compatibility,
+            joint_step_fn=lambda: None,
+            audio_loss_fn=compatibility,
+        )
+
+
+def test_baseexception_restore_rolls_back_model_and_optimizer(tmp_path: Path) -> None:
+    class Abort(BaseException):
+        pass
+
+    class AbortingSGD(torch.optim.SGD):
+        def load_state_dict(self, state_dict):
+            with torch.no_grad():
+                self.param_groups[0]["params"][0].add_(10)
+            self.state["partial"] = {"nested": [torch.tensor(2.0)]}
+            raise Abort("abort restore")
+
+    source = nn.Linear(2, 1)
+    source_optimizer = torch.optim.SGD(source.parameters(), lr=0.1)
+    path = tmp_path / "latest.pt"
+    save_pilot_checkpoint(path, **_checkpoint_kwargs(source, source_optimizer))
+    state = inspect_pilot_checkpoint(
+        path,
+        expected_compatibility=compatibility(),
+        indices=VariantIndices((0, 1), (4, 5, 6)),
+    )
+    target = nn.Linear(2, 1)
+    optimizer = AbortingSGD(target.parameters(), lr=0.1)
+    before_model = {name: value.clone() for name, value in target.state_dict().items()}
+    before_optimizer = copy.deepcopy(optimizer.state_dict())
+    with pytest.raises(Abort, match="abort restore"):
+        restore_pilot_checkpoint(
+            state, model=target, optimizer=optimizer, optimizer_stage="joint"
+        )
+    for name, value in target.state_dict().items():
+        assert torch.equal(value, before_model[name])
+    assert optimizer.state_dict() == before_optimizer
+
+
+def test_prepare_rolls_back_ahead_best_from_incomplete_transaction(
+    tmp_path: Path,
+) -> None:
+    model = nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    kwargs = _checkpoint_kwargs(model, optimizer)
+    latest = tmp_path / "latest.pt"
+    best = tmp_path / "best.pt"
+    save_pilot_checkpoint(latest, generation=1, **kwargs)
+    best_kwargs = {
+        **kwargs,
+        "checkpoint_kind": "best",
+        "optimizer": None,
+        "optimizer_stage": None,
+    }
+    save_pilot_checkpoint(best, generation=1, **best_kwargs)
+    old_best = best.read_bytes()
+    (tmp_path / ".pilot-best-backup.pt").write_bytes(old_best)
+    with torch.no_grad():
+        model.weight.add_(10)
+    save_pilot_checkpoint(best, generation=2, **best_kwargs)
+    (tmp_path / ".pilot-validation-transaction.json").write_text(
+        json.dumps({"generation": 2, "had_best": True})
+    )
+
+    store = PilotCheckpointStore(tmp_path, compatibility(), resume=True)
+    with store:
+        store.prepare()
+
+    assert best.read_bytes() == old_best
+    assert not (tmp_path / ".pilot-validation-transaction.json").exists()
+    assert not (tmp_path / ".pilot-best-backup.pt").exists()
+
+
+def test_derived_stopper_corruption_is_rejected(tmp_path: Path) -> None:
+    model = nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    path = tmp_path / "corrupt-derived.pt"
+    save_pilot_checkpoint(path, **_checkpoint_kwargs(model, optimizer))
+    payload = torch.load(path, weights_only=True)
+    payload["stopper_state"]["best"] = 0.5
+    torch.save(payload, path)
+    with pytest.raises(PilotResumeError, match="stopper_state.*history"):
+        inspect_pilot_checkpoint(
+            path,
+            expected_compatibility=compatibility(),
+            indices=VariantIndices((0, 1), (4, 5, 6)),
+        )
+
+
+def test_overwrite_removes_all_owned_outputs_but_keeps_unowned_file(
+    tmp_path: Path,
+) -> None:
+    for name in (
+        "latest.pt",
+        "best.pt",
+        "worker_summary.json",
+        "training_curve.csv",
+        ".pilot-validation-transaction.json",
+        ".pilot-best-backup.pt",
+    ):
+        (tmp_path / name).write_text("old")
+    (tmp_path / "validation" / "step_000001").mkdir(parents=True)
+    (tmp_path / "validation" / "step_000001" / "metrics.json").write_text("old")
+    (tmp_path / "keep.txt").write_text("keep")
+    store = PilotCheckpointStore(tmp_path, compatibility(), overwrite=True)
+    with store:
+        store.prepare()
+    for name in (
+        "latest.pt",
+        "best.pt",
+        "worker_summary.json",
+        "training_curve.csv",
+        ".pilot-validation-transaction.json",
+        ".pilot-best-backup.pt",
+        "validation",
+    ):
+        assert not (tmp_path / name).exists()
+    assert (tmp_path / "keep.txt").read_text() == "keep"

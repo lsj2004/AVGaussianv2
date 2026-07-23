@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import copy
+import fcntl
 import hashlib
 import json
 import math
 import os
+import shutil
 import tempfile
+import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields
 from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
@@ -18,11 +21,15 @@ import torch
 from torch import nn
 
 from avgaussianv2.experiment.contracts import Variant, VariantIndices
+from avgaussianv2.experiment.contracts import PilotConfig
 from avgaussianv2.experiment.selection import BestSelector, EarlyStopper
+from avgaussianv2.config import TrainConfig
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 STAGES = frozenset({"warmup", "joint", "complete"})
+ALGORITHM_IDENTITY = "avgaussianv2.pilot-training-v3"
+LOSS_STEP_API_VERSION = "avgaussianv2.loss-step-api-v1"
 
 
 class PilotResumeError(RuntimeError):
@@ -131,6 +138,144 @@ def hash_index_manifest(manifest: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _qualified_identity(
+    value: object,
+    name: str,
+    overrides: Mapping[str, str],
+) -> str:
+    if name in overrides:
+        return _text(f"component_identities[{name!r}]", overrides[name])
+    module = getattr(value, "__module__", None)
+    qualified = getattr(value, "__qualname__", None)
+    if not isinstance(module, str) or not isinstance(qualified, str):
+        raise ValueError(f"{name} requires an explicit stable identity")
+    if "<lambda>" in qualified:
+        raise ValueError(f"{name} lambda requires an explicit stable identity")
+    return f"{module}.{qualified}"
+
+
+def build_run_fingerprint(
+    *,
+    pilot_config: PilotConfig,
+    train_config: TrainConfig,
+    visual_baseline: object,
+    model: nn.Module,
+    warmup_optimizer_factory: object,
+    joint_optimizer_factory: object,
+    warmup_step_fn: object,
+    joint_step_fn: object,
+    audio_loss_fn: object,
+    component_identities: Mapping[str, str] | None = None,
+) -> dict[str, object]:
+    """Build the canonical identity of every behavior-affecting pilot input."""
+    overrides = {} if component_identities is None else dict(component_identities)
+    allowed_overrides = {
+        "model_class",
+        "warmup_optimizer_factory",
+        "joint_optimizer_factory",
+        "warmup_optimizer_class",
+        "joint_optimizer_class",
+        "warmup_step_fn",
+        "joint_step_fn",
+        "audio_loss_fn",
+    }
+    unexpected_overrides = sorted(set(overrides) - allowed_overrides)
+    if unexpected_overrides:
+        raise ValueError(
+            f"unexpected component identities: {unexpected_overrides}"
+        )
+    inputs = {
+        "pilot_config": asdict(pilot_config),
+        "train_config": asdict(train_config),
+        "visual_baseline": _json_clone(visual_baseline, "visual_baseline"),
+        "model_class": _qualified_identity(model.__class__, "model_class", overrides),
+        "model_format_version": str(
+            getattr(model, "checkpoint_format_version", "state-dict-v1")
+        ),
+        "warmup_optimizer_factory": _qualified_identity(
+            warmup_optimizer_factory, "warmup_optimizer_factory", overrides
+        ),
+        "joint_optimizer_factory": _qualified_identity(
+            joint_optimizer_factory, "joint_optimizer_factory", overrides
+        ),
+        "warmup_optimizer_class": overrides.get(
+            "warmup_optimizer_class", "torch.optim.adam.Adam"
+        ),
+        "joint_optimizer_class": overrides.get(
+            "joint_optimizer_class", "torch.optim.adam.Adam"
+        ),
+        "warmup_step_fn": _qualified_identity(
+            warmup_step_fn, "warmup_step_fn", overrides
+        ),
+        "joint_step_fn": _qualified_identity(
+            joint_step_fn, "joint_step_fn", overrides
+        ),
+        "audio_loss_fn": _qualified_identity(
+            audio_loss_fn, "audio_loss_fn", overrides
+        ),
+        "loss_step_api_version": LOSS_STEP_API_VERSION,
+    }
+    encoded = json.dumps(
+        inputs, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return {
+        "algorithm": ALGORITHM_IDENTITY,
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "inputs": inputs,
+    }
+
+
+def _validate_run_fingerprint(value: object) -> dict[str, object]:
+    mapping = _require_exact_keys(
+        value, {"algorithm", "sha256", "inputs"}, "run_fingerprint"
+    )
+    if mapping["algorithm"] != ALGORITHM_IDENTITY:
+        raise PilotResumeError("run_fingerprint algorithm mismatch")
+    if not isinstance(mapping["inputs"], Mapping):
+        raise PilotResumeError("run_fingerprint inputs must be a mapping")
+    inputs = _json_clone(mapping["inputs"], "run_fingerprint.inputs")
+    _require_exact_keys(
+        inputs,
+        {
+            "pilot_config",
+            "train_config",
+            "visual_baseline",
+            "model_class",
+            "model_format_version",
+            "warmup_optimizer_factory",
+            "joint_optimizer_factory",
+            "warmup_optimizer_class",
+            "joint_optimizer_class",
+            "warmup_step_fn",
+            "joint_step_fn",
+            "audio_loss_fn",
+            "loss_step_api_version",
+        },
+        "run_fingerprint.inputs",
+    )
+    _require_exact_keys(
+        inputs["pilot_config"],
+        set(PilotConfig.__dataclass_fields__),
+        "run_fingerprint.inputs.pilot_config",
+    )
+    _require_exact_keys(
+        inputs["train_config"],
+        set(TrainConfig.__dataclass_fields__),
+        "run_fingerprint.inputs.train_config",
+    )
+    encoded = json.dumps(
+        inputs, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    expected = hashlib.sha256(encoded).hexdigest()
+    if mapping["sha256"] != expected:
+        raise PilotResumeError("run_fingerprint sha256 mismatch")
+    return {
+        "algorithm": mapping["algorithm"],
+        "sha256": mapping["sha256"],
+        "inputs": inputs,
+    }
+
+
 def validate_compatibility(
     actual: PilotCompatibility, expected: PilotCompatibility
 ) -> None:
@@ -160,12 +305,16 @@ def _json_clone(value: object, name: str) -> Any:
 @dataclass(frozen=True)
 class PilotResumeState:
     checkpoint_kind: str
+    generation: int
+    run_fingerprint: dict[str, object]
     stage: str
     next_warmup_position: int
     next_joint_position: int
     completed_warmup_steps: int
     completed_joint_steps: int
     maximum_positive_audio_visual_gradient: float
+    pending_validation: bool
+    stop_requested: bool
     stop_reason: str | None
     training_history: tuple[dict[str, object], ...]
     validation_history: tuple[dict[str, object], ...]
@@ -228,6 +377,7 @@ def build_pilot_payload(
     *,
     model: nn.Module,
     compatibility: PilotCompatibility,
+    run_fingerprint: Mapping[str, object],
     stage: str,
     next_warmup_position: int,
     next_joint_position: int,
@@ -239,6 +389,9 @@ def build_pilot_payload(
     validation_history: Sequence[Mapping[str, object]],
     maximum_positive_audio_visual_gradient: float,
     checkpoint_kind: str = "latest",
+    generation: int = 0,
+    pending_validation: bool = False,
+    stop_requested: bool = False,
     stop_reason: str | None = None,
     validation_summary: Mapping[str, object] | None = None,
     best_evaluation_summary: Mapping[str, object] | None = None,
@@ -256,9 +409,17 @@ def build_pilot_payload(
         raise ValueError("maximum_positive_audio_visual_gradient must be finite nonnegative")
     warmup = _positive_int("next_warmup_position", next_warmup_position, allow_zero=True)
     joint = _positive_int("next_joint_position", next_joint_position, allow_zero=True)
+    generation_value = _positive_int("generation", generation, allow_zero=True)
+    fingerprint = _validate_run_fingerprint(run_fingerprint)
+    if not isinstance(pending_validation, bool):
+        raise TypeError("pending_validation must be a boolean")
+    if not isinstance(stop_requested, bool):
+        raise TypeError("stop_requested must be a boolean")
     return {
         "schema_version": SCHEMA_VERSION,
         "checkpoint_kind": checkpoint_kind,
+        "generation": generation_value,
+        "run_fingerprint": fingerprint,
         "compatibility": compatibility.to_mapping(),
         "provenance": {
             "compatibility": compatibility.to_mapping(),
@@ -278,6 +439,8 @@ def build_pilot_payload(
         "training_history": _json_clone(list(training_history), "training_history"),
         "validation_history": _json_clone(list(validation_history), "validation_history"),
         "maximum_positive_audio_visual_gradient": gradient,
+        "pending_validation": pending_validation,
+        "stop_requested": stop_requested,
         "stop_reason": stop_reason,
         "validation_summary": (
             None
@@ -332,24 +495,34 @@ def _require_exact_keys(
     return value
 
 
+def _resume_integer(name: str, value: object, *, allow_zero: bool = False) -> int:
+    try:
+        return _positive_int(name, value, allow_zero=allow_zero)
+    except (TypeError, ValueError) as error:
+        raise PilotResumeError(f"invalid {name}: {error}") from error
+
+
 def inspect_pilot_checkpoint(
     path: str | Path,
     *,
     expected_compatibility: PilotCompatibility,
     indices: VariantIndices,
+    expected_run_fingerprint: Mapping[str, object] | None = None,
     model: nn.Module | None = None,
     active_resume: bool = True,
     allow_complete: bool = False,
 ) -> PilotResumeState:
     payload = _payload(path)
     required = {
-        "schema_version", "checkpoint_kind", "compatibility", "provenance",
+        "schema_version", "checkpoint_kind", "generation", "run_fingerprint",
+        "compatibility", "provenance",
         "stage", "variant",
         "next_warmup_position", "next_joint_position", "completed_warmup_steps",
         "completed_joint_steps", "model_state_dict", "optimizer_stage",
         "optimizer_state_dict", "selector_state", "stopper_state",
         "training_history", "validation_history",
         "maximum_positive_audio_visual_gradient", "stop_reason",
+        "pending_validation", "stop_requested",
         "validation_summary", "best_evaluation_summary",
     }
     _require_exact_keys(payload, required, "pilot checkpoint root")
@@ -357,6 +530,16 @@ def inspect_pilot_checkpoint(
         raise PilotResumeError(
             f"schema_version must be {SCHEMA_VERSION}, got {payload['schema_version']!r}"
         )
+    generation = _resume_integer("generation", payload["generation"], allow_zero=True)
+    run_fingerprint = _validate_run_fingerprint(payload["run_fingerprint"])
+    if expected_run_fingerprint is not None:
+        expected_fingerprint = _validate_run_fingerprint(expected_run_fingerprint)
+        if run_fingerprint != expected_fingerprint:
+            raise PilotResumeError(
+                "run_fingerprint mismatch: "
+                f"actual={run_fingerprint['sha256']!r}, "
+                f"expected={expected_fingerprint['sha256']!r}"
+            )
     actual = PilotCompatibility.from_mapping(payload["compatibility"])
     validate_compatibility(actual, expected_compatibility)
     _require_exact_keys(
@@ -380,10 +563,10 @@ def inspect_pilot_checkpoint(
         raise PilotResumeError(f"invalid checkpoint stage: {stage!r}")
     if active_resume and stage == "complete" and not allow_complete:
         raise PilotResumeError("complete checkpoint cannot be resumed as active")
-    warmup = _positive_int(
+    warmup = _resume_integer(
         "next_warmup_position", payload["next_warmup_position"], allow_zero=True
     )
-    joint = _positive_int(
+    joint = _resume_integer(
         "next_joint_position", payload["next_joint_position"], allow_zero=True
     )
     if warmup > len(indices.warmup) or joint > len(indices.joint):
@@ -397,8 +580,28 @@ def inspect_pilot_checkpoint(
         raise PilotResumeError("warmup checkpoint joint position must be zero")
     if stage in {"joint", "complete"} and warmup != len(indices.warmup):
         raise PilotResumeError("joint/complete checkpoint requires completed warmup")
-    if payload["completed_warmup_steps"] != warmup or payload["completed_joint_steps"] != joint:
+    completed_warmup = _resume_integer(
+        "completed_warmup_steps",
+        payload["completed_warmup_steps"],
+        allow_zero=True,
+    )
+    completed_joint = _resume_integer(
+        "completed_joint_steps",
+        payload["completed_joint_steps"],
+        allow_zero=True,
+    )
+    if completed_warmup != warmup or completed_joint != joint:
         raise PilotResumeError("completed counts must equal exact next positions")
+    pending_validation = payload["pending_validation"]
+    stop_requested = payload["stop_requested"]
+    if not isinstance(pending_validation, bool) or not isinstance(stop_requested, bool):
+        raise PilotResumeError(
+            "pending_validation and stop_requested must be booleans"
+        )
+    if pending_validation and stop_requested:
+        raise PilotResumeError(
+            "pending_validation and stop_requested cannot both be true"
+        )
     optimizer_stage = payload["optimizer_stage"]
     optimizer_state = payload["optimizer_state_dict"]
     expected_optimizer_stage = (
@@ -534,6 +737,94 @@ def inspect_pilot_checkpoint(
         raise PilotResumeError(
             "selector/stopper last_step must match validation history"
         )
+    try:
+        replay_selector = BestSelector(
+            payload["selector_state"]["visual_baseline"],
+            payload["selector_state"]["psnr_tolerance_db"],
+            payload["selector_state"]["ssim_tolerance"],
+        )
+        replay_stopper = EarlyStopper(
+            payload["stopper_state"]["minimum_steps"],
+            payload["stopper_state"]["patience"],
+            payload["stopper_state"]["relative_delta"],
+        )
+        replay_stop_requested = False
+        for validation_index, row in enumerate(histories[1]):
+            replay_selector.consider(row["step"], row["summary"])
+            replay_stop_requested = replay_stopper.update(
+                row["step"], row["summary"]["audio_total"]["mean"]
+            )
+            if replay_stop_requested and validation_index != len(histories[1]) - 1:
+                raise ValueError("validation history continues after early stop")
+    except (KeyError, TypeError, ValueError) as error:
+        raise PilotResumeError(
+            f"validation history cannot reproduce selector/stopper: {error}"
+        ) from error
+    if replay_selector.state_dict() != selector.state_dict():
+        raise PilotResumeError("selector_state does not match validation history")
+    if replay_stopper.state_dict() != stopper.state_dict():
+        raise PilotResumeError("stopper_state does not match validation history")
+    if stop_requested != replay_stop_requested:
+        raise PilotResumeError("stop_requested does not match validation history")
+
+    fingerprint_inputs = run_fingerprint["inputs"]
+    pilot_values = fingerprint_inputs.get("pilot_config")
+    if not isinstance(pilot_values, Mapping):
+        raise PilotResumeError("run_fingerprint pilot_config is invalid")
+    try:
+        total_joint = _resume_integer(
+            "run_fingerprint joint_steps", pilot_values["joint_steps"]
+        )
+        validation_interval = _resume_integer(
+            "run_fingerprint validation_interval",
+            pilot_values["validation_interval"],
+        )
+    except KeyError as error:
+        raise PilotResumeError(
+            f"run_fingerprint pilot_config is missing {error.args[0]}"
+        ) from error
+    expected_selector_config = {
+        "psnr_tolerance_db": pilot_values.get("psnr_tolerance_db"),
+        "ssim_tolerance": pilot_values.get("ssim_tolerance"),
+    }
+    for name, expected_value in expected_selector_config.items():
+        if payload["selector_state"][name] != expected_value:
+            raise PilotResumeError(
+                f"selector_state {name} disagrees with run_fingerprint"
+            )
+    if (
+        payload["selector_state"]["visual_baseline"]
+        != fingerprint_inputs.get("visual_baseline")
+    ):
+        raise PilotResumeError(
+            "selector_state visual_baseline disagrees with run_fingerprint"
+        )
+    expected_stopper_config = {
+        "minimum_steps": pilot_values.get("minimum_joint_steps"),
+        "patience": pilot_values.get("patience"),
+        "relative_delta": pilot_values.get("minimum_relative_improvement"),
+    }
+    for name, expected_value in expected_stopper_config.items():
+        if payload["stopper_state"][name] != expected_value:
+            raise PilotResumeError(
+                f"stopper_state {name} disagrees with run_fingerprint"
+            )
+    scheduled = [
+        step
+        for step in range(1, joint + 1)
+        if step % validation_interval == 0
+        or (step == total_joint and joint == total_joint)
+    ]
+    expected_pending = bool(scheduled and scheduled[-1] == joint and joint not in validation_steps)
+    if pending_validation != expected_pending:
+        raise PilotResumeError(
+            "pending_validation does not match scheduled validation completeness"
+        )
+    completed_schedule = scheduled[:-1] if pending_validation else scheduled
+    if validation_steps != completed_schedule:
+        raise PilotResumeError(
+            "validation_history does not match the configured validation schedule"
+        )
     gradient = payload["maximum_positive_audio_visual_gradient"]
     if not isinstance(gradient, Real) or isinstance(gradient, bool):
         raise PilotResumeError("maximum_positive_audio_visual_gradient must be numeric")
@@ -549,6 +840,21 @@ def inspect_pilot_checkpoint(
         raise PilotResumeError("stop_reason is invalid")
     if stage == "complete" and stop_reason is None:
         raise PilotResumeError("complete checkpoint requires stop_reason")
+    if stage == "complete":
+        if pending_validation:
+            raise PilotResumeError("complete checkpoint cannot have pending validation")
+        if stop_reason == "max_steps" and joint != len(indices.joint):
+            raise PilotResumeError(
+                "complete max_steps checkpoint requires exhausted joint indices"
+            )
+        if stop_reason == "early_stop" and not stop_requested:
+            raise PilotResumeError(
+                "complete early_stop checkpoint requires stop_requested"
+            )
+        if stop_reason == "max_steps" and stop_requested:
+            raise PilotResumeError(
+                "complete max_steps checkpoint cannot request early stop"
+            )
     validation_summary = payload["validation_summary"]
     if validation_summary is not None and not isinstance(validation_summary, dict):
         raise PilotResumeError("validation_summary must be a mapping or None")
@@ -582,12 +888,16 @@ def inspect_pilot_checkpoint(
         )
     return PilotResumeState(
         checkpoint_kind=checkpoint_kind,
+        generation=generation,
+        run_fingerprint=run_fingerprint,
         stage=stage,
         next_warmup_position=warmup,
         next_joint_position=joint,
         completed_warmup_steps=warmup,
         completed_joint_steps=joint,
         maximum_positive_audio_visual_gradient=gradient,
+        pending_validation=pending_validation,
+        stop_requested=stop_requested,
         stop_reason=stop_reason,
         training_history=histories[0],
         validation_history=histories[1],
@@ -637,19 +947,42 @@ def restore_pilot_checkpoint(
     try:
         optimizer.load_state_dict(state.optimizer_state_dict)
         model.load_state_dict(state.model_state_dict, strict=True)
-        device = next(model.parameters()).device
-        for optimizer_state in optimizer.state.values():
-            for key, value in optimizer_state.items():
-                if torch.is_tensor(value):
-                    optimizer_state[key] = value.to(device)
-    except (RuntimeError, ValueError, TypeError) as error:
-        model.load_state_dict(original_model_state, strict=True)
-        for name, parameter in model.named_parameters():
-            parameter.requires_grad_(original_flags[name])
-        if hasattr(model, "condition_enabled"):
-            model.condition_enabled = original_condition
-        torch.optim.Optimizer.load_state_dict(optimizer, original_optimizer_state)
-        raise PilotResumeError(f"checkpoint state cannot be restored: {error}") from error
+        for parameter, optimizer_state in tuple(optimizer.state.items()):
+            optimizer.state[parameter] = _move_optimizer_value(
+                optimizer_state, parameter.device
+            )
+    except BaseException as error:
+        try:
+            model.load_state_dict(original_model_state, strict=True)
+            for name, parameter in model.named_parameters():
+                parameter.requires_grad_(original_flags[name])
+            if hasattr(model, "condition_enabled"):
+                model.condition_enabled = original_condition
+            torch.optim.Optimizer.load_state_dict(optimizer, original_optimizer_state)
+        except BaseException as rollback_error:
+            raise PilotResumeError(
+                f"checkpoint rollback failed after {error!r}: {rollback_error}"
+            ) from rollback_error
+        if isinstance(error, Exception):
+            raise PilotResumeError(
+                f"checkpoint state cannot be restored: {error}"
+            ) from error
+        raise
+
+
+def _move_optimizer_value(value: object, device: torch.device) -> object:
+    if torch.is_tensor(value):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {
+            key: _move_optimizer_value(item, device)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_move_optimizer_value(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_optimizer_value(item, device) for item in value)
+    return value
 
 
 def _validate_model_state(state: object, model: nn.Module) -> None:
@@ -670,6 +1003,48 @@ def _validate_model_state(state: object, model: nn.Module) -> None:
             )
 
 
+def _atomic_json(path: Path, value: Mapping[str, object]) -> None:
+    encoded = (
+        json.dumps(value, sort_keys=True, allow_nan=False, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _durable_copy(source: Path, destination: Path) -> None:
+    with source.open("rb") as reader, destination.open("wb") as writer:
+        shutil.copyfileobj(reader, writer, length=1024 * 1024)
+        writer.flush()
+        os.fsync(writer.fileno())
+    _fsync_directory(destination.parent)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 class PilotCheckpointStore:
     """Own canonical latest/best paths and fresh/resume output policy."""
 
@@ -680,6 +1055,8 @@ class PilotCheckpointStore:
         *,
         resume: bool = False,
         overwrite: bool = False,
+        component_identities: Mapping[str, str] | None = None,
+        checkpoint_hook: Any | None = None,
     ) -> None:
         if resume and overwrite:
             raise ValueError("resume and overwrite are mutually exclusive")
@@ -687,25 +1064,261 @@ class PilotCheckpointStore:
         self.compatibility = compatibility
         self.resume = bool(resume)
         self.overwrite = bool(overwrite)
+        self.component_identities = (
+            {} if component_identities is None else dict(component_identities)
+        )
+        self.checkpoint_hook = checkpoint_hook
         self.latest_path = self.output_dir / "latest.pt"
         self.best_path = self.output_dir / "best.pt"
+        self.lock_path = self.output_dir / ".pilot.lock"
+        self.journal_path = self.output_dir / ".pilot-validation-transaction.json"
+        self.backup_path = self.output_dir / ".pilot-best-backup.pt"
+        self.run_fingerprint: dict[str, object] | None = None
+        self.generation = 0
+        self.save_count = 0
+        self.save_bytes = 0
+        self.save_duration_seconds = 0.0
+        self._lock_stream: Any | None = None
+
+    @property
+    def metrics(self) -> dict[str, object]:
+        return {
+            "save_count": self.save_count,
+            "save_bytes": self.save_bytes,
+            "save_duration_seconds": self.save_duration_seconds,
+            "cadence": "every_completed_optimizer_step",
+        }
+
+    def bind_run_fingerprint(self, value: Mapping[str, object]) -> None:
+        validated = _validate_run_fingerprint(value)
+        if self.run_fingerprint is not None and self.run_fingerprint != validated:
+            raise PilotResumeError("checkpoint store run_fingerprint changed")
+        self.run_fingerprint = validated
+
+    def acquire(self) -> None:
+        if self._lock_stream is not None:
+            raise RuntimeError("pilot checkpoint store is already acquired")
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        stream = self.lock_path.open("a+b")
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            stream.close()
+            raise PilotResumeError(
+                f"pilot output is owned by another process: {self.output_dir}"
+            ) from error
+        metadata = {
+            "pid": os.getpid(),
+            "compatibility": self.compatibility.to_mapping(),
+            "acquired_unix_seconds": time.time(),
+        }
+        stream.seek(0)
+        stream.truncate()
+        stream.write(
+            (json.dumps(metadata, sort_keys=True, allow_nan=False) + "\n").encode(
+                "utf-8"
+            )
+        )
+        stream.flush()
+        os.fsync(stream.fileno())
+        self._lock_stream = stream
+
+    def release(self) -> None:
+        if self._lock_stream is None:
+            return
+        stream = self._lock_stream
+        self._lock_stream = None
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        finally:
+            stream.close()
+
+    def __enter__(self) -> PilotCheckpointStore:
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.release()
+
+    def _require_lock(self) -> None:
+        if self._lock_stream is None:
+            raise RuntimeError("pilot checkpoint store must be acquired")
+
+    def _record_save(self, path: Path, started: float) -> None:
+        duration = time.perf_counter() - started
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        self.save_count += 1
+        self.save_bytes += size
+        self.save_duration_seconds += duration
+        if self.checkpoint_hook is not None:
+            try:
+                self.checkpoint_hook(
+                    {
+                        "path": str(path),
+                        "bytes": size,
+                        "duration_seconds": duration,
+                        "save_count": self.save_count,
+                    }
+                )
+            except Exception:
+                # Measurement must never change checkpoint durability semantics.
+                pass
+
+    def _save(self, path: Path, **kwargs: object) -> None:
+        if self.run_fingerprint is None:
+            raise RuntimeError("run_fingerprint must be bound before saving")
+        started = time.perf_counter()
+        save_pilot_checkpoint(
+            path,
+            run_fingerprint=self.run_fingerprint,
+            **kwargs,
+        )
+        self._record_save(path, started)
+
+    def publish_latest(self, **kwargs: object) -> None:
+        self._require_lock()
+        generation = self.generation + 1
+        self._save(
+            self.latest_path,
+            checkpoint_kind="latest",
+            generation=generation,
+            **kwargs,
+        )
+        self.generation = generation
+
+    def publish_validation(
+        self,
+        *,
+        latest_kwargs: Mapping[str, object],
+        best_kwargs: Mapping[str, object] | None,
+    ) -> None:
+        self._require_lock()
+        if best_kwargs is None:
+            self.publish_latest(**dict(latest_kwargs))
+            return
+        generation = self.generation + 1
+        had_best = self.best_path.is_file()
+        if had_best:
+            _durable_copy(self.best_path, self.backup_path)
+        _atomic_json(
+            self.journal_path,
+            {"generation": generation, "had_best": had_best},
+        )
+        try:
+            self._save(
+                self.best_path,
+                checkpoint_kind="best",
+                generation=generation,
+                **dict(best_kwargs),
+            )
+            self._save(
+                self.latest_path,
+                checkpoint_kind="latest",
+                generation=generation,
+                **dict(latest_kwargs),
+            )
+            self.generation = generation
+        except BaseException:
+            self._rollback_transaction(had_best)
+            raise
+        self._clear_transaction()
+
+    def _clear_transaction(self) -> None:
+        self.journal_path.unlink(missing_ok=True)
+        self.backup_path.unlink(missing_ok=True)
+        _fsync_directory(self.output_dir)
+
+    def _rollback_transaction(self, had_best: bool) -> None:
+        if had_best and self.backup_path.is_file():
+            os.replace(self.backup_path, self.best_path)
+        elif not had_best:
+            self.best_path.unlink(missing_ok=True)
+        self.journal_path.unlink(missing_ok=True)
+        self.backup_path.unlink(missing_ok=True)
+        _fsync_directory(self.output_dir)
+
+    def _recover_transaction(self) -> None:
+        if not self.journal_path.exists():
+            return
+        try:
+            journal = json.loads(self.journal_path.read_text(encoding="utf-8"))
+            mapping = _require_exact_keys(
+                journal, {"generation", "had_best"}, "transaction journal"
+            )
+            generation = _resume_integer(
+                "transaction generation", mapping["generation"], allow_zero=True
+            )
+            if not isinstance(mapping["had_best"], bool):
+                raise PilotResumeError("transaction had_best must be boolean")
+            latest_generation = None
+            if self.latest_path.is_file():
+                latest_generation = _payload(self.latest_path).get("generation")
+            if latest_generation == generation:
+                self._clear_transaction()
+            else:
+                self._rollback_transaction(mapping["had_best"])
+        except (OSError, json.JSONDecodeError) as error:
+            raise PilotResumeError(
+                f"cannot recover checkpoint transaction: {error}"
+            ) from error
 
     def prepare(self) -> None:
+        self._require_lock()
         if self.resume:
+            self._recover_transaction()
             if not self.latest_path.is_file():
                 raise FileNotFoundError(
                     f"resume requires readable latest checkpoint: {self.latest_path}"
                 )
+            payload = _payload(self.latest_path)
+            self.generation = _resume_integer(
+                "generation", payload.get("generation"), allow_zero=True
+            )
+            if self.best_path.is_file():
+                best_payload = _payload(self.best_path)
+                best_generation = _resume_integer(
+                    "best generation",
+                    best_payload.get("generation"),
+                    allow_zero=True,
+                )
+                if best_generation > self.generation:
+                    raise PilotResumeError(
+                        "best checkpoint generation is ahead of latest without journal"
+                    )
             return
-        existing = list(self.output_dir.iterdir()) if self.output_dir.exists() else []
+        existing = [
+            path
+            for path in self.output_dir.iterdir()
+            if path.name != self.lock_path.name
+        ]
         if existing and not self.overwrite:
             raise FileExistsError(
                 "fresh pilot refuses nonempty output directory: "
                 + ", ".join(path.name for path in existing)
             )
         if self.overwrite:
-            self.latest_path.unlink(missing_ok=True)
-            self.best_path.unlink(missing_ok=True)
+            for path in (
+                self.latest_path,
+                self.best_path,
+                self.journal_path,
+                self.backup_path,
+                self.output_dir / "worker_summary.json",
+                self.output_dir / "training_curve.csv",
+            ):
+                path.unlink(missing_ok=True)
+            for pattern in (
+                ".latest.pt.*.tmp",
+                ".best.pt.*.tmp",
+                ".worker_summary.json.*.tmp",
+                ".training_curve.csv.*.tmp",
+            ):
+                for temporary in self.output_dir.glob(pattern):
+                    temporary.unlink(missing_ok=True)
+            shutil.rmtree(self.output_dir / "validation", ignore_errors=True)
+        self.generation = 0
 
 
 __all__ = [
@@ -714,6 +1327,7 @@ __all__ = [
     "PilotResumeError",
     "PilotResumeState",
     "build_pilot_payload",
+    "build_run_fingerprint",
     "hash_index_manifest",
     "inspect_pilot_checkpoint",
     "restore_pilot_checkpoint",
