@@ -30,6 +30,7 @@ from avgaussianv2.experiment.checkpoint import (
     build_run_fingerprint,
     inspect_pilot_checkpoint,
     restore_pilot_checkpoint,
+    validate_pilot_resume_model,
 )
 from avgaussianv2.experiment.selection import BestSelector, EarlyStopper
 from avgaussianv2.losses import AudioLoss, capture_visual_anchor
@@ -416,6 +417,8 @@ class PilotTrainer:
         on_validation: ValidationCallback | None = None,
         on_best_candidate: ValidationCallback | None = None,
         checkpoint_store: PilotCheckpointStore | None = None,
+        preloaded_resume_state: PilotResumeState | None = None,
+        checkpoint_store_prepared: bool = False,
     ) -> PilotTrainingResult:
         arguments = {
             "model": model,
@@ -430,6 +433,8 @@ class PilotTrainer:
             "on_validation": on_validation,
             "on_best_candidate": on_best_candidate,
             "checkpoint_store": checkpoint_store,
+            "preloaded_resume_state": preloaded_resume_state,
+            "checkpoint_store_prepared": checkpoint_store_prepared,
         }
         if checkpoint_store is None:
             return self._run_impl(**arguments)
@@ -451,6 +456,8 @@ class PilotTrainer:
         on_validation: ValidationCallback | None = None,
         on_best_candidate: ValidationCallback | None = None,
         checkpoint_store: PilotCheckpointStore | None = None,
+        preloaded_resume_state: PilotResumeState | None = None,
+        checkpoint_store_prepared: bool = False,
     ) -> PilotTrainingResult:
         if hasattr(self.evaluator, "model") and self.evaluator.model is not model:
             raise ValueError("evaluator must be bound to the same model passed to PilotTrainer.run")
@@ -482,7 +489,7 @@ class PilotTrainer:
                 raise ValueError(f"training index {index} is out of range")
 
         output = Path(output_dir)
-        resume_state: PilotResumeState | None = None
+        resume_state: PilotResumeState | None = preloaded_resume_state
         if checkpoint_store is not None:
             if checkpoint_store.output_dir.resolve() != output.resolve():
                 raise ValueError("checkpoint store output_dir must match trainer output_dir")
@@ -499,16 +506,20 @@ class PilotTrainer:
                 component_identities=checkpoint_store.component_identities,
             )
             checkpoint_store.bind_run_fingerprint(run_fingerprint)
-            checkpoint_store.prepare()
+            if not checkpoint_store_prepared:
+                checkpoint_store.prepare()
             if checkpoint_store.resume:
-                resume_state = inspect_pilot_checkpoint(
-                    checkpoint_store.latest_path,
-                    expected_compatibility=checkpoint_store.compatibility,
-                    indices=indices,
-                    expected_run_fingerprint=run_fingerprint,
-                    model=model,
-                    allow_complete=True,
-                )
+                if resume_state is None:
+                    resume_state = inspect_pilot_checkpoint(
+                        checkpoint_store.latest_path,
+                        expected_compatibility=checkpoint_store.compatibility,
+                        indices=indices,
+                        expected_run_fingerprint=run_fingerprint,
+                        model=model,
+                        allow_complete=True,
+                    )
+                else:
+                    validate_pilot_resume_model(resume_state, model)
                 _inspect_canonical_best(
                     store=checkpoint_store,
                     latest=resume_state,
@@ -546,6 +557,10 @@ class PilotTrainer:
                             f"actual={actual_stopper[name]!r}, "
                             f"expected={expected_stopper[name]!r}"
                         )
+            elif resume_state is not None:
+                raise ValueError(
+                    "preloaded_resume_state requires a resume checkpoint store"
+                )
         output_ready = False
 
         def prepare_output() -> None:

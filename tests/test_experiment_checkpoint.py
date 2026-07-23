@@ -808,7 +808,11 @@ def test_validation_commit_survives_one_shot_directory_sync_failure(
 
         def fail_first_directory_open(path, flags, *args, **named):
             nonlocal failed
-            if latest_replaced and not failed and Path(path) == tmp_path:
+            if (
+                latest_replaced
+                and not failed
+                and Path(path).resolve() == tmp_path.resolve()
+            ):
                 failed = True
                 raise OSError("injected directory open failure")
             return real_open(path, flags, *args, **named)
@@ -869,7 +873,7 @@ def test_validation_commit_retains_journal_when_durability_is_ambiguous(
                 latest_replaced = True
 
         def fail_directory_open(path, flags, *args, **named):
-            if latest_replaced and Path(path) == tmp_path:
+            if latest_replaced and Path(path).resolve() == tmp_path.resolve():
                 raise OSError("persistent directory open failure")
             return real_open(path, flags, *args, **named)
 

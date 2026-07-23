@@ -18,6 +18,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
@@ -35,10 +36,11 @@ from avgaussianv2.experiment.selection import BestSelector, EarlyStopper
 from avgaussianv2.config import TrainConfig
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 STAGES = frozenset({"warmup", "joint", "complete"})
-ALGORITHM_IDENTITY = "avgaussianv2.pilot-training-v4"
+ALGORITHM_IDENTITY = "avgaussianv2.pilot-training-v5"
 LOSS_STEP_API_VERSION = "avgaussianv2.loss-step-api-v1"
+MAX_PILOT_CHECKPOINT_BYTES = 256 * 1024 * 1024 * 1024
 
 
 class PilotResumeError(RuntimeError):
@@ -193,6 +195,7 @@ def build_run_fingerprint(
         "warmup_step_fn",
         "joint_step_fn",
         "audio_loss_fn",
+        "worker_contract_sha256",
     }
     unexpected_overrides = sorted(set(overrides) - allowed_overrides)
     if unexpected_overrides:
@@ -227,6 +230,9 @@ def build_run_fingerprint(
         ),
         "audio_loss_fn": _qualified_identity(
             audio_loss_fn, "audio_loss_fn", overrides
+        ),
+        "worker_contract_sha256": overrides.get(
+            "worker_contract_sha256", "none"
         ),
         "loss_step_api_version": LOSS_STEP_API_VERSION,
     }
@@ -264,6 +270,7 @@ def _validate_run_fingerprint(value: object) -> dict[str, object]:
             "warmup_step_fn",
             "joint_step_fn",
             "audio_loss_fn",
+            "worker_contract_sha256",
             "loss_step_api_version",
         },
         "run_fingerprint.inputs",
@@ -486,14 +493,36 @@ def save_pilot_checkpoint(path: str | Path, **kwargs: object) -> None:
 
 def _payload(path: str | Path) -> dict[str, Any]:
     source = Path(path)
-    if not source.exists():
-        raise FileNotFoundError(f"pilot checkpoint does not exist: {source}")
-    if not source.is_file():
-        raise PilotResumeError(f"pilot checkpoint is not a regular file: {source}")
     try:
-        value = torch.load(source, map_location="cpu", weights_only=True)
+        descriptor = os.open(
+            source,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"pilot checkpoint does not exist: {source}"
+        ) from None
+    except OSError as error:
+        raise PilotResumeError(
+            f"cannot securely open pilot checkpoint {source}: {error}"
+        ) from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise PilotResumeError(
+                f"pilot checkpoint must be a single-link regular file: {source}"
+            )
+        if metadata.st_size > MAX_PILOT_CHECKPOINT_BYTES:
+            raise PilotResumeError(
+                "pilot checkpoint exceeds the configured "
+                f"{MAX_PILOT_CHECKPOINT_BYTES} byte limit: {source}"
+            )
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            value = torch.load(stream, map_location="cpu", weights_only=True)
     except Exception as error:
         raise PilotResumeError(f"cannot read pilot checkpoint {source}: {error}") from error
+    finally:
+        os.close(descriptor)
     _validate_safe_checkpoint_value(value)
     if not isinstance(value, dict):
         raise PilotResumeError("pilot checkpoint root must be a mapping")
@@ -1053,6 +1082,15 @@ def _validate_model_state(state: object, model: nn.Module) -> None:
             )
 
 
+def validate_pilot_resume_model(
+    state: PilotResumeState, model: nn.Module
+) -> None:
+    """Validate a retained resume payload against the constructed model."""
+    if not isinstance(state, PilotResumeState):
+        raise TypeError("state must be PilotResumeState")
+    _validate_model_state(state.model_state_dict, model)
+
+
 def _atomic_json(path: Path, value: Mapping[str, object]) -> None:
     encoded = (
         json.dumps(value, sort_keys=True, allow_nan=False, separators=(",", ":"))
@@ -1080,7 +1118,42 @@ def _atomic_json(path: Path, value: Mapping[str, object]) -> None:
 
 
 def _durable_copy(source: Path, destination: Path) -> None:
-    with source.open("rb") as reader, destination.open("wb") as writer:
+    source_fd = os.open(
+        source,
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0),
+    )
+    try:
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            0o600,
+        )
+    except BaseException:
+        os.close(source_fd)
+        raise
+    source_stat = os.fstat(source_fd)
+    destination_stat = os.fstat(destination_fd)
+    if (
+        not stat.S_ISREG(source_stat.st_mode)
+        or source_stat.st_nlink != 1
+        or not stat.S_ISREG(destination_stat.st_mode)
+        or destination_stat.st_nlink != 1
+    ):
+        os.close(source_fd)
+        os.close(destination_fd)
+        raise PilotResumeError(
+            "checkpoint copy endpoints must be single-link regular files"
+        )
+    os.ftruncate(destination_fd, 0)
+    with (
+        os.fdopen(source_fd, "rb") as reader,
+        os.fdopen(destination_fd, "wb") as writer,
+    ):
         shutil.copyfileobj(reader, writer, length=1024 * 1024)
         writer.flush()
         os.fsync(writer.fileno())
@@ -1122,11 +1195,6 @@ class PilotCheckpointStore:
             {} if component_identities is None else dict(component_identities)
         )
         self.checkpoint_hook = checkpoint_hook
-        self.latest_path = self.output_dir / "latest.pt"
-        self.best_path = self.output_dir / "best.pt"
-        self.lock_path = self.output_dir / ".pilot.lock"
-        self.journal_path = self.output_dir / ".pilot-validation-transaction.json"
-        self.backup_path = self.output_dir / ".pilot-best-backup.pt"
         self.run_fingerprint: dict[str, object] | None = None
         self.generation = 0
         self.best_generation: int | None = None
@@ -1141,6 +1209,34 @@ class PilotCheckpointStore:
         self.backup_copy_bytes = 0
         self.backup_copy_duration_seconds = 0.0
         self._lock_stream: Any | None = None
+        self._directory_fd: int | None = None
+        self._lock_depth = 0
+
+    @property
+    def pinned_output_dir(self) -> Path:
+        if self._directory_fd is None:
+            return self.output_dir
+        return Path(f"/proc/self/fd/{self._directory_fd}")
+
+    @property
+    def latest_path(self) -> Path:
+        return self.pinned_output_dir / "latest.pt"
+
+    @property
+    def best_path(self) -> Path:
+        return self.pinned_output_dir / "best.pt"
+
+    @property
+    def lock_path(self) -> Path:
+        return self.pinned_output_dir / ".pilot.lock"
+
+    @property
+    def journal_path(self) -> Path:
+        return self.pinned_output_dir / ".pilot-validation-transaction.json"
+
+    @property
+    def backup_path(self) -> Path:
+        return self.pinned_output_dir / ".pilot-best-backup.pt"
 
     @property
     def metrics(self) -> dict[str, object]:
@@ -1167,13 +1263,58 @@ class PilotCheckpointStore:
 
     def acquire(self) -> None:
         if self._lock_stream is not None:
-            raise RuntimeError("pilot checkpoint store is already acquired")
+            self._lock_depth += 1
+            return
+        if self.output_dir.is_symlink():
+            raise PilotResumeError("pilot output directory must not be a symlink")
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        stream = self.lock_path.open("a+b")
+        for path in (
+            self.lock_path,
+            self.journal_path,
+            self.backup_path,
+            self.latest_path,
+            self.best_path,
+            self.output_dir / "worker_summary.json",
+            self.output_dir / "training_curve.csv",
+        ):
+            if path.is_symlink():
+                raise PilotResumeError(
+                    f"pilot control path must not be a symlink: {path}"
+                )
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        directory_fd = os.open(
+            self.output_dir,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        directory_stat = os.fstat(directory_fd)
+        path_stat = self.output_dir.lstat()
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or (directory_stat.st_dev, directory_stat.st_ino)
+            != (path_stat.st_dev, path_stat.st_ino)
+        ):
+            os.close(directory_fd)
+            raise PilotResumeError("pilot output directory identity changed")
+        try:
+            descriptor = os.open(
+                self.lock_path.name, flags, 0o600, dir_fd=directory_fd
+            )
+        except BaseException:
+            os.close(directory_fd)
+            raise
+        lock_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1:
+            os.close(descriptor)
+            os.close(directory_fd)
+            raise PilotResumeError("pilot lock must be a single-link regular file")
+        stream = os.fdopen(descriptor, "a+b")
         try:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             stream.close()
+            os.close(directory_fd)
             raise PilotResumeError(
                 f"pilot output is owned by another process: {self.output_dir}"
             ) from error
@@ -1192,16 +1333,26 @@ class PilotCheckpointStore:
         stream.flush()
         os.fsync(stream.fileno())
         self._lock_stream = stream
+        self._directory_fd = directory_fd
+        self._lock_depth = 1
 
     def release(self) -> None:
         if self._lock_stream is None:
             return
+        if self._lock_depth > 1:
+            self._lock_depth -= 1
+            return
         stream = self._lock_stream
+        directory_fd = self._directory_fd
         self._lock_stream = None
+        self._directory_fd = None
+        self._lock_depth = 0
         try:
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
         finally:
             stream.close()
+            if directory_fd is not None:
+                os.close(directory_fd)
 
     def __enter__(self) -> PilotCheckpointStore:
         self.acquire()
@@ -1211,8 +1362,26 @@ class PilotCheckpointStore:
         self.release()
 
     def _require_lock(self) -> None:
-        if self._lock_stream is None:
+        if self._lock_stream is None or self._directory_fd is None:
             raise RuntimeError("pilot checkpoint store must be acquired")
+        pinned = os.fstat(self._directory_fd)
+        try:
+            current = self.output_dir.lstat()
+        except OSError as error:
+            raise PilotResumeError(
+                "pilot output directory disappeared while locked"
+            ) from error
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or (pinned.st_dev, pinned.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise PilotResumeError(
+                "pilot output directory changed while locked"
+            )
+
+    def verify_output_identity(self) -> None:
+        """Require the locked output pathname to still name the pinned directory."""
+        self._require_lock()
 
     def _record_save(self, path: Path, started: float, *, succeeded: bool) -> None:
         duration = time.perf_counter() - started
@@ -1329,7 +1498,7 @@ class PilotCheckpointStore:
             latest_generation = self._read_generation_safely(self.latest_path)
             if latest_generation == generation:
                 try:
-                    _fsync_directory(self.output_dir)
+                    _fsync_directory(self.pinned_output_dir)
                 except OSError:
                     # The canonical pair may be committed, but durability is
                     # ambiguous. Preserve the journal and backup for prepare().
@@ -1367,9 +1536,9 @@ class PilotCheckpointStore:
     def _clear_transaction(self) -> None:
         self.journal_path.unlink(missing_ok=True)
         self.backup_path.unlink(missing_ok=True)
-        for temporary in self.output_dir.glob(".pilot-best-restore.*.tmp"):
+        for temporary in self.pinned_output_dir.glob(".pilot-best-restore.*.tmp"):
             temporary.unlink(missing_ok=True)
-        _fsync_directory(self.output_dir)
+        _fsync_directory(self.pinned_output_dir)
 
     def _rollback_transaction(self, had_best: bool) -> None:
         if had_best:
@@ -1380,23 +1549,23 @@ class PilotCheckpointStore:
             descriptor, temporary_name = tempfile.mkstemp(
                 prefix=".pilot-best-restore.",
                 suffix=".tmp",
-                dir=self.output_dir,
+                dir=self.pinned_output_dir,
             )
             os.close(descriptor)
             temporary = Path(temporary_name)
             try:
                 _durable_copy(self.backup_path, temporary)
                 os.replace(temporary, self.best_path)
-                _fsync_directory(self.output_dir)
+                _fsync_directory(self.pinned_output_dir)
             finally:
                 temporary.unlink(missing_ok=True)
         elif not had_best:
             self.best_path.unlink(missing_ok=True)
-            _fsync_directory(self.output_dir)
+            _fsync_directory(self.pinned_output_dir)
         # The rollback is durable before recovery metadata is removed.
         self.journal_path.unlink(missing_ok=True)
         self.backup_path.unlink(missing_ok=True)
-        _fsync_directory(self.output_dir)
+        _fsync_directory(self.pinned_output_dir)
 
     def _recover_transaction(self) -> None:
         if not self.journal_path.exists():
@@ -1423,7 +1592,7 @@ class PilotCheckpointStore:
                     allow_zero=True,
                 )
             if latest_generation == generation:
-                _fsync_directory(self.output_dir)
+                _fsync_directory(self.pinned_output_dir)
                 self._clear_transaction()
             elif latest_generation is None or latest_generation < generation:
                 self._rollback_transaction(mapping["had_best"])
@@ -1436,27 +1605,42 @@ class PilotCheckpointStore:
                 f"cannot recover checkpoint transaction: {error}"
             ) from error
 
-    def prepare(self) -> None:
+    def recover(self) -> None:
         self._require_lock()
         if self.resume:
             self._recover_transaction()
+
+    def prepare(
+        self,
+        *,
+        resume_state: PilotResumeState | None = None,
+        recover: bool = True,
+    ) -> None:
+        self._require_lock()
+        if self.resume:
+            if recover:
+                self._recover_transaction()
             if not self.latest_path.is_file():
                 raise FileNotFoundError(
                     f"resume requires readable latest checkpoint: {self.latest_path}"
                 )
-            payload = _payload(self.latest_path)
-            self.generation = _resume_integer(
-                "generation", payload.get("generation"), allow_zero=True
-            )
-            raw_best_generation = payload.get("best_generation")
-            self.best_generation = (
-                None
-                if raw_best_generation is None
-                else _resume_integer(
-                    "best_generation", raw_best_generation, allow_zero=True
+            if resume_state is None:
+                payload = _payload(self.latest_path)
+                self.generation = _resume_integer(
+                    "generation", payload.get("generation"), allow_zero=True
                 )
-            )
-            if self.best_path.is_file():
+                raw_best_generation = payload.get("best_generation")
+                self.best_generation = (
+                    None
+                    if raw_best_generation is None
+                    else _resume_integer(
+                        "best_generation", raw_best_generation, allow_zero=True
+                    )
+                )
+            else:
+                self.generation = resume_state.generation
+                self.best_generation = resume_state.best_generation
+            if resume_state is None and self.best_path.is_file():
                 best_payload = _payload(self.best_path)
                 best_generation = _resume_integer(
                     "best generation",
@@ -1470,7 +1654,7 @@ class PilotCheckpointStore:
             return
         existing = [
             path
-            for path in self.output_dir.iterdir()
+            for path in self.pinned_output_dir.iterdir()
             if path.name != self.lock_path.name
         ]
         if existing and not self.overwrite:
@@ -1484,8 +1668,8 @@ class PilotCheckpointStore:
                 self.best_path,
                 self.journal_path,
                 self.backup_path,
-                self.output_dir / "worker_summary.json",
-                self.output_dir / "training_curve.csv",
+                self.pinned_output_dir / "worker_summary.json",
+                self.pinned_output_dir / "training_curve.csv",
             ):
                 path.unlink(missing_ok=True)
             for pattern in (
@@ -1495,9 +1679,9 @@ class PilotCheckpointStore:
                 ".training_curve.csv.*.tmp",
                 ".pilot-best-restore.*.tmp",
             ):
-                for temporary in self.output_dir.glob(pattern):
+                for temporary in self.pinned_output_dir.glob(pattern):
                     temporary.unlink(missing_ok=True)
-            shutil.rmtree(self.output_dir / "validation", ignore_errors=True)
+            shutil.rmtree(self.pinned_output_dir / "validation", ignore_errors=True)
         self.generation = 0
         self.best_generation = None
 
@@ -1515,4 +1699,5 @@ __all__ = [
     "save_pilot_checkpoint",
     "sha256_file",
     "validate_compatibility",
+    "validate_pilot_resume_model",
 ]

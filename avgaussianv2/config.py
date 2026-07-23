@@ -197,9 +197,12 @@ class ProjectConfig:
         self.train.validate()
 
 
-def load_project_config(path: str | Path) -> ProjectConfig:
-    config_path = Path(path)
-    raw = yaml.safe_load(config_path.read_text())
+def load_project_config_bytes(
+    data: bytes,
+    *,
+    base_dir: str | Path,
+) -> ProjectConfig:
+    raw = yaml.safe_load(data.decode("utf-8"))
     if not isinstance(raw, Mapping):
         raise ValueError("configuration root must be a mapping")
     if "paths" not in raw:
@@ -207,6 +210,29 @@ def load_project_config(path: str | Path) -> ProjectConfig:
     paths = _mapping(raw["paths"], "paths")
     if "audio_checkpoint" not in paths:
         raise ValueError("paths.audio_checkpoint is required")
-    config = ProjectConfig.from_dict(raw)
+    paths = dict(paths)
+    root = Path(base_dir)
+    for name in (
+        "visual_upstream_root",
+        "audio_upstream_root",
+        "visual_checkpoint",
+        "audio_checkpoint",
+        "manifest",
+        "visual_memmap",
+    ):
+        value = paths.get(name)
+        if value is not None:
+            candidate = Path(value)
+            paths[name] = candidate if candidate.is_absolute() else root / candidate
+    normalized = dict(raw)
+    normalized["paths"] = paths
+    config = ProjectConfig.from_dict(normalized)
     config.validate()
     return config
+
+
+def load_project_config(path: str | Path) -> ProjectConfig:
+    config_path = Path(path)
+    return load_project_config_bytes(
+        config_path.read_bytes(), base_dir=config_path.parent
+    )

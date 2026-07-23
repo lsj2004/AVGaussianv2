@@ -8,28 +8,56 @@ from typing import Sequence
 import torch
 from torch import nn
 
-from avgaussianv2.backends.audio_audiogs import AudioGSBackend
-from avgaussianv2.backends.visual_ftgspp import FTGSVisualBackend
 from avgaussianv2.config import ProjectConfig
 from avgaussianv2.contracts import AlignedAVSample
-from avgaussianv2.data.aligned import AlignedAVDataset
 from avgaussianv2.losses import AudioLoss
-from avgaussianv2.models.fusion import AVGaussianFusionV2
-from avgaussianv2.models.rgbd import RGBDConditionEncoder
+
+
+FTGSVisualBackend = None
+AudioGSBackend = None
+AlignedAVDataset = None
+AVGaussianFusionV2 = None
+RGBDConditionEncoder = None
+
+
+def _load_runtime_components() -> tuple[object, ...]:
+    global FTGSVisualBackend, AudioGSBackend, AlignedAVDataset
+    global AVGaussianFusionV2, RGBDConditionEncoder
+    if FTGSVisualBackend is None:
+        from avgaussianv2.backends.visual_ftgspp import (
+            FTGSVisualBackend as visual_backend,
+        )
+        from avgaussianv2.backends.audio_audiogs import AudioGSBackend as audio_backend
+        from avgaussianv2.data.aligned import AlignedAVDataset as aligned_dataset
+        from avgaussianv2.models.fusion import AVGaussianFusionV2 as fusion_model
+        from avgaussianv2.models.rgbd import RGBDConditionEncoder as condition_encoder
+
+        FTGSVisualBackend = visual_backend
+        AudioGSBackend = audio_backend
+        AlignedAVDataset = aligned_dataset
+        AVGaussianFusionV2 = fusion_model
+        RGBDConditionEncoder = condition_encoder
+    return (
+        FTGSVisualBackend,
+        AudioGSBackend,
+        AlignedAVDataset,
+        AVGaussianFusionV2,
+        RGBDConditionEncoder,
+    )
 
 
 @dataclass(frozen=True, init=False)
 class TrainingBundle:
     model: nn.Module
     train_samples: Sequence[AlignedAVSample]
-    eval_samples: Sequence[AlignedAVSample]
+    eval_samples: Sequence[AlignedAVSample] | None
     audio_loss_fn: AudioLoss
 
     def __init__(
         self,
         model: nn.Module,
         train_samples: Sequence[AlignedAVSample] | None = None,
-        eval_samples: Sequence[AlignedAVSample] = (),
+        eval_samples: Sequence[AlignedAVSample] | None = None,
         audio_loss_fn: AudioLoss | None = None,
         *,
         samples: Sequence[AlignedAVSample] | None = None,
@@ -58,31 +86,60 @@ class TrainingBundle:
         return self.train_samples
 
 
-def build_runtime(config: ProjectConfig, device: torch.device) -> TrainingBundle:
-    """Build the model, aligned train/eval datasets, and audio criterion once."""
+def build_runtime(
+    config: ProjectConfig,
+    device: torch.device,
+    *,
+    trusted_upstream_artifacts: bool = False,
+    include_eval: bool = True,
+) -> TrainingBundle:
+    """Build a runtime only after explicitly trusting legacy upstream artifacts.
+
+    FTGS and AudioGS loaders import Python from configured upstream roots and
+    load legacy pickle checkpoints. Content hashes establish identity, not
+    safety; callers must independently trust these artifacts.
+    """
+    if not trusted_upstream_artifacts:
+        raise PermissionError(
+            "refusing untrusted upstream artifacts: FTGS/AudioGS loaders import "
+            "configured Python and use unsafe legacy pickle; pass "
+            "trusted_upstream_artifacts=True only after independently trusting "
+            "the upstream code and checkpoints"
+        )
+    (
+        visual_backend,
+        audio_backend,
+        aligned_dataset,
+        fusion_model,
+        condition_encoder,
+    ) = _load_runtime_components()
     config.validate()
     resolved_device = torch.device(device)
-    visual = FTGSVisualBackend.load(
+    visual = visual_backend.load(
         config.paths.visual_checkpoint,
         config.paths.visual_upstream_root,
     )
-    audio = AudioGSBackend.load(
+    audio = audio_backend.load(
         config.paths.audio_checkpoint,
         embedding_dim=config.model.embedding_dim,
         upstream_root=config.paths.audio_upstream_root,
         model_class=config.model.audio_model_class,
     )
-    model = AVGaussianFusionV2(
+    model = fusion_model(
         visual=visual,
-        condition_encoder=RGBDConditionEncoder(
+        condition_encoder=condition_encoder(
             embedding_dim=config.model.embedding_dim,
             alpha_threshold=config.model.alpha_threshold,
         ),
         audio=audio,
-    ).to(resolved_device)
-    train_samples = AlignedAVDataset(config, split="train")
-    eval_samples = AlignedAVDataset(config, split="eval")
-    criterion = audio.build_criterion().to(resolved_device)
+    )
+    criterion = audio.build_criterion()
+    train_samples = aligned_dataset(config, split="train")
+    eval_samples = (
+        aligned_dataset(config, split="eval") if include_eval else None
+    )
+    model = model.to(resolved_device)
+    criterion = criterion.to(resolved_device)
     return TrainingBundle(model, train_samples, eval_samples, criterion)
 
 

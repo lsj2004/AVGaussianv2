@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
 import json
 import math
 import os
 import random
+import stat
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
@@ -18,7 +21,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from avgaussianv2.config import ProjectConfig, load_project_config
+from avgaussianv2.config import ProjectConfig, load_project_config_bytes
 from avgaussianv2.experiment.checkpoint import (
     PilotCheckpointStore,
     PilotCompatibility,
@@ -26,7 +29,6 @@ from avgaussianv2.experiment.checkpoint import (
     build_run_fingerprint,
     hash_index_manifest,
     inspect_pilot_checkpoint,
-    sha256_file,
 )
 from avgaussianv2.experiment.contracts import (
     PilotConfig,
@@ -79,6 +81,78 @@ _COMPONENT_IDENTITY_FIELDS = {
 }
 _AGGREGATE_FIELDS = {"mean", "std", "median"}
 _NONNEGATIVE_BASELINE_METRICS = set(METRIC_NAMES) - {"rgb_ssim"}
+MAX_SMALL_INPUT_BYTES = 16 * 1024 * 1024
+MAX_SUMMARY_BYTES = 8 * 1024 * 1024
+MAX_CURVE_BYTES = 64 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class FileSnapshot:
+    path: Path
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    sha256: str
+
+
+def _read_bounded_regular_bytes(path: Path, limit: int) -> bytes:
+    before = path.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ValueError(f"input must be a non-symlink regular file: {path}")
+    if before.st_size > limit:
+        raise ValueError(f"input exceeds {limit} byte limit: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            data = stream.read(limit + 1)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if len(data) > limit:
+        raise ValueError(f"input exceeds {limit} byte limit: {path}")
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        raise ValueError(f"input changed while being read: {path}")
+    return data
+
+
+def _snapshot_file(path: Path) -> FileSnapshot:
+    before = path.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ValueError(f"artifact must be a non-symlink regular file: {path}")
+    digest = hashlib.sha256()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        raise ValueError(f"artifact changed while hashing: {path}")
+    return FileSnapshot(
+        path.resolve(),
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        digest.hexdigest(),
+    )
+
+
+def _verify_snapshot(snapshot: FileSnapshot) -> None:
+    actual = _snapshot_file(snapshot.path)
+    if actual != snapshot:
+        raise ValueError(f"artifact changed after runtime load: {snapshot.path}")
 
 
 def _exact(value: object, expected: set[str], name: str) -> Mapping[str, object]:
@@ -128,16 +202,20 @@ def _indices(value: object, name: str, *, nonempty: bool = False) -> tuple[int, 
     return result
 
 
-def _strict_json(path: Path) -> object:
+def _strict_json_bytes(data: bytes, name: str) -> object:
     try:
         return json.loads(
-            path.read_text(encoding="utf-8"),
+            data.decode("utf-8"),
             parse_constant=lambda token: (_ for _ in ()).throw(
                 ValueError(f"non-finite JSON constant {token}")
             ),
         )
     except (OSError, json.JSONDecodeError, UnicodeError) as error:
-        raise ValueError(f"cannot read strict JSON from {path}: {error}") from error
+        raise ValueError(f"cannot read strict JSON from {name}: {error}") from error
+
+
+def _strict_json(path: Path, limit: int = MAX_SMALL_INPUT_BYTES) -> object:
+    return _strict_json_bytes(_read_bounded_regular_bytes(path, limit), str(path))
 
 
 def _pilot_config(value: object) -> PilotConfig:
@@ -266,6 +344,7 @@ def load_worker_manifest(
     *,
     config_path: str | Path,
     config: ProjectConfig,
+    actual_source_hashes: Mapping[str, str] | None = None,
 ) -> WorkerManifest:
     """Load and fully validate the shared, JSON-safe worker contract."""
     source = Path(path)
@@ -308,13 +387,23 @@ def load_worker_manifest(
         name: _digest(hashes_raw[name], f"source_hashes.{name}")
         for name in _SOURCE_HASH_FIELDS
     }
-    actual_hashes = {
-        "project_config_sha256": sha256_file(config_path),
-        "dataset_manifest_sha256": sha256_file(config.paths.manifest),
-        "visual_checkpoint_sha256": sha256_file(config.paths.visual_checkpoint),
-        "audio_checkpoint_sha256": sha256_file(config.paths.audio_checkpoint),
-        "camera_mapping_sha256": hash_index_manifest(config.scene.camera_mapping),
-    }
+    if actual_source_hashes is None:
+        config_bytes = _read_bounded_regular_bytes(
+            Path(config_path), MAX_SMALL_INPUT_BYTES
+        )
+        dataset_snapshot = _snapshot_file(config.paths.manifest)
+        visual_snapshot = _snapshot_file(config.paths.visual_checkpoint)
+        audio_snapshot = _snapshot_file(config.paths.audio_checkpoint)
+        actual_hashes = {
+            "project_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+            "dataset_manifest_sha256": dataset_snapshot.sha256,
+            "visual_checkpoint_sha256": visual_snapshot.sha256,
+            "audio_checkpoint_sha256": audio_snapshot.sha256,
+            "camera_mapping_sha256": hash_index_manifest(config.scene.camera_mapping),
+        }
+    else:
+        actual_hashes = dict(actual_source_hashes)
+    _exact(actual_hashes, _SOURCE_HASH_FIELDS, "actual_source_hashes")
     labels = {
         "project_config_sha256": "project config",
         "dataset_manifest_sha256": "dataset manifest",
@@ -403,7 +492,7 @@ def load_worker_manifest(
     )
     return WorkerManifest(
         path=source.resolve(),
-        sha256=sha256_file(source),
+        sha256=hash_index_manifest(raw),
         scene_id=scene_id,
         seed=seed,
         pilot_config=pilot,
@@ -425,10 +514,11 @@ def load_worker_manifest(
 def _validate_baseline(manifest: WorkerManifest, path: Path) -> dict[str, object]:
     if path.resolve() != manifest.visual_baseline_path:
         raise ValueError("visual baseline path mismatch")
+    data = _read_bounded_regular_bytes(path, MAX_SMALL_INPUT_BYTES)
     value = _visual_baseline_summary(
-        _strict_json(path), "visual baseline file"
+        _strict_json_bytes(data, str(path)), "visual baseline file"
     )
-    if sha256_file(path) != manifest.visual_baseline_sha256:
+    if hashlib.sha256(data).hexdigest() != manifest.visual_baseline_sha256:
         raise ValueError("visual baseline hash mismatch")
     if value != manifest.visual_baseline_summary:
         raise ValueError("visual baseline summary mismatch")
@@ -456,6 +546,13 @@ def _preflight_output(output: Path, resume: bool) -> None:
         if not output.is_dir():
             raise FileExistsError(f"pilot output is not a directory: {output}")
         existing = list(output.iterdir())
+        symlinks = [path for path in existing if path.is_symlink()]
+        if symlinks:
+            raise ValueError(
+                "pilot output contains unsafe symlink: "
+                + ", ".join(path.name for path in symlinks)
+            )
+        existing = [path for path in existing if path.name != ".pilot.lock"]
         if existing:
             raise FileExistsError(
                 "fresh pilot refuses nonempty output directory: "
@@ -463,12 +560,21 @@ def _preflight_output(output: Path, resume: bool) -> None:
             )
 
 
-def _bound_component_identities(manifest: WorkerManifest) -> dict[str, str]:
-    """Bind the exact shared contract and all source hashes into Task 6."""
+def _bound_component_identities(
+    manifest: WorkerManifest,
+    *,
+    trust_upstream_artifacts: bool,
+) -> dict[str, str]:
+    """Bind canonical worker semantics and trust mode into Task 6."""
     identities = dict(manifest.component_identities)
-    identities["model_class"] = (
-        f"{identities['model_class']}|worker-manifest-v{MANIFEST_VERSION}:"
-        f"{manifest.sha256}"
+    identities["worker_contract_sha256"] = hash_index_manifest(
+        {
+            "manifest_schema": MANIFEST_SCHEMA,
+            "manifest_version": MANIFEST_VERSION,
+            "manifest_sha256": manifest.sha256,
+            "source_hashes": manifest.source_hashes,
+            "trust_upstream_artifacts": trust_upstream_artifacts,
+        }
     )
     return identities
 
@@ -487,6 +593,8 @@ def _expected_run_fingerprint(
     manifest: WorkerManifest,
     config: ProjectConfig,
     baseline: Mapping[str, object],
+    *,
+    trust_upstream_artifacts: bool,
 ) -> dict[str, object]:
     """Construct Task 6's exact fingerprint without loading a runtime."""
     return build_run_fingerprint(
@@ -499,7 +607,10 @@ def _expected_run_fingerprint(
         warmup_step_fn=condition_warmup_step,
         joint_step_fn=joint_train_step,
         audio_loss_fn=_fingerprint_audio_loss,
-        component_identities=_bound_component_identities(manifest),
+        component_identities=_bound_component_identities(
+            manifest,
+            trust_upstream_artifacts=trust_upstream_artifacts,
+        ),
     )
 
 
@@ -558,7 +669,284 @@ def _atomic_json(path: Path, value: Mapping[str, object]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _verify_worker_reports(
+    output: Path,
+    result: PilotTrainingResult,
+    latest: Any,
+    best: Any,
+    store: PilotCheckpointStore,
+) -> dict[str, object]:
+    curve_data = _read_bounded_regular_bytes(
+        output / "training_curve.csv", MAX_CURVE_BYTES
+    )
+    try:
+        text = curve_data.decode("utf-8")
+    except UnicodeError as error:
+        raise RuntimeError("training curve must be UTF-8") from error
+    reader = csv.DictReader(text.splitlines())
+    expected_columns = [
+        "stage",
+        "step",
+        "sample_index",
+        "total",
+        "audio_to_visual_grad_norm",
+        "losses",
+        "gradient_norms",
+    ]
+    if reader.fieldnames != expected_columns:
+        raise RuntimeError("training curve columns mismatch")
+    rows = list(reader)
+    if len(rows) != len(result.training_history):
+        raise RuntimeError("training curve row count mismatch")
+    for actual, expected in zip(rows, result.training_history, strict=True):
+        if (
+            actual["stage"] != str(expected["stage"])
+            or int(actual["step"]) != expected["step"]
+            or int(actual["sample_index"]) != expected["sample_index"]
+            or float(actual["total"]) != float(expected["total"])
+            or float(actual["audio_to_visual_grad_norm"])
+            != float(expected["audio_to_visual_grad_norm"])
+            or _strict_json_bytes(
+                actual["losses"].encode("utf-8"), "training curve losses"
+            )
+            != expected["losses"]
+            or _strict_json_bytes(
+                actual["gradient_norms"].encode("utf-8"),
+                "training curve gradient_norms",
+            )
+            != expected["gradient_norms"]
+        ):
+            raise RuntimeError("training curve rows disagree with result")
+
+    summary = _strict_json_bytes(
+        _read_bounded_regular_bytes(
+            output / "worker_summary.json", MAX_SUMMARY_BYTES
+        ),
+        "worker_summary.json",
+    )
+    expected_summary_fields = {
+        "variant",
+        "completed_warmup_steps",
+        "completed_joint_steps",
+        "best_step",
+        "stop_reason",
+        "training_history",
+        "validation_history",
+        "selector_state",
+        "stopper_state",
+        "checkpoint_io",
+    }
+    summary = dict(_exact(summary, expected_summary_fields, "worker summary"))
+    if (
+        summary["variant"] != result.variant.value
+        or summary["completed_warmup_steps"] != result.completed_warmup_steps
+        or summary["completed_joint_steps"] != result.completed_joint_steps
+        or summary["best_step"] != result.best_step
+        or summary["stop_reason"] != result.stop_reason
+        or summary["training_history"] != list(result.training_history)
+        or summary["validation_history"] != list(result.validation_history)
+        or summary["selector_state"] != latest.selector.state_dict()
+        or summary["stopper_state"] != latest.stopper.state_dict()
+        or summary["checkpoint_io"] != store.metrics
+    ):
+        raise RuntimeError("worker summary disagrees with training result")
+    if (
+        latest.completed_warmup_steps != result.completed_warmup_steps
+        or latest.completed_joint_steps != result.completed_joint_steps
+        or latest.selector.best_step != result.best_step
+        or latest.training_history != tuple(result.training_history)
+        or latest.validation_history != tuple(result.validation_history)
+        or latest.stop_reason != result.stop_reason
+    ):
+        raise RuntimeError("latest checkpoint disagrees with training result")
+    selected_summary = next(
+        row["summary"]
+        for row in latest.validation_history
+        if row["step"] == result.best_step
+    )
+    expected_best_training = tuple(
+        row
+        for row in latest.training_history
+        if row["stage"] == "warmup"
+        or (row["stage"] == "joint" and row["step"] <= result.best_step)
+    )
+    expected_best_validations = tuple(
+        row
+        for row in latest.validation_history
+        if row["step"] <= result.best_step
+    )
+    if (
+        best.checkpoint_kind != "best"
+        or best.generation != latest.best_generation
+        or best.selector.best_step != result.best_step
+        or best.best_evaluation_summary != latest.best_evaluation_summary
+        or best.validation_summary != selected_summary
+        or best.training_history != expected_best_training
+        or best.validation_history != expected_best_validations
+    ):
+        raise RuntimeError("best checkpoint disagrees with latest checkpoint")
+    return summary
+
+
 RuntimeFactory = Callable[[ProjectConfig, torch.device], Any]
+
+
+def _run_worker_locked(
+    *,
+    store: PilotCheckpointStore,
+    config: ProjectConfig,
+    manifest: WorkerManifest,
+    baseline: dict[str, object],
+    indices: Any,
+    variant: Variant,
+    device: torch.device,
+    output: Path,
+    resume: bool,
+    trust_upstream_artifacts: bool,
+    expected_run_fingerprint: Mapping[str, object],
+    runtime_factory: RuntimeFactory | None,
+    evaluator_factory: Callable[..., Any],
+    trainer_factory: Callable[..., Any],
+    artifact_snapshots: Sequence[FileSnapshot],
+) -> PilotTrainingResult:
+    if device.type == "cuda":
+        index = 0 if device.index is None else device.index
+        if not torch.cuda.is_available() or index >= torch.cuda.device_count():
+            raise ValueError(f"CUDA device is unavailable: {device}")
+    store.bind_run_fingerprint(expected_run_fingerprint)
+    resume_state = None
+    if resume:
+        store.recover()
+        resume_state = inspect_pilot_checkpoint(
+            store.latest_path,
+            expected_compatibility=store.compatibility,
+            indices=indices,
+            expected_run_fingerprint=expected_run_fingerprint,
+            model=None,
+            allow_complete=True,
+        )
+        store.prepare(resume_state=resume_state, recover=False)
+    else:
+        store.prepare()
+
+    _seed_everything(manifest.seed)
+    if runtime_factory is None:
+        from avgaussianv2.runtime import build_runtime
+
+        if not trust_upstream_artifacts:
+            raise PermissionError(
+                "production runtime requires --trust-upstream-artifacts because "
+                "configured upstream Python and unsafe legacy pickle are loaded"
+            )
+        bundle = build_runtime(
+            config,
+            device,
+            trusted_upstream_artifacts=True,
+            include_eval=True,
+        )
+    else:
+        bundle = runtime_factory(config, device)
+    for snapshot in artifact_snapshots:
+        _verify_snapshot(snapshot)
+    _validate_runtime_identity(bundle.model, manifest)
+    if len(bundle.train_samples) != manifest.train_length:
+        raise ValueError(
+            "training dataset length mismatch: "
+            f"actual={len(bundle.train_samples)} expected={manifest.train_length}"
+        )
+    if bundle.eval_samples is None:
+        raise ValueError("worker runtime requires an evaluation dataset")
+    if len(bundle.eval_samples) != manifest.eval_length:
+        raise ValueError(
+            "evaluation dataset length mismatch: "
+            f"actual={len(bundle.eval_samples)} expected={manifest.eval_length}"
+        )
+
+    evaluator = evaluator_factory(bundle.model, bundle.audio_loss_fn, device)
+    if getattr(evaluator, "model", bundle.model) is not bundle.model:
+        raise ValueError("evaluator must be bound to the runtime model")
+    trainer = trainer_factory(
+        manifest.pilot_config, evaluator, train_config=config.train
+    )
+    result = trainer.run(
+        model=bundle.model,
+        train_samples=bundle.train_samples,
+        heldout_samples=bundle.eval_samples,
+        indices=indices,
+        heldout_indices=manifest.quick_heldout_indices,
+        variant=variant,
+        visual_baseline=baseline,
+        audio_loss_fn=bundle.audio_loss_fn,
+        output_dir=output,
+        checkpoint_store=store,
+        preloaded_resume_state=resume_state,
+        checkpoint_store_prepared=True,
+    )
+    preflight_stage = None if resume_state is None else resume_state.stage
+    preflight_positions = (
+        None
+        if resume_state is None
+        else (
+            resume_state.completed_warmup_steps,
+            resume_state.completed_joint_steps,
+        )
+    )
+    if preflight_positions is not None and (
+        result.completed_warmup_steps < preflight_positions[0]
+        or result.completed_joint_steps < preflight_positions[1]
+    ):
+        raise PilotResumeError("resumed result regressed from preflight state")
+    _finite(asdict(result))
+    if result.best_step is None:
+        (output / "worker_summary.json").unlink(missing_ok=True)
+        raise RuntimeError(
+            "pilot completed without a visually feasible best candidate; "
+            "no best checkpoint was selected"
+        )
+    if store.run_fingerprint != expected_run_fingerprint:
+        raise PilotResumeError(
+            "runtime run fingerprint disagrees with preflight fingerprint"
+        )
+
+    store.verify_output_identity()
+    if resume and preflight_stage == "complete" and store.save_count == 0:
+        latest = resume_state
+    else:
+        latest = inspect_pilot_checkpoint(
+            store.latest_path,
+            expected_compatibility=store.compatibility,
+            indices=indices,
+            expected_run_fingerprint=store.run_fingerprint,
+            model=bundle.model,
+            allow_complete=True,
+            active_resume=False,
+        )
+    best = inspect_pilot_checkpoint(
+        store.best_path,
+        expected_compatibility=store.compatibility,
+        indices=indices,
+        expected_run_fingerprint=store.run_fingerprint,
+        model=bundle.model,
+        active_resume=False,
+    )
+    if latest is None or latest.stage != "complete":
+        raise RuntimeError("pilot did not publish a complete readable checkpoint")
+
+    summary_path = output / "worker_summary.json"
+    summary = _verify_worker_reports(output, result, latest, best, store)
+    summary["worker"] = {
+        "variant": variant.value,
+        "device": str(device),
+        "scene_id": manifest.scene_id,
+        "config_sha256": manifest.source_hashes["project_config_sha256"],
+        "manifest_sha256": manifest.sha256,
+        "visual_baseline_sha256": manifest.visual_baseline_sha256,
+        "trusted_upstream_artifacts": trust_upstream_artifacts,
+    }
+    _finite(summary, "worker summary")
+    store.verify_output_identity()
+    _atomic_json(summary_path, summary)
+    return result
 
 
 def run_worker(
@@ -570,6 +958,7 @@ def run_worker(
     *,
     device: str | torch.device = "cuda:0",
     resume: bool = False,
+    trust_upstream_artifacts: bool = False,
     runtime_factory: RuntimeFactory | None = None,
     evaluator_factory: Callable[..., Any] = Evaluator,
     trainer_factory: Callable[..., Any] = PilotTrainer,
@@ -580,14 +969,42 @@ def run_worker(
     resolved_device = (
         validate_device(device) if isinstance(device, str) else torch.device(device)
     )
-    if resolved_device.type == "cuda":
-        index = 0 if resolved_device.index is None else resolved_device.index
-        if not torch.cuda.is_available() or index >= torch.cuda.device_count():
-            raise ValueError(f"CUDA device is unavailable: {resolved_device}")
     config_source = Path(config_path)
-    config = load_project_config(config_source)
+    config_bytes = _read_bounded_regular_bytes(
+        config_source, MAX_SMALL_INPUT_BYTES
+    )
+    config = load_project_config_bytes(
+        config_bytes, base_dir=config_source.parent
+    )
+    artifact_snapshots = (
+        _snapshot_file(config.paths.visual_checkpoint),
+        _snapshot_file(config.paths.audio_checkpoint),
+        _snapshot_file(config.paths.manifest),
+    )
+    # Runtime loaders receive the exact resolved paths that were snapshotted.
+    # This prevents a configured parent symlink from being retargeted between
+    # validation and backend/dataset construction.
+    config = replace(
+        config,
+        paths=replace(
+            config.paths,
+            visual_checkpoint=artifact_snapshots[0].path,
+            audio_checkpoint=artifact_snapshots[1].path,
+            manifest=artifact_snapshots[2].path,
+        ),
+    )
+    actual_source_hashes = {
+        "project_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "visual_checkpoint_sha256": artifact_snapshots[0].sha256,
+        "audio_checkpoint_sha256": artifact_snapshots[1].sha256,
+        "dataset_manifest_sha256": artifact_snapshots[2].sha256,
+        "camera_mapping_sha256": hash_index_manifest(config.scene.camera_mapping),
+    }
     manifest = load_worker_manifest(
-        shared_indices_path, config_path=config_source, config=config
+        shared_indices_path,
+        config_path=config_source,
+        config=config,
+        actual_source_hashes=actual_source_hashes,
     )
     baseline_source = Path(visual_baseline_path)
     baseline = _validate_baseline(manifest, baseline_source)
@@ -595,137 +1012,38 @@ def run_worker(
     _preflight_output(output, bool(resume))
     indices = manifest.indices_for(resolved_variant)
     expected_run_fingerprint = _expected_run_fingerprint(
-        manifest, config, baseline
-    )
-    preflight_completed_positions: tuple[int, int] | None = None
-    if resume:
-        # This shape-independent pass uses weights_only loading and rejects
-        # unsafe, corrupt, or incompatible state before expensive backends.
-        preflight_state = inspect_pilot_checkpoint(
-            output / "latest.pt",
-            expected_compatibility=manifest.compatibility_for(resolved_variant),
-            indices=indices,
-            expected_run_fingerprint=expected_run_fingerprint,
-            model=None,
-            allow_complete=True,
-        )
-        preflight_completed_positions = (
-            preflight_state.completed_warmup_steps,
-            preflight_state.completed_joint_steps,
-        )
-        # Task 6 re-inspects under the store lock to close the TOCTOU window
-        # and validate model shapes. Do not retain this tensor-bearing copy.
-        del preflight_state
-
-    _seed_everything(manifest.seed)
-    if runtime_factory is None:
-        # Keep backend/upstream imports out of parser/help and manifest-only paths.
-        from avgaussianv2.runtime import build_runtime
-
-        runtime_factory = build_runtime
-    bundle = runtime_factory(config, resolved_device)
-    _validate_runtime_identity(bundle.model, manifest)
-    if len(bundle.train_samples) != manifest.train_length:
-        raise ValueError(
-            "training dataset length mismatch: "
-            f"actual={len(bundle.train_samples)} expected={manifest.train_length}"
-        )
-    if len(bundle.eval_samples) != manifest.eval_length:
-        raise ValueError(
-            "evaluation dataset length mismatch: "
-            f"actual={len(bundle.eval_samples)} expected={manifest.eval_length}"
-        )
-    for index in (*indices.warmup, *indices.joint):
-        if index >= len(bundle.train_samples):
-            raise ValueError(f"training index {index} is out of range")
-    for index in manifest.quick_heldout_indices:
-        if index >= len(bundle.eval_samples):
-            raise ValueError(f"held-out index {index} is out of range")
-
-    evaluator = evaluator_factory(
-        bundle.model, bundle.audio_loss_fn, resolved_device
-    )
-    if getattr(evaluator, "model", bundle.model) is not bundle.model:
-        raise ValueError("evaluator must be bound to the runtime model")
-    trainer = trainer_factory(
-        manifest.pilot_config, evaluator, train_config=config.train
+        manifest,
+        config,
+        baseline,
+        trust_upstream_artifacts=trust_upstream_artifacts,
     )
     store = checkpoint_store_factory(
         output,
         manifest.compatibility_for(resolved_variant),
         resume=bool(resume),
-        component_identities=_bound_component_identities(manifest),
+        component_identities=_bound_component_identities(
+            manifest,
+            trust_upstream_artifacts=trust_upstream_artifacts,
+        ),
     )
-    result = trainer.run(
-        model=bundle.model,
-        train_samples=bundle.train_samples,
-        heldout_samples=bundle.eval_samples,
-        indices=indices,
-        heldout_indices=manifest.quick_heldout_indices,
-        variant=resolved_variant,
-        visual_baseline=baseline,
-        audio_loss_fn=bundle.audio_loss_fn,
-        output_dir=output,
-        checkpoint_store=store,
-    )
-    if preflight_completed_positions is not None:
-        if (
-            result.completed_warmup_steps
-            < preflight_completed_positions[0]
-            or result.completed_joint_steps
-            < preflight_completed_positions[1]
-        ):
-            raise PilotResumeError("resumed result regressed from preflight state")
-    _finite(asdict(result))
-    if result.best_step is None:
-        (output / "worker_summary.json").unlink(missing_ok=True)
-        raise RuntimeError(
-            "pilot completed without a visually feasible best candidate; "
-            "no best checkpoint was selected"
+    with store:
+        return _run_worker_locked(
+            store=store,
+            config=config,
+            manifest=manifest,
+            baseline=baseline,
+            indices=indices,
+            variant=resolved_variant,
+            device=resolved_device,
+            output=store.pinned_output_dir,
+            resume=bool(resume),
+            trust_upstream_artifacts=trust_upstream_artifacts,
+            expected_run_fingerprint=expected_run_fingerprint,
+            runtime_factory=runtime_factory,
+            evaluator_factory=evaluator_factory,
+            trainer_factory=trainer_factory,
+            artifact_snapshots=artifact_snapshots,
         )
-    if store.run_fingerprint is None:
-        raise RuntimeError("pilot checkpoint store did not bind a run fingerprint")
-    if store.run_fingerprint != expected_run_fingerprint:
-        raise PilotResumeError(
-            "runtime run fingerprint disagrees with preflight fingerprint"
-        )
-    latest = inspect_pilot_checkpoint(
-        store.latest_path,
-        expected_compatibility=store.compatibility,
-        indices=indices,
-        expected_run_fingerprint=store.run_fingerprint,
-        model=bundle.model,
-        allow_complete=True,
-        active_resume=False,
-    )
-    best = inspect_pilot_checkpoint(
-        store.best_path,
-        expected_compatibility=store.compatibility,
-        indices=indices,
-        expected_run_fingerprint=store.run_fingerprint,
-        model=bundle.model,
-        active_resume=False,
-    )
-    if latest.stage != "complete" or best.checkpoint_kind != "best":
-        raise RuntimeError("pilot did not publish complete readable checkpoints")
-    curve_path = output / "training_curve.csv"
-    summary_path = output / "worker_summary.json"
-    if not curve_path.is_file() or not curve_path.read_text(encoding="utf-8").strip():
-        raise RuntimeError("pilot training curve is missing or unreadable")
-    summary = _strict_json(summary_path)
-    if not isinstance(summary, dict):
-        raise RuntimeError("worker summary must be a JSON object")
-    summary["worker"] = {
-        "variant": resolved_variant.value,
-        "device": str(resolved_device),
-        "scene_id": manifest.scene_id,
-        "config_sha256": manifest.source_hashes["project_config_sha256"],
-        "manifest_sha256": manifest.sha256,
-        "visual_baseline_sha256": manifest.visual_baseline_sha256,
-    }
-    _finite(summary, "worker summary")
-    _atomic_json(summary_path, summary)
-    return result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -743,6 +1061,14 @@ def build_parser() -> argparse.ArgumentParser:
         default="cuda:0",
     )
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--trust-upstream-artifacts",
+        action="store_true",
+        help=(
+            "trust configured upstream Python and unsafe legacy pickle "
+            "checkpoints after independent review"
+        ),
+    )
     return parser
 
 
@@ -756,6 +1082,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.output_dir,
         device=args.device,
         resume=args.resume,
+        trust_upstream_artifacts=args.trust_upstream_artifacts,
     )
     return 0
 

@@ -149,7 +149,17 @@ def _artifact_predictions(model: nn.Module, sample: AlignedAVSample):
         model.train(was_training)
 
 
-_default_backend_factory = build_runtime
+def _default_backend_factory(
+    config: ProjectConfig, device: torch.device
+) -> TrainingBundle:
+    # Legacy train keeps its historical behavior. These upstream roots and
+    # pickle checkpoints must be independently trusted; hashes are not safety.
+    return build_runtime(
+        config,
+        device,
+        trusted_upstream_artifacts=True,
+        include_eval=False,
+    )
 
 
 def _write_artifacts(

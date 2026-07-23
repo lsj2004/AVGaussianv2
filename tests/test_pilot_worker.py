@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
-import gc
 import json
-import weakref
+import os
+import subprocess
+import sys
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -542,6 +544,30 @@ def test_runtime_must_match_manifest_declared_identity(
     assert len(calls) == 1
 
 
+def test_worker_rejects_checkpoint_changed_during_runtime_load(tmp_path) -> None:
+    from avgaussianv2.cli.pilot_worker import run_worker
+
+    config, manifest, baseline, project = _manifest_files(tmp_path)
+    calls = []
+
+    def factory(*args):
+        calls.append(True)
+        project.paths.visual_checkpoint.write_bytes(b"changed")
+        return _fake_runtime(*args)
+
+    with pytest.raises(ValueError, match="changed after runtime load"):
+        run_worker(
+            config,
+            Variant.FROZEN_VISUAL,
+            manifest,
+            baseline,
+            tmp_path / "run",
+            device="cpu",
+            runtime_factory=factory,
+        )
+    assert calls == [True]
+
+
 @pytest.mark.parametrize(
     ("variant", "expected_warmup", "condition_enabled"),
     [
@@ -684,7 +710,7 @@ def test_resume_rejects_corrupt_checkpoint_before_runtime_factory(tmp_path) -> N
     assert calls == []
 
 
-def test_resume_binds_exact_manifest_bytes_into_task6_fingerprint(tmp_path) -> None:
+def test_resume_uses_canonical_manifest_semantics_not_whitespace(tmp_path) -> None:
     from avgaussianv2.cli.pilot_worker import run_worker
     from avgaussianv2.experiment.checkpoint import PilotResumeError
 
@@ -700,8 +726,7 @@ def test_resume_binds_exact_manifest_bytes_into_task6_fingerprint(tmp_path) -> N
         runtime_factory=_fake_runtime,
         evaluator_factory=_FeasibleEvaluator,
     )
-    # Semantically valid, but it is no longer the exact shared contract used
-    # for the checkpointed run.
+    # Formatting-only changes preserve canonical validated semantics.
     manifest.write_text(json.dumps(json.loads(manifest.read_text())))
     calls = []
 
@@ -709,19 +734,19 @@ def test_resume_binds_exact_manifest_bytes_into_task6_fingerprint(tmp_path) -> N
         calls.append(args)
         return _fake_runtime(*args)
 
-    with pytest.raises(PilotResumeError, match="fingerprint"):
-        run_worker(
-            config,
-            Variant.FROZEN_VISUAL,
-            manifest,
-            baseline,
-            output,
-            device="cpu",
-            resume=True,
-            runtime_factory=factory,
-            evaluator_factory=_FeasibleEvaluator,
-        )
-    assert calls == []
+    result = run_worker(
+        config,
+        Variant.FROZEN_VISUAL,
+        manifest,
+        baseline,
+        output,
+        device="cpu",
+        resume=True,
+        runtime_factory=factory,
+        evaluator_factory=_FeasibleEvaluator,
+    )
+    assert result.best_step == 1
+    assert len(calls) == 1
 
 
 def test_resume_preserves_and_validates_explicit_model_class_identity(tmp_path) -> None:
@@ -834,14 +859,60 @@ def test_resume_rejects_changed_project_config_before_runtime_factory(tmp_path) 
     assert calls == []
 
 
-def test_resume_releases_tensor_bearing_preflight_state_before_runtime(
-    tmp_path, monkeypatch
+def test_worker_acquires_lock_before_runtime_and_loser_factory_is_not_called(
+    tmp_path,
 ) -> None:
-    import avgaussianv2.cli.pilot_worker as worker
+    from avgaussianv2.cli.pilot_worker import run_worker
+    from avgaussianv2.experiment.checkpoint import PilotResumeError
 
     config, manifest, baseline, _ = _manifest_files(tmp_path)
     output = tmp_path / "run"
-    worker.run_worker(
+    loser_calls = []
+
+    def winner_factory(*args):
+        with pytest.raises(PilotResumeError, match="owned by another process"):
+            run_worker(
+                config,
+                Variant.FROZEN_VISUAL,
+                manifest,
+                baseline,
+                output,
+                device="cpu",
+                runtime_factory=lambda *_: loser_calls.append(True),
+            )
+        raise RuntimeError("stop winner")
+
+    with pytest.raises(RuntimeError, match="stop winner"):
+        run_worker(
+            config,
+            Variant.FROZEN_VISUAL,
+            manifest,
+            baseline,
+            output,
+            device="cpu",
+            runtime_factory=winner_factory,
+        )
+    assert loser_calls == []
+
+
+def test_worker_releases_lock_when_runtime_factory_fails(tmp_path) -> None:
+    from avgaussianv2.cli.pilot_worker import run_worker
+
+    config, manifest, baseline, _ = _manifest_files(tmp_path)
+    output = tmp_path / "run"
+    with pytest.raises(RuntimeError, match="factory failed"):
+        run_worker(
+            config,
+            Variant.FROZEN_VISUAL,
+            manifest,
+            baseline,
+            output,
+            device="cpu",
+            runtime_factory=lambda *_: (_ for _ in ()).throw(
+                RuntimeError("factory failed")
+            ),
+        )
+    result = run_worker(
         config,
         Variant.FROZEN_VISUAL,
         manifest,
@@ -851,24 +922,43 @@ def test_resume_releases_tensor_bearing_preflight_state_before_runtime(
         runtime_factory=_fake_runtime,
         evaluator_factory=_FeasibleEvaluator,
     )
-    original_inspect = worker.inspect_pilot_checkpoint
-    state_reference = None
+    assert result.best_step == 1
 
-    def tracking_inspect(*args, **kwargs):
-        nonlocal state_reference
-        state = original_inspect(*args, **kwargs)
-        state_reference = weakref.ref(state)
-        return state
 
-    monkeypatch.setattr(worker, "inspect_pilot_checkpoint", tracking_inspect)
+def test_complete_resume_loads_latest_checkpoint_exactly_once(
+    tmp_path, monkeypatch
+) -> None:
+    import avgaussianv2.experiment.checkpoint as checkpoint
+    from avgaussianv2.cli.pilot_worker import run_worker
 
-    def factory(*args):
-        gc.collect()
-        assert state_reference is not None
-        assert state_reference() is None
-        return _fake_runtime(*args)
+    config, manifest, baseline, _ = _manifest_files(tmp_path)
+    output = tmp_path / "run"
+    run_worker(
+        config,
+        Variant.FROZEN_VISUAL,
+        manifest,
+        baseline,
+        output,
+        device="cpu",
+        runtime_factory=_fake_runtime,
+        evaluator_factory=_FeasibleEvaluator,
+    )
+    original_load = checkpoint.torch.load
+    latest_loads = 0
 
-    worker.run_worker(
+    def counting_load(path, *args, **kwargs):
+        nonlocal latest_loads
+        loaded_path = (
+            Path(os.readlink(f"/proc/self/fd/{path.fileno()}"))
+            if hasattr(path, "fileno")
+            else Path(path)
+        )
+        if loaded_path == output / "latest.pt":
+            latest_loads += 1
+        return original_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(checkpoint.torch, "load", counting_load)
+    run_worker(
         config,
         Variant.FROZEN_VISUAL,
         manifest,
@@ -876,9 +966,70 @@ def test_resume_releases_tensor_bearing_preflight_state_before_runtime(
         output,
         device="cpu",
         resume=True,
-        runtime_factory=factory,
+        runtime_factory=_fake_runtime,
         evaluator_factory=_FeasibleEvaluator,
     )
+    assert latest_loads == 1
+
+
+def test_resume_rejects_changed_trust_mode_before_runtime_factory(tmp_path) -> None:
+    from avgaussianv2.cli.pilot_worker import run_worker
+    from avgaussianv2.experiment.checkpoint import PilotResumeError
+
+    config, manifest, baseline, _ = _manifest_files(tmp_path)
+    output = tmp_path / "run"
+    run_worker(
+        config,
+        Variant.FROZEN_VISUAL,
+        manifest,
+        baseline,
+        output,
+        device="cpu",
+        runtime_factory=_fake_runtime,
+        evaluator_factory=_FeasibleEvaluator,
+    )
+    calls = []
+    with pytest.raises(PilotResumeError, match="fingerprint"):
+        run_worker(
+            config,
+            Variant.FROZEN_VISUAL,
+            manifest,
+            baseline,
+            output,
+            device="cpu",
+            resume=True,
+            trust_upstream_artifacts=True,
+            runtime_factory=lambda *args: calls.append(args) or _fake_runtime(*args),
+            evaluator_factory=_FeasibleEvaluator,
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("name", [".pilot.lock", ".pilot-best-backup.pt"])
+def test_worker_rejects_checkpoint_control_symlinks_without_touching_target(
+    tmp_path, name
+) -> None:
+    from avgaussianv2.cli.pilot_worker import run_worker
+
+    config, manifest, baseline, _ = _manifest_files(tmp_path)
+    output = tmp_path / "run"
+    output.mkdir()
+    target = tmp_path / "target"
+    target.write_text("unchanged")
+    (output / name).symlink_to(target)
+    calls = []
+    with pytest.raises((OSError, ValueError), match="symlink|regular|unsafe"):
+        run_worker(
+            config,
+            Variant.FROZEN_VISUAL,
+            manifest,
+            baseline,
+            output,
+            device="cpu",
+            runtime_factory=lambda *_: calls.append(True),
+        )
+    assert target.read_text() == "unchanged"
+    assert calls == []
 
 
 def test_parser_has_exact_worker_surface_and_validates_devices() -> None:
@@ -902,6 +1053,7 @@ def test_parser_has_exact_worker_surface_and_validates_devices() -> None:
     )
     assert args.device == "cuda:0"
     assert args.variant == Variant.CONDITION_OFF
+    assert args.trust_upstream_artifacts is False
     assert not hasattr(args, "overwrite")
     with pytest.raises(SystemExit):
         parser.parse_args(
@@ -924,6 +1076,28 @@ def test_parser_has_exact_worker_surface_and_validates_devices() -> None:
                 "--device", "cuda",
             ]
         )
+
+
+def test_worker_help_does_not_import_runtime_or_upstream_modules() -> None:
+    script = """
+import runpy
+import sys
+sys.argv = ["pilot_worker", "--help"]
+try:
+    runpy.run_module("avgaussianv2.cli.pilot_worker", run_name="__main__")
+except SystemExit as error:
+    assert error.code == 0
+assert "avgaussianv2.runtime" not in sys.modules
+assert not any(name.startswith(("scene", "arguments", "gaussian_renderer")) for name in sys.modules)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[1],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_fresh_nonempty_and_resume_missing_refuse_before_factory(tmp_path) -> None:
@@ -964,17 +1138,24 @@ def test_public_runtime_factory_loads_configured_backends_and_both_splits(
     audio.build_criterion = lambda: criterion
 
     monkeypatch.setattr(
-        runtime.FTGSVisualBackend,
-        "load",
-        lambda checkpoint, root: calls.append(("visual", checkpoint, root)) or visual,
+        runtime,
+        "FTGSVisualBackend",
+        SimpleNamespace(
+            load=lambda checkpoint, root: calls.append(
+                ("visual", checkpoint, root)
+            )
+            or visual
+        ),
     )
     monkeypatch.setattr(
-        runtime.AudioGSBackend,
-        "load",
-        lambda checkpoint, **kwargs: calls.append(
-            ("audio", checkpoint, kwargs)
+        runtime,
+        "AudioGSBackend",
+        SimpleNamespace(
+            load=lambda checkpoint, **kwargs: calls.append(
+                ("audio", checkpoint, kwargs)
+            )
+            or audio
         )
-        or audio,
     )
     encoders = []
     monkeypatch.setattr(
@@ -995,7 +1176,9 @@ def test_public_runtime_factory_loads_configured_backends_and_both_splits(
         lambda cfg, split: calls.append(("dataset", cfg, split)) or [split],
     )
 
-    bundle = runtime.build_runtime(config, torch.device("cpu"))
+    bundle = runtime.build_runtime(
+        config, torch.device("cpu"), trusted_upstream_artifacts=True
+    )
 
     assert bundle.train_samples == ["train"]
     assert bundle.eval_samples == ["eval"]
@@ -1021,3 +1204,83 @@ def test_public_runtime_factory_loads_configured_backends_and_both_splits(
         ),
     ]
     assert [call[-1] for call in calls if call[0] == "dataset"] == ["train", "eval"]
+
+
+def test_runtime_refuses_untrusted_upstream_before_any_loader(
+    tmp_path, monkeypatch
+) -> None:
+    import avgaussianv2.runtime as runtime
+
+    _, config = _write_config(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        runtime,
+        "FTGSVisualBackend",
+        SimpleNamespace(load=lambda *_args, **_kwargs: calls.append("visual")),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "AudioGSBackend",
+        SimpleNamespace(load=lambda *_args, **_kwargs: calls.append("audio")),
+    )
+    with pytest.raises(PermissionError, match="unsafe legacy pickle|trusted"):
+        runtime.build_runtime(config, torch.device("cpu"))
+    assert calls == []
+
+
+def test_runtime_can_build_train_only_and_validates_datasets_before_device_move(
+    tmp_path, monkeypatch
+) -> None:
+    import avgaussianv2.runtime as runtime
+
+    _, config = _write_config(tmp_path)
+    events = []
+    visual = nn.Linear(1, 1)
+    criterion = nn.Linear(1, 1)
+    audio = nn.Linear(1, 1)
+    audio.build_criterion = lambda: criterion
+    monkeypatch.setattr(
+        runtime, "FTGSVisualBackend", SimpleNamespace(load=lambda *_: visual)
+    )
+    monkeypatch.setattr(
+        runtime,
+        "AudioGSBackend",
+        SimpleNamespace(load=lambda *_args, **_kwargs: audio),
+    )
+    monkeypatch.setattr(runtime, "RGBDConditionEncoder", lambda **_: nn.Linear(1, 1))
+
+    class OrderedFusion(nn.Module):
+        def __init__(self, **_parts):
+            super().__init__()
+
+        def to(self, device):
+            events.append(("model.to", str(device)))
+            return self
+
+    class OrderedCriterion(nn.Module):
+        def to(self, device):
+            events.append(("criterion.to", str(device)))
+            return self
+
+    criterion = OrderedCriterion()
+    audio.build_criterion = lambda: criterion
+    monkeypatch.setattr(runtime, "AVGaussianFusionV2", OrderedFusion)
+    monkeypatch.setattr(
+        runtime,
+        "AlignedAVDataset",
+        lambda _cfg, split: events.append(("dataset", split)) or [split],
+    )
+
+    bundle = runtime.build_runtime(
+        config,
+        torch.device("cpu"),
+        trusted_upstream_artifacts=True,
+        include_eval=False,
+    )
+
+    assert bundle.eval_samples is None
+    assert events == [
+        ("dataset", "train"),
+        ("model.to", "cpu"),
+        ("criterion.to", "cpu"),
+    ]
