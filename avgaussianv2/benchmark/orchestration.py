@@ -464,6 +464,22 @@ def _read_in_progress_attempt(
     return contract
 
 
+def _is_incomplete_attempt_creation(attempt: Path) -> bool:
+    entries = list(attempt.iterdir())
+    if not entries:
+        return True
+    for child in entries:
+        metadata = child.lstat()
+        if (
+            not child.name.startswith(".in_progress.json.")
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+        ):
+            return False
+    return True
+
+
 def _seal_interrupted_attempt(
     logs: Path,
     attempt: Path,
@@ -504,8 +520,24 @@ def _seal_interrupted_attempt(
 
 
 def _recover_interrupted_attempt(logs: Path, identity: str) -> None:
-    tail = _verify_logs_path(logs, identity, allow_interrupted_tail=True)
+    tail, pointer_repair = _verify_logs_path(
+        logs, identity, allow_interrupted_tail=True
+    )
+    if pointer_repair is not None:
+        _atomic_json(logs / "current.json", pointer_repair)
+        tail, second_repair = _verify_logs_path(
+            logs, identity, allow_interrupted_tail=True
+        )
+        if second_repair is not None:
+            raise OrchestrationError("attempt log pointer repair did not converge")
     if tail is None:
+        return
+    if not (tail / "in_progress.json").exists():
+        if not _is_incomplete_attempt_creation(tail):
+            raise OrchestrationError("incomplete attempt creation is unsafe")
+        for child in tail.iterdir():
+            child.unlink()
+        tail.rmdir()
         return
     current = logs / "current.json"
     previous = None
@@ -527,7 +559,7 @@ def _recover_interrupted_attempt(logs: Path, identity: str) -> None:
 def _verify_logs(
     root: Path, identity: str, *, allow_interrupted_tail: bool = False
 ) -> None:
-    tail = _verify_logs_path(
+    tail, _ = _verify_logs_path(
         root / "logs", identity, allow_interrupted_tail=allow_interrupted_tail
     )
     if tail is not None and not allow_interrupted_tail:
@@ -536,7 +568,7 @@ def _verify_logs(
 
 def _verify_logs_path(
     logs: Path, identity: str, *, allow_interrupted_tail: bool
-) -> Path | None:
+) -> tuple[Path | None, dict[str, object] | None]:
     _require_safe_inode(logs, directory=True)
     current_path = logs / "current.json"
     current = _safe_json(current_path) if current_path.exists() else None
@@ -548,6 +580,7 @@ def _verify_logs_path(
     )
     previous: str | None = None
     committed = 0
+    committed_pointers: list[dict[str, object]] = []
     tail: Path | None = None
     for sequence, attempt in enumerate(attempts):
         if attempt.name != f"attempt-{sequence:06d}":
@@ -561,14 +594,15 @@ def _verify_logs_path(
                 or tail is not None
             ):
                 raise OrchestrationError("attempt log has an uncommitted entry")
-            contract = _read_in_progress_attempt(
-                attempt,
-                identity=identity,
-                sequence=sequence,
-                previous=previous,
-            )
-            if _attempt_owner_live(contract):
-                raise OrchestrationError("in-progress attempt owner is still alive")
+            if not _is_incomplete_attempt_creation(attempt):
+                contract = _read_in_progress_attempt(
+                    attempt,
+                    identity=identity,
+                    sequence=sequence,
+                    previous=previous,
+                )
+                if _attempt_owner_live(contract):
+                    raise OrchestrationError("in-progress attempt owner is still alive")
             tail = attempt
             continue
         manifest_data = _safe_bytes(manifest_path)
@@ -601,27 +635,38 @@ def _verify_logs_path(
             if sha256_file(attempt / name) != digest:
                 raise OrchestrationError("attempt log hash mismatch")
         previous = hashlib.sha256(manifest_data).hexdigest()
+        committed_pointers.append(
+            {
+                "schema": f"{SCHEMA}.logs.current",
+                "version": 1,
+                "identity": identity,
+                "sequence": sequence,
+                "attempt": attempt.name,
+                "manifest_sha256": previous,
+            }
+        )
         committed += 1
-    expected_current = (
-        None
-        if committed == 0
-        else {
-            "schema": f"{SCHEMA}.logs.current",
-            "version": 1,
-            "identity": identity,
-            "sequence": committed - 1,
-            "attempt": attempts[committed - 1].name,
-            "manifest_sha256": previous,
-        }
-    )
+    expected_current = committed_pointers[-1] if committed_pointers else None
+    pointer_repair = None
     if current != expected_current:
-        raise OrchestrationError("attempt log current pointer mismatch")
+        previous_current = (
+            committed_pointers[-2] if len(committed_pointers) >= 2 else None
+        )
+        if (
+            allow_interrupted_tail
+            and tail is None
+            and current == previous_current
+            and expected_current is not None
+        ):
+            pointer_repair = expected_current
+        else:
+            raise OrchestrationError("attempt log current pointer mismatch")
     expected_root = {attempt.name for attempt in attempts}
     if current is not None:
         expected_root.add("current.json")
     if {path.name for path in logs.iterdir()} != expected_root:
         raise OrchestrationError("attempt log root inventory mismatch")
-    return tail
+    return tail, pointer_repair
 
 
 def _atomic_json(path: Path, value: Mapping[str, object]) -> None:
@@ -1047,7 +1092,13 @@ def verify_scene_outputs(
     return SceneBenchmarkResult(scene, original, original / "report", True)
 
 
-def _verify_scene_snapshot(output_dir: Path, *, repository: Path, scene: str) -> None:
+def _verify_scene_snapshot(
+    output_dir: Path,
+    *,
+    repository: Path,
+    scene: str,
+    allow_interrupted_logs: bool = False,
+) -> None:
     expected_root_entries = {
         ".benchmark.lock",
         "preflight",
@@ -1065,7 +1116,7 @@ def _verify_scene_snapshot(output_dir: Path, *, repository: Path, scene: str) ->
         raise OrchestrationError("scene output root inventory mismatch")
     _verify_status(output_dir, scene)
     _verify_preflight_history(output_dir, scene)
-    _verify_logs(output_dir, scene)
+    _verify_logs(output_dir, scene, allow_interrupted_tail=allow_interrupted_logs)
     preparation_path = output_dir / "protocol" / "preparation.json"
     protocol_root = preparation_path.parent
     if {path.name for path in protocol_root.iterdir()} != {
@@ -1129,6 +1180,26 @@ def _verify_scene_snapshot(output_dir: Path, *, repository: Path, scene: str) ->
                 identity=expected_identity(scene, system, step),
             )
     verify_scene_report(output_dir / "report")
+
+
+def _recover_completed_scene(
+    output: Path, *, repository: Path, scene: str
+) -> SceneBenchmarkResult:
+    with BenchmarkOutputReadLock(output) as pinned:
+        _verify_scene_snapshot(
+            pinned,
+            repository=repository,
+            scene=scene,
+            allow_interrupted_logs=True,
+        )
+        snapshot = _tree_snapshot_sha256(pinned)
+    with BenchmarkOutputLock(output) as pinned:
+        if _tree_snapshot_sha256(pinned) != snapshot:
+            raise OrchestrationError(
+                "completed scene changed before exclusive log recovery"
+            )
+        _recover_interrupted_attempt(pinned / "logs", scene)
+    return verify_scene_outputs(output, repository=repository, scene=scene)
 
 
 def _verify_preparation(path: Path, scene: str, source_config: Path) -> None:
@@ -1495,9 +1566,12 @@ def run_scene_benchmark(
     if verify_only:
         return _verifier(output, repository=repository, scene=scene)
     if resume and (output / "report" / "current.json").is_file():
-        # A published final report declares a complete tree. Any verification
-        # failure is corruption/incompatibility and must fail closed.
-        return _verifier(output, repository=repository, scene=scene)
+        try:
+            return _verifier(output, repository=repository, scene=scene)
+        except Exception:
+            if _verifier is not verify_scene_outputs:
+                raise
+            return _recover_completed_scene(output, repository=repository, scene=scene)
     if resume and output.exists():
         try:
             return _verifier(output, repository=repository, scene=scene)
@@ -1612,6 +1686,29 @@ def run_scene_benchmark(
     return result
 
 
+def _verify_completed_suite_snapshot(
+    pinned: Path,
+    *,
+    repository: Path,
+    allow_interrupted_logs: bool = False,
+    report_verifier: Callable[[Path], Mapping[str, object]] = verify_suite_report,
+    report_path: Path | None = None,
+) -> dict[str, object]:
+    if {path.name for path in pinned.iterdir()} != {
+        ".benchmark.lock",
+        *SCENES,
+        "logs",
+        "report",
+    }:
+        raise OrchestrationError("suite output root inventory mismatch")
+    _verify_logs(pinned, "suite", allow_interrupted_tail=allow_interrupted_logs)
+    for scene in SCENES:
+        verify_scene_outputs(pinned / scene, repository=repository, scene=scene)
+    return dict(
+        report_verifier(pinned / "report" if report_path is None else report_path)
+    )
+
+
 def run_benchmark_suite(
     *,
     repository: Path,
@@ -1629,19 +1726,44 @@ def run_benchmark_suite(
     repository = Path(repository).absolute()
     output = Path(output_dir).absolute()
     resume_snapshot: str | None = None
-    if verify_only or (resume and (output / "report" / "current.json").is_file()):
+    if verify_only:
         with BenchmarkOutputReadLock(output) as pinned:
-            if {path.name for path in pinned.iterdir()} != {
-                ".benchmark.lock",
-                *SCENES,
-                "logs",
-                "report",
-            }:
-                raise OrchestrationError("suite output root inventory mismatch")
-            _verify_logs(pinned, "suite")
-            for scene in SCENES:
-                verify_scene_outputs(output / scene, repository=repository, scene=scene)
-            return dict(_suite_verifier(output / "report"))
+            return _verify_completed_suite_snapshot(
+                pinned,
+                repository=repository,
+                report_verifier=_suite_verifier,
+                report_path=output / "report",
+            )
+    if resume and (output / "report" / "current.json").is_file():
+        try:
+            with BenchmarkOutputReadLock(output) as pinned:
+                return _verify_completed_suite_snapshot(
+                    pinned,
+                    repository=repository,
+                    report_verifier=_suite_verifier,
+                    report_path=output / "report",
+                )
+        except Exception:
+            if _suite_verifier is not verify_suite_report:
+                raise
+        with BenchmarkOutputReadLock(output) as pinned:
+            _verify_completed_suite_snapshot(
+                pinned, repository=repository, allow_interrupted_logs=True
+            )
+            snapshot = _tree_snapshot_sha256(pinned)
+        with BenchmarkOutputLock(output) as pinned:
+            if _tree_snapshot_sha256(pinned) != snapshot:
+                raise OrchestrationError(
+                    "completed suite changed before exclusive log recovery"
+                )
+            _recover_interrupted_attempt(pinned / "logs", "suite")
+        with BenchmarkOutputReadLock(output) as pinned:
+            return _verify_completed_suite_snapshot(
+                pinned,
+                repository=repository,
+                report_verifier=_suite_verifier,
+                report_path=output / "report",
+            )
     if resume and output.exists():
         resume_snapshot = _inspect_partial_suite(output, repository=repository)
     if output.exists() and not resume and any(output.iterdir()):

@@ -396,6 +396,117 @@ def test_multiple_or_tampered_tail_attempts_fail_closed(tmp_path: Path) -> None:
         orchestration._verify_logs(output, "scene1_opera", allow_interrupted_tail=True)
 
 
+@pytest.mark.parametrize("partial_atomic_file", [False, True])
+def test_empty_tail_from_mkdir_crash_is_reused_safely(
+    tmp_path: Path, partial_atomic_file: bool
+) -> None:
+    output = tmp_path / "result"
+    with orchestration.BenchmarkOutputLock(output) as pinned:
+        tail = pinned / "logs" / "attempt-000000"
+        tail.mkdir(parents=True)
+        if partial_atomic_file:
+            (tail / ".in_progress.json.crash").write_text("partial")
+    orchestration._verify_logs(output, "scene1_opera", allow_interrupted_tail=True)
+
+    with orchestration.BenchmarkOutputLock(output) as pinned:
+        snapshot = orchestration._tree_snapshot_sha256(pinned)
+        with orchestration._AttemptLogs(
+            pinned, "scene1_opera", expected_snapshot=snapshot
+        ) as attempt:
+            assert attempt.name == "attempt-000000"
+            assert (attempt / "in_progress.json").is_file()
+
+    orchestration._verify_logs(output, "scene1_opera")
+
+
+def test_stale_current_after_manifest_publish_is_repaired(tmp_path: Path) -> None:
+    output = tmp_path / "result"
+    with orchestration.BenchmarkOutputLock(output) as pinned:
+        with orchestration._AttemptLogs(pinned, "scene1_opera"):
+            pass
+        old_current = (pinned / "logs" / "current.json").read_bytes()
+        with orchestration._AttemptLogs(pinned, "scene1_opera"):
+            pass
+        (pinned / "logs" / "current.json").write_bytes(old_current)
+
+    with pytest.raises(OrchestrationError, match="pointer mismatch"):
+        orchestration._verify_logs(output, "scene1_opera")
+    orchestration._verify_logs(output, "scene1_opera", allow_interrupted_tail=True)
+    with orchestration.BenchmarkOutputLock(output) as pinned:
+        snapshot = orchestration._tree_snapshot_sha256(pinned)
+        with orchestration._AttemptLogs(
+            pinned, "scene1_opera", expected_snapshot=snapshot
+        ) as attempt:
+            assert attempt.name == "attempt-000002"
+
+    orchestration._verify_logs(output, "scene1_opera")
+
+
+def test_completed_resume_recovers_tail_before_strict_verify(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repo"
+    config = _config(repository)
+    output = tmp_path / "result"
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(target=_crash_attempt, args=(str(output),))
+    process.start()
+    process.join(10)
+    (output / "report").mkdir()
+    (output / "report" / "current.json").write_text("{}")
+
+    def snapshot_verify(
+        pinned: Path,
+        *,
+        repository: Path,
+        scene: str,
+        allow_interrupted_logs: bool = False,
+    ) -> None:
+        del repository
+        orchestration._verify_logs(
+            pinned, scene, allow_interrupted_tail=allow_interrupted_logs
+        )
+
+    def strict_verify(
+        target: Path, *, repository: Path, scene: str
+    ) -> SceneBenchmarkResult:
+        del repository
+        orchestration._verify_logs(target, scene)
+        return SceneBenchmarkResult(scene, target, target / "report", True)
+
+    monkeypatch.setattr(orchestration, "_verify_scene_snapshot", snapshot_verify)
+    monkeypatch.setattr(orchestration, "verify_scene_outputs", strict_verify)
+    result = run_scene_benchmark(
+        config_path=config,
+        output_dir=output,
+        resume=True,
+        _verifier=strict_verify,
+        _preflight_fn=lambda *_args: pytest.fail("entered preflight"),
+    )
+
+    assert result.verified
+    assert (
+        json.loads((output / "logs" / "attempt-000000" / "manifest.json").read_text())[
+            "state"
+        ]
+        == "interrupted"
+    )
+
+
+def test_completed_verify_only_rejects_tail_without_writes(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "result"
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(target=_crash_attempt, args=(str(output),))
+    process.start()
+    process.join(10)
+    before = _tree_digest(output)
+    with pytest.raises(OrchestrationError, match="uncommitted"):
+        orchestration._verify_logs(output, "scene1_opera")
+    assert _tree_digest(output) == before
+
+
 def test_worker_resume_flag_is_only_emitted_for_committed_modes(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     config = _config(repository)
