@@ -790,6 +790,50 @@ def test_suite_partial_resume_rejects_extra_before_preflight_or_mutation(
     assert _tree_digest(output) == before
 
 
+def test_failed_prepare_protocol_is_safe_to_retry_only_with_exact_evidence(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "scene1_opera.yaml"
+    config.write_bytes(b"source config\n")
+    output = tmp_path / "scene"
+    with orchestration.BenchmarkOutputLock(output) as pinned:
+        logs = pinned / "logs"
+        with pytest.raises(OrchestrationError, match="prepare failed"):
+            with orchestration._AttemptLogs(pinned, "scene1_opera") as attempt:
+                (attempt / "prepare.log").write_text(
+                    "Traceback\nbenchmark_prepare.py\nprepare_worker_manifests\n"
+                )
+                raise OrchestrationError("prepare failed")
+        protocol = pinned / "protocol"
+        protocol.mkdir()
+        resolved = protocol / "resolved_project.yaml"
+        resolved.write_bytes(b"resolved config\n")
+        origin = {
+            "schema": "avgaussianv2.cam38-resolved-config-origin",
+            "version": 1,
+            "source_path": str(config.resolve()),
+            "source_sha256": orchestration.sha256_file(config),
+            "resolved_sha256": orchestration.sha256_file(resolved),
+        }
+        (protocol / "resolved_project.origin.json").write_text(json.dumps(origin))
+        orchestration._verify_failed_prepare_protocol(
+            protocol,
+            logs=logs,
+            scene="scene1_opera",
+            source_config=config,
+        )
+
+        origin["resolved_sha256"] = "0" * 64
+        (protocol / "resolved_project.origin.json").write_text(json.dumps(origin))
+        with pytest.raises(OrchestrationError, match="origin"):
+            orchestration._verify_failed_prepare_protocol(
+                protocol,
+                logs=logs,
+                scene="scene1_opera",
+                source_config=config,
+            )
+
+
 @pytest.mark.parametrize(
     ("system", "artifact"),
     [

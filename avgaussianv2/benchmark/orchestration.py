@@ -1522,9 +1522,15 @@ def _inspect_partial_resume(
         protocol = pinned / "protocol"
         preparation = protocol / "preparation.json"
         if protocol.exists():
-            if not preparation.is_file() or preparation.is_symlink():
-                raise OrchestrationError("partial protocol is not committed")
-            _verify_preparation(preparation, scene, config_path)
+            if preparation.is_file() and not preparation.is_symlink():
+                _verify_preparation(preparation, scene, config_path)
+            else:
+                _verify_failed_prepare_protocol(
+                    protocol,
+                    logs=pinned / "logs",
+                    scene=scene,
+                    source_config=config_path,
+                )
         workers_root = pinned / "workers"
         resume_modes: set[str] = set()
         if workers_root.exists():
@@ -1582,6 +1588,75 @@ def _inspect_partial_resume(
         ):
             raise OrchestrationError("partial scene report cannot be resumed")
         return frozenset(resume_modes), _tree_snapshot_sha256(pinned)
+
+
+def _verify_failed_prepare_protocol(
+    protocol: Path,
+    *,
+    logs: Path,
+    scene: str,
+    source_config: Path,
+) -> None:
+    """Allow retry only for the exact files left by a failed prepare subprocess."""
+    if protocol.is_symlink() or not protocol.is_dir():
+        raise OrchestrationError("failed prepare protocol root is unsafe")
+    expected_protocol = {
+        "resolved_project.yaml",
+        "resolved_project.origin.json",
+    }
+    if {entry.name for entry in protocol.iterdir()} != expected_protocol:
+        raise OrchestrationError("partial protocol is not committed")
+    resolved = protocol / "resolved_project.yaml"
+    origin_path = protocol / "resolved_project.origin.json"
+    _require_safe_inode(resolved, directory=False)
+    _require_safe_inode(origin_path, directory=False)
+
+    _verify_logs(protocol.parent, scene, allow_interrupted_tail=True)
+    current = _safe_json(logs / "current.json")
+    attempt_name = current.get("attempt") if isinstance(current, Mapping) else None
+    if (
+        not isinstance(attempt_name, str)
+        or not attempt_name.startswith("attempt-")
+        or not attempt_name.removeprefix("attempt-").isdigit()
+    ):
+        raise OrchestrationError("failed prepare log pointer is invalid")
+    attempt = logs / attempt_name
+    manifest = _safe_json(attempt / "manifest.json")
+    hashes = manifest.get("sha256") if isinstance(manifest, Mapping) else None
+    if (
+        manifest.get("state") != "failed"
+        or manifest.get("exception_type") != "OrchestrationError"
+        or manifest.get("identity") != scene
+        or not isinstance(hashes, Mapping)
+        or set(hashes) != {"in_progress.json", "prepare.log"}
+    ):
+        raise OrchestrationError("failed prepare log evidence is invalid")
+    prepare_log = _safe_bytes(attempt / "prepare.log").decode(
+        "utf-8", errors="strict"
+    )
+    if not all(
+        marker in prepare_log
+        for marker in ("Traceback", "benchmark_prepare.py", "prepare_worker_manifests")
+    ):
+        raise OrchestrationError("failed prepare traceback evidence is invalid")
+
+    origin = _safe_json(origin_path)
+    expected_origin_fields = {
+        "schema",
+        "version",
+        "source_path",
+        "source_sha256",
+        "resolved_sha256",
+    }
+    if (
+        set(origin) != expected_origin_fields
+        or origin.get("schema") != "avgaussianv2.cam38-resolved-config-origin"
+        or origin.get("version") != 1
+        or origin.get("source_path") != str(source_config.resolve())
+        or origin.get("source_sha256") != sha256_file(source_config)
+        or origin.get("resolved_sha256") != sha256_file(resolved)
+    ):
+        raise OrchestrationError("failed prepare resolved config origin mismatches")
 
 
 def _inspect_partial_suite(
