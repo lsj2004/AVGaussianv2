@@ -20,6 +20,7 @@ from avgaussianv2.benchmark.training import (
     BenchmarkConfig,
     BenchmarkMode,
     CheckpointIO,
+    TRAIN_CAMERAS,
     build_worker_manifest,
     configure_benchmark_mode,
     make_shared_indices,
@@ -263,6 +264,18 @@ def test_worker_seeds_before_internal_builder_and_checks_identity(
     assert str(observed["run"]["output_dir"]).startswith("/proc/self/fd/")
     assert result["completed_main_updates"] == 30_000
     assert result["final_checkpoint"] == str(tmp_path / "output" / "final.pt")
+    runtime_contract = json.loads(
+        (tmp_path / "output" / "runtime_contract.json").read_text()
+    )
+    assert runtime_contract["schema"] == (
+        "avgaussianv2.cam38-production-train-only-runtime"
+    )
+    assert runtime_contract["include_eval"] is False
+    assert runtime_contract["train_cameras"] == list(TRAIN_CAMERAS)
+    assert runtime_contract["test_camera"] == "cam38"
+    assert result["runtime_contract_sha256"] == hashlib.sha256(
+        (tmp_path / "output" / "runtime_contract.json").read_bytes()
+    ).hexdigest()
 
 
 def test_cli_does_not_expose_external_runtime_factory(monkeypatch, capsys) -> None:

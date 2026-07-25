@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import copy
 
 import pytest
 
@@ -9,6 +10,7 @@ from avgaussianv2.benchmark.evaluation import (
     BenchmarkEvaluationResult,
     EvaluationIdentity,
 )
+from avgaussianv2.benchmark.artifacts import canonical_json, sha256
 from avgaussianv2.benchmark.report import (
     BenchmarkReportError,
     build_scene_report,
@@ -45,16 +47,48 @@ def _result(scene, system, step, count, offset=0.0, role="continuation"):
         for index, sample_id in enumerate(ids)
     )
     metadata = {"sample_id", "scene_id", "camera", "frame_index", "time_seconds"}
+    if system == "native_audiogs":
+        allowed = metadata | {
+            "audio_total",
+            "audio_mono",
+            "audio_diff",
+            "waveform_l1",
+            "mono_lsd",
+            "diff_lsd",
+            "lre_error_db",
+        }
+        rows = tuple({name: value for name, value in row.items() if name in allowed} for row in rows)
+    elif system == "native_ftgspp":
+        allowed = metadata | {"rgb_psnr", "rgb_ssim", "rgb_l1"}
+        rows = tuple({name: value for name, value in row.items() if name in allowed} for row in rows)
     metrics = tuple(metric for metric in rows[0] if metric not in metadata)
     summary = aggregate_metrics(
         [{metric: float(row[metric]) for metric in metrics} for row in rows]
     )
-    native_updates = 61 if system == "native_audiogs" else 30_000
+    native_updates = (
+        (2_318 if scene == "scene1_opera" else 6_954)
+        if system == "native_audiogs"
+        else 30_000
+    )
+    directions = {
+        metric: (
+            "higher_is_better"
+            if metric in {"rgb_psnr", "rgb_ssim"}
+            else "lower_is_better"
+        )
+        for metric in metrics
+    }
     return BenchmarkEvaluationResult(
         identity=EvaluationIdentity(scene, system, step, ids, count),
         count=count,
         rows=rows,
         summary=summary,
+        metric_directions=directions,
+        metric_protocol={
+            "psnr_cap_db": 100.0,
+            "lpips_implementation_sha256": None,
+            "extra_metric_registry": {},
+        },
         provenance={
             "system_name": system,
             "scene_id": scene,
@@ -83,6 +117,9 @@ def _result(scene, system, step, count, offset=0.0, role="continuation"):
             "index_sha256": _sha(f"{scene}-indices") if role == "continuation" else None,
             "batch_size": 1,
             "epochs": 61.0 if system == "native_audiogs" else None,
+            "training_output_dir": None,
+            "runtime_contract_path": None,
+            "runtime_contract_sha256": None,
         },
         content_sha256=_sha(f"{scene}-{system}-{step}-content"),
         generation_path=None,
@@ -175,6 +212,44 @@ def test_suite_reports_macro_and_sample_weighted_micro(tmp_path):
     }
     assert "macro" in suite["aggregates"]
     assert "micro" in suite["aggregates"]
+    first_mean = first["scaling"]["30000"]["joint_conditioned"]["summary"][
+        "audio_total"
+    ]["mean"]
+    second_mean = second["scaling"]["30000"]["joint_conditioned"]["summary"][
+        "audio_total"
+    ]["mean"]
+    macro = suite["aggregates"]["macro"]["30000"]["joint_conditioned"][
+        "audio_total"
+    ]
+    micro = suite["aggregates"]["micro"]["30000"]["joint_conditioned"][
+        "audio_total"
+    ]
+    assert macro == pytest.approx((first_mean + second_mean) / 2)
+    assert micro == pytest.approx((first_mean * 130 + second_mean * 293) / 423)
+    paired_micro = suite["paired_aggregates"]["micro"][
+        "joint_vs_audio_only"
+    ]["audio_total"]["mean_delta"]
+    first_delta = first["paired"]["joint_vs_audio_only"]["audio_total"][
+        "mean_delta"
+    ]
+    second_delta = second["paired"]["joint_vs_audio_only"]["audio_total"][
+        "mean_delta"
+    ]
+    assert paired_micro == pytest.approx(
+        (first_delta * 130 + second_delta * 293) / 423
+    )
+
+    missing = copy.deepcopy(second)
+    del missing["scaling"]["5000"]["audio_only"]["summary"]["audio_total"]
+    content = dict(missing)
+    content.pop("content_sha256")
+    missing["content_sha256"] = sha256(canonical_json(content))
+    with pytest.raises(BenchmarkReportError, match="metric set"):
+        build_suite_report(
+            scene_reports=[first, missing],
+            output_dir=tmp_path / "missing-suite",
+            strict_protocol=False,
+        )
 
 
 def test_report_resume_is_zero_mutation_and_tamper_is_rejected(tmp_path):

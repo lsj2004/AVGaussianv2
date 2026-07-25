@@ -161,6 +161,101 @@ class BenchmarkOutputLock:
         return False
 
 
+class BenchmarkOutputReadLock:
+    """Retain an existing output inode under a non-mutating shared lock."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.original = Path(os.path.abspath(path))
+        self.directory_fd: int | None = None
+        self.lock_fd: int | None = None
+        self.identity: tuple[int, int] | None = None
+
+    def __enter__(self) -> Path:
+        if not _is_proc_fd(self.original):
+            _reject_symlink_components(self.original)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        if not _is_proc_fd(self.original):
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            self.directory_fd = os.open(self.original, flags)
+        except OSError as error:
+            raise BenchmarkOutputError(
+                "benchmark output does not exist or is unsafe"
+            ) from error
+        metadata = os.fstat(self.directory_fd)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+            self.close()
+            raise BenchmarkOutputError("benchmark output must be an owned directory")
+        self.identity = (metadata.st_dev, metadata.st_ino)
+        try:
+            self.lock_fd = os.open(
+                ".benchmark.lock",
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=self.directory_fd,
+            )
+        except OSError as error:
+            self.close()
+            raise BenchmarkOutputError("benchmark output lock is missing") from error
+        lock_metadata = os.fstat(self.lock_fd)
+        if (
+            not stat.S_ISREG(lock_metadata.st_mode)
+            or lock_metadata.st_uid != os.getuid()
+            or lock_metadata.st_nlink != 1
+        ):
+            self.close()
+            raise BenchmarkOutputError("benchmark output lock is unsafe")
+        try:
+            fcntl.flock(self.lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            self.close()
+            raise BenchmarkOutputError(
+                "benchmark output is locked by another process"
+            ) from error
+        return Path(f"/proc/self/fd/{self.directory_fd}")
+
+    def verify_identity(self) -> None:
+        if self.directory_fd is None or self.identity is None:
+            raise BenchmarkOutputError("benchmark output read lock is not active")
+        retained = os.fstat(self.directory_fd)
+        if (retained.st_dev, retained.st_ino) != self.identity:
+            raise BenchmarkOutputError("retained benchmark output identity changed")
+        if not _is_proc_fd(self.original):
+            current = self.original.lstat()
+            if stat.S_ISLNK(current.st_mode) or (
+                current.st_dev,
+                current.st_ino,
+            ) != self.identity:
+                raise BenchmarkOutputError(
+                    "benchmark output directory changed while locked"
+                )
+
+    def close(self) -> None:
+        if self.lock_fd is not None:
+            os.close(self.lock_fd)
+            self.lock_fd = None
+        if self.directory_fd is not None:
+            os.close(self.directory_fd)
+            self.directory_fd = None
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        identity_error: BaseException | None = None
+        try:
+            self.verify_identity()
+        except BaseException as error:
+            identity_error = error
+        finally:
+            self.close()
+        if identity_error is not None:
+            raise identity_error
+        return False
+
+
 def validate_output_children(root: Path) -> None:
     """Reject links, foreign owners, and unexpected first-level artifacts."""
     allowed_directories = {"checkpoints", "milestones"}
@@ -172,6 +267,7 @@ def validate_output_children(root: Path) -> None:
         "contract.json",
         "final.pt",
         "progress.json",
+        "runtime_contract.json",
     }
     for child in root.iterdir():
         metadata = child.lstat()
@@ -212,5 +308,6 @@ def validate_output_children(root: Path) -> None:
 __all__ = [
     "BenchmarkOutputError",
     "BenchmarkOutputLock",
+    "BenchmarkOutputReadLock",
     "validate_output_children",
 ]

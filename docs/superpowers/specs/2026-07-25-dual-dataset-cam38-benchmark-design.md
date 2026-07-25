@@ -80,6 +80,10 @@ same local implementation and weights are available to every system. No depth
 accuracy metric is reported because these datasets do not provide an
 independently verified depth ground truth.
 
+For an exact RGB match, mathematical PSNR is positive infinity. The benchmark
+reports a finite 100 dB cap for that case; the cap is persisted in every metric
+artifact so JSON, CSV, paired comparisons, and aggregate reports remain finite.
+
 Each scene report contains per-sample JSONL/CSV, mean, standard deviation,
 median, paired deltas, and win rates. A suite report contains per-scene tables
 plus macro and sample-weighted micro aggregates.

@@ -15,14 +15,17 @@ from avgaussianv2.benchmark.assets import (
 from avgaussianv2.benchmark.output import (
     BenchmarkOutputError,
     BenchmarkOutputLock,
+    BenchmarkOutputReadLock,
 )
 from avgaussianv2.benchmark.evaluation import (
     BenchmarkEvaluationError,
     BenchmarkEvaluationResult,
+    BenchmarkEvaluationRuntime,
     BenchmarkEvaluator,
     BenchmarkPrediction,
     EvaluationIdentity,
     TrainingEvidence,
+    audit_training_evidence,
     load_evaluation,
     verify_evaluation,
 )
@@ -54,10 +57,12 @@ __all__ = [
     "BenchmarkConfig",
     "BenchmarkEvaluationError",
     "BenchmarkEvaluationResult",
+    "BenchmarkEvaluationRuntime",
     "BenchmarkEvaluator",
     "BenchmarkMode",
     "BenchmarkOutputError",
     "BenchmarkOutputLock",
+    "BenchmarkOutputReadLock",
     "BenchmarkPrediction",
     "BenchmarkReportError",
     "BenchmarkResumeError",
@@ -65,6 +70,7 @@ __all__ = [
     "FixedBudgetTrainer",
     "EvaluationIdentity",
     "TrainingEvidence",
+    "audit_training_evidence",
     "audit_audiogs_conversion",
     "audit_ftgspp_flow_cache",
     "audit_ftgspp_seed_record",

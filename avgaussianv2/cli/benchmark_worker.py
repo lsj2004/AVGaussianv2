@@ -5,10 +5,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
 import sys
+import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from pathlib import Path
@@ -79,6 +81,58 @@ def _load_json(path: Path) -> object:
 
 
 RuntimeBuilder = Callable[..., BenchmarkRuntime]
+
+
+def _atomic_runtime_contract(
+    output: Path,
+    *,
+    runtime: BenchmarkRuntime,
+    compatibility: BenchmarkCompatibility,
+) -> str:
+    payload = {
+        "schema": "avgaussianv2.cam38-production-train-only-runtime",
+        "version": 1,
+        "include_eval": False,
+        "train_cameras": list(compatibility.train_cameras),
+        "test_camera": compatibility.test_camera,
+        "dataset_identity_sha256": runtime.dataset_identity_sha256,
+        "dataset_sample_ids_sha256": hashlib.sha256(
+            json.dumps(
+                list(runtime.dataset_sample_ids),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+        ).hexdigest(),
+        "config_sha256": runtime.config_sha256,
+        "source_sha256": runtime.source_sha256,
+        "visual_initialization_sha256": runtime.visual_initialization_sha256,
+        "audio_initialization_sha256": runtime.audio_initialization_sha256,
+        "model_initialization_sha256": runtime.model_initialization_sha256,
+    }
+    data = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        + "\n"
+    ).encode()
+    descriptor, name = tempfile.mkstemp(
+        prefix=".runtime_contract.", suffix=".tmp", dir=output
+    )
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output / "runtime_contract.json")
+        directory = os.open(output, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return hashlib.sha256(data).hexdigest()
 
 
 def _seed_everything(seed: int) -> None:
@@ -168,6 +222,11 @@ def run_worker(
             compatibility=compatibility,
             resume=resume,
         )
+        runtime_contract_sha256 = _atomic_runtime_contract(
+            pinned_output,
+            runtime=runtime,
+            compatibility=compatibility,
+        )
         return {
             "mode": result.mode.value,
             "completed_warmup_steps": result.completed_warmup_steps,
@@ -181,6 +240,8 @@ def run_worker(
                 for path in result.milestones
             ],
             "io": asdict(result.io),
+            "runtime_contract": str(original_output / "runtime_contract.json"),
+            "runtime_contract_sha256": runtime_contract_sha256,
         }
 
 

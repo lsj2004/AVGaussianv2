@@ -12,6 +12,11 @@ import uuid
 from collections.abc import Mapping
 from pathlib import Path
 
+from avgaussianv2.benchmark.output import (
+    BenchmarkOutputError,
+    BenchmarkOutputLock,
+    BenchmarkOutputReadLock,
+)
 
 class ArtifactError(RuntimeError):
     pass
@@ -61,10 +66,31 @@ def publish_generation(
     schema: str,
     files: Mapping[str, bytes],
     identity: Mapping[str, object],
+    overwrite: bool = False,
 ) -> tuple[Path, str]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if output_dir.is_symlink() or not output_dir.is_dir():
-        raise ArtifactError("artifact output must be a non-symlink directory")
+    original = Path(os.path.abspath(output_dir))
+    try:
+        with BenchmarkOutputLock(original) as pinned:
+            if (pinned / "current.json").exists() and not overwrite:
+                raise ArtifactError(
+                    "artifact already exists; use resume or overwrite"
+                )
+            generation, digest = _publish_pinned(
+                pinned, schema=schema, files=files, identity=identity
+            )
+            relative = generation.relative_to(pinned)
+        return original / relative, digest
+    except BenchmarkOutputError as error:
+        raise ArtifactError(str(error)) from error
+
+
+def _publish_pinned(
+    output_dir: Path,
+    *,
+    schema: str,
+    files: Mapping[str, bytes],
+    identity: Mapping[str, object],
+) -> tuple[Path, str]:
     generations = output_dir / "generations"
     generations.mkdir(exist_ok=True)
     if generations.is_symlink() or not generations.is_dir():
@@ -133,8 +159,26 @@ def load_generation(
     schema: str,
     expected_identity: Mapping[str, object] | None = None,
 ) -> tuple[Path, dict[str, bytes], dict[str, object], str]:
-    if output_dir.is_symlink() or not output_dir.is_dir():
-        raise ArtifactError("artifact output is missing or unsafe")
+    original = Path(os.path.abspath(output_dir))
+    try:
+        with BenchmarkOutputReadLock(original) as pinned:
+            generation, files, manifest, digest = _load_pinned(
+                pinned,
+                schema=schema,
+                expected_identity=expected_identity,
+            )
+            relative = generation.relative_to(pinned)
+        return original / relative, files, manifest, digest
+    except BenchmarkOutputError as error:
+        raise ArtifactError(str(error)) from error
+
+
+def _load_pinned(
+    output_dir: Path,
+    *,
+    schema: str,
+    expected_identity: Mapping[str, object] | None = None,
+) -> tuple[Path, dict[str, bytes], dict[str, object], str]:
     pointer_path = output_dir / "current.json"
     try:
         pointer_metadata = pointer_path.lstat()

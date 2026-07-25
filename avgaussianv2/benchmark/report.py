@@ -18,9 +18,9 @@ from avgaussianv2.benchmark.artifacts import (
     sha256,
 )
 from avgaussianv2.benchmark.evaluation import (
+    ALL_METRICS,
     AUDIO_METRICS,
     CONTINUATION_SYSTEMS,
-    METRIC_DIRECTIONS,
     NATIVE_SYSTEMS,
     REPORTING_STEPS,
     SCENE_SAMPLE_COUNTS,
@@ -81,6 +81,20 @@ def _validate_result(
     )
     if recalculated != result.summary:
         raise BenchmarkReportError("evaluation summary does not match per-sample rows")
+    if (
+        set(result.metric_directions) != set(result.summary)
+        or any(
+            direction not in {"lower_is_better", "higher_is_better"}
+            for direction in result.metric_directions.values()
+        )
+        or set(result.metric_protocol)
+        != {
+            "psnr_cap_db",
+            "lpips_implementation_sha256",
+            "extra_metric_registry",
+        }
+    ):
+        raise BenchmarkReportError("evaluation metric schema is incomplete")
     provenance = result.provenance
     if (
         provenance.get("test_camera") != TEST_CAMERA
@@ -115,6 +129,9 @@ def _validate_fairness(
         "seed",
         "planned_updates",
         "batch_size",
+        "source_sha256",
+        "config_sha256",
+        "runtime_contract_sha256",
     )
     reference = indexed[("joint_conditioned", REPORTING_STEPS[0])].provenance
     for step in REPORTING_STEPS:
@@ -163,7 +180,9 @@ def _paired(
             float(left_rows[sample_id][metric]) - float(right_rows[sample_id][metric])
             for sample_id in left_rows
         ]
-        direction = METRIC_DIRECTIONS.get(metric, "lower_is_better")
+        if left.metric_directions[metric] != right.metric_directions[metric]:
+            raise BenchmarkReportError("paired metric direction mismatch")
+        direction = left.metric_directions[metric]
         wins = [
             delta > 0 if direction == "higher_is_better" else delta < 0
             for delta in deltas
@@ -347,6 +366,8 @@ def build_scene_report(
                 verified.content_sha256 != result.content_sha256
                 or verified.rows != result.rows
                 or verified.summary != result.summary
+                or verified.metric_directions != result.metric_directions
+                or verified.metric_protocol != result.metric_protocol
                 or verified.provenance != result.provenance
             ):
                 raise BenchmarkReportError(
@@ -356,6 +377,42 @@ def build_scene_report(
     if any(result.identity.expected_sample_ids != common_ids for result in indexed.values()):
         raise BenchmarkReportError("all systems require identical sample IDs")
     _validate_fairness(indexed)
+    reference_protocol = indexed[
+        ("joint_conditioned", REPORTING_STEPS[0])
+    ].metric_protocol
+    registry = reference_protocol["extra_metric_registry"]
+    if not isinstance(registry, Mapping):
+        raise BenchmarkReportError("extra metric registry must be a mapping")
+    for (system, _), result in indexed.items():
+        if result.metric_protocol != reference_protocol:
+            raise BenchmarkReportError(
+                "all systems/steps must use one exact metric protocol"
+            )
+        core = (
+            set(ALL_METRICS)
+            if system in CONTINUATION_SYSTEMS
+            else set(AUDIO_METRICS)
+            if system == "native_audiogs"
+            else set(VIDEO_METRICS)
+        )
+        modalities: set[str] = set()
+        if set(AUDIO_METRICS).issubset(core):
+            modalities.add("audio")
+        if set(VIDEO_METRICS).issubset(core):
+            modalities.add("video")
+        extras = {
+            name
+            for name, specification in registry.items()
+            if specification["modality"] in modalities
+        }
+        if "video" in modalities and reference_protocol[
+            "lpips_implementation_sha256"
+        ] is not None:
+            extras.add("rgb_lpips")
+        if set(result.summary) != core | extras:
+            raise BenchmarkReportError(
+                "system/step metric set is incomplete or contains unknown metrics"
+            )
     video_results = [
         result
         for result in indexed.values()
@@ -404,6 +461,12 @@ def build_scene_report(
             "provenance": indexed[
                 (system, None if system in NATIVE_SYSTEMS else PRIMARY_STEP)
             ].provenance,
+            "metric_directions": indexed[
+                (system, None if system in NATIVE_SYSTEMS else PRIMARY_STEP)
+            ].metric_directions,
+            "metric_protocol": indexed[
+                (system, None if system in NATIVE_SYSTEMS else PRIMARY_STEP)
+            ].metric_protocol,
         }
         for system in sorted((*CONTINUATION_SYSTEMS, *NATIVE_SYSTEMS))
     }
@@ -503,6 +566,7 @@ def build_scene_report(
             "per_sample.jsonl": b"".join(canonical_json(row) for row in flat),
             "per_sample.csv": csv_stream.getvalue().encode(),
         },
+        overwrite=overwrite,
     )
     return report
 
@@ -529,6 +593,10 @@ def _aggregate_suite(
     macro: dict[str, object] = {}
     micro: dict[str, object] = {}
     for (step, system, metric), values in sorted(accumulator.items()):
+        if len(values) != len(SCENE_SAMPLE_COUNTS):
+            raise BenchmarkReportError(
+                "suite aggregate must contain exactly both scenes"
+            )
         macro.setdefault(step, {}).setdefault(system, {})[metric] = sum(
             value for value, _ in values
         ) / len(values)
@@ -537,6 +605,50 @@ def _aggregate_suite(
             value * count for value, count in values
         ) / total
     return {"macro": macro, "micro": micro}
+
+
+def _aggregate_suite_pairs(
+    scene_reports: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {"macro": {}, "micro": {}}
+    comparisons = {
+        "joint_vs_audio_only": AUDIO_METRICS,
+        "joint_vs_visual_only": VIDEO_METRICS,
+    }
+    for comparison, expected_metrics in comparisons.items():
+        available = [
+            set(report["paired"][comparison]) for report in scene_reports
+        ]
+        if any(metrics != available[0] for metrics in available[1:]):
+            raise BenchmarkReportError("suite paired metric set mismatch")
+        if not set(expected_metrics).issubset(available[0]):
+            raise BenchmarkReportError("suite paired metrics are incomplete")
+        for metric in sorted(available[0]):
+            values = [
+                report["paired"][comparison][metric] for report in scene_reports
+            ]
+            counts = [int(value["count"]) for value in values]
+            if counts != [int(report["sample_count"]) for report in scene_reports]:
+                raise BenchmarkReportError("suite paired sample count mismatch")
+            result["macro"].setdefault(comparison, {})[metric] = {
+                "mean_delta": sum(value["mean_delta"] for value in values)
+                / len(values),
+                "win_rate": sum(value["win_rate"] for value in values) / len(values),
+            }
+            total = sum(counts)
+            result["micro"].setdefault(comparison, {})[metric] = {
+                "mean_delta": sum(
+                    value["mean_delta"] * count
+                    for value, count in zip(values, counts)
+                )
+                / total,
+                "win_rate": sum(
+                    value["win_rate"] * count
+                    for value, count in zip(values, counts)
+                )
+                / total,
+            }
+    return result
 
 
 def build_suite_report(
@@ -571,6 +683,31 @@ def build_suite_report(
             verified = verify_scene_report(Path(root))
             if verified["content_sha256"] != report["content_sha256"]:
                 raise BenchmarkReportError("suite input scene artifact mismatch")
+    first, second = (indexed[scene] for scene in sorted(indexed))
+    if (
+        set(first["scaling"]) != {str(step) for step in REPORTING_STEPS}
+        or set(second["scaling"]) != set(first["scaling"])
+        or set(first["systems"])
+        != {*CONTINUATION_SYSTEMS, *NATIVE_SYSTEMS}
+        or set(second["systems"]) != set(first["systems"])
+    ):
+        raise BenchmarkReportError("suite system/step set mismatch")
+    for step in first["scaling"]:
+        if (
+            set(first["scaling"][step]) != CONTINUATION_SYSTEMS
+            or set(second["scaling"][step]) != CONTINUATION_SYSTEMS
+        ):
+            raise BenchmarkReportError("suite continuation set mismatch")
+        for system in CONTINUATION_SYSTEMS:
+            if set(first["scaling"][step][system]["summary"]) != set(
+                second["scaling"][step][system]["summary"]
+            ):
+                raise BenchmarkReportError("suite metric set mismatch")
+    for system in NATIVE_SYSTEMS:
+        if set(first["systems"][system]["primary_summary"]) != set(
+            second["systems"][system]["primary_summary"]
+        ):
+            raise BenchmarkReportError("suite native metric set mismatch")
     identity = _report_identity("suite", scene_reports)
     output = Path(output_dir)
     if resume:
@@ -599,6 +736,7 @@ def build_suite_report(
         "total_sample_count": sum(SCENE_SAMPLE_COUNTS.values()),
         "primary_step": PRIMARY_STEP,
         "aggregates": _aggregate_suite(scene_reports),
+        "paired_aggregates": _aggregate_suite_pairs(scene_reports),
         "aggregation_notes": {
             "macro": "unweighted mean of scene means",
             "micro": "sample-count-weighted mean of scene means",
@@ -621,6 +759,7 @@ def build_suite_report(
             "report.md": markdown.encode(),
             "report.csv": _suite_csv(report).encode(),
         },
+        overwrite=overwrite,
     )
     return report
 
