@@ -442,3 +442,19 @@ def test_arbitrary_proc_fd_input_requires_live_orchestrator_contract(
     monkeypatch.delenv("AVGAUSSIANV2_ORCHESTRATOR_PID", raising=False)
     with pytest.raises(PermissionError, match="orchestrator parent contract"):
         _validate_orchestrator_proc_paths((Path("/proc/1/fd/0"),))
+
+
+def test_durable_artifact_path_resolves_live_proc_fd_parent(tmp_path) -> None:
+    from avgaussianv2.cli.pilot_eval import _durable_artifact_path
+
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    directory_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        pinned = Path(f"/proc/self/fd/{directory_fd}") / "best.pt"
+        durable = _durable_artifact_path(pinned)
+    finally:
+        os.close(directory_fd)
+
+    assert durable == checkpoint.resolve()
+    assert durable.read_bytes() == b"checkpoint"

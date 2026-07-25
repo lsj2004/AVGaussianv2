@@ -240,6 +240,15 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _durable_artifact_path(path: Path) -> Path:
+    """Return the stable pathname behind a live orchestrator proc-fd path."""
+    resolved = path.resolve(strict=True)
+    metadata = resolved.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"artifact must resolve to a regular file: {path}")
+    return resolved
+
+
 def _snapshot(path: Path) -> SourceSnapshot:
     original = path.lstat()
     if stat.S_ISLNK(original.st_mode) or not stat.S_ISREG(original.st_mode):
@@ -1046,6 +1055,7 @@ def run_evaluation(
             raise ValueError("evaluation checkpoint must be kind best")
         checkpoint_generation = checkpoint_state.generation
         fingerprint = checkpoint_state.run_fingerprint
+    durable_checkpoint_path = _durable_artifact_path(checkpoint_path)
     output = Path(output_dir).absolute()
     _preflight_output(output, resume=resume, overwrite=overwrite)
     lock_fd = os.open(
@@ -1137,7 +1147,7 @@ def run_evaluation(
             bundle.model.load_state_dict(checkpoint_state.model_state_dict, strict=True)
 
         run_id = build_evaluation_run_id(
-            checkpoint_path=checkpoint_path,
+            checkpoint_path=durable_checkpoint_path,
             checkpoint_sha256=checkpoint_sha,
             checkpoint_generation=checkpoint_generation,
             run_fingerprint=fingerprint,
@@ -1194,7 +1204,7 @@ def run_evaluation(
             )
             provenance = EvaluationProvenance(
                 scene_id=config.scene.scene_id,
-                checkpoint_path=checkpoint_path,
+                checkpoint_path=durable_checkpoint_path,
                 checkpoint_sha256=checkpoint_sha,
                 checkpoint_generation=checkpoint_generation,
                 run_fingerprint=fingerprint,
