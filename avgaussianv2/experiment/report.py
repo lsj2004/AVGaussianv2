@@ -12,7 +12,7 @@ import os
 import stat
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
@@ -299,6 +299,47 @@ def _run_fingerprint(value: object, name: str) -> dict[str, object]:
     return {"algorithm": algorithm, "sha256": digest, "inputs": inputs}
 
 
+def _canonical_pilot_config(value: object, name: str) -> dict[str, object]:
+    if not isinstance(value, PilotConfig):
+        raise TypeError(f"{name} must be a PilotConfig")
+    for field_name, field in PilotConfig.__dataclass_fields__.items():
+        field_value = getattr(value, field_name)
+        if type(field_value) is not type(field.default):
+            raise TypeError(
+                f"{name}.{field_name} must have exact type "
+                f"{type(field.default).__name__}"
+            )
+    value.validate()
+    canonical = _canonical_json(asdict(value), name)
+    if not isinstance(canonical, dict):  # pragma: no cover - dataclass invariant
+        raise TypeError(f"{name} must canonicalize to a mapping")
+    return canonical
+
+
+def _fingerprint_pilot_config(
+    fingerprint: Mapping[str, object], name: str
+) -> Mapping[str, object]:
+    inputs = fingerprint["inputs"]
+    if not isinstance(inputs, Mapping):  # guarded by _run_fingerprint
+        raise TypeError(f"{name}.inputs must be a mapping")
+    config = _exact(
+        inputs.get("pilot_config"),
+        set(PilotConfig.__dataclass_fields__),
+        f"{name}.inputs.pilot_config",
+    )
+    return config
+
+
+def _require_matching_pilot_config(
+    canonical: Mapping[str, object],
+    fingerprint: Mapping[str, object],
+    name: str,
+) -> None:
+    inspected = _fingerprint_pilot_config(fingerprint, name)
+    if not _strict_json_equal(dict(canonical), dict(inspected)):
+        raise ValueError(f"{name}.inputs.pilot_config mismatch")
+
+
 def build_evaluation_run_id(
     *,
     checkpoint_path: str | Path,
@@ -373,51 +414,6 @@ def build_evaluation_manifest_sha256(
         ),
     }
     return hash_index_manifest(payload)
-
-
-def _secure_sha256_file(path: Path) -> str:
-    try:
-        before = path.lstat()
-    except FileNotFoundError as error:
-        raise FileNotFoundError(f"evaluation artifact does not exist: {path}") from error
-    if (
-        stat.S_ISLNK(before.st_mode)
-        or not stat.S_ISREG(before.st_mode)
-        or before.st_nlink != 1
-    ):
-        raise ValueError(
-            f"evaluation artifact must be a single-link non-symlink regular file: {path}"
-        )
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-    )
-    digest = hashlib.sha256()
-    try:
-        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or opened.st_nlink != 1
-            or (opened.st_dev, opened.st_ino)
-            != (before.st_dev, before.st_ino)
-        ):
-            raise ValueError(f"evaluation artifact identity changed: {path}")
-        while block := os.read(descriptor, 1024 * 1024):
-            digest.update(block)
-        after = os.fstat(descriptor)
-        if (
-            opened.st_size,
-            opened.st_mtime_ns,
-            opened.st_ctime_ns,
-        ) != (
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        ):
-            raise ValueError(f"evaluation artifact changed while hashing: {path}")
-    finally:
-        os.close(descriptor)
-    return digest.hexdigest()
 
 
 def _artifact_identity_tuple(path: Path) -> tuple[int, int, int, int, int]:
@@ -1022,9 +1018,14 @@ def _validate_provenance(
     if run_id != expected_run_id:
         raise ValueError(f"{system_name} evaluation_run_id mismatch")
     if system_name != "baseline_imported":
-        if not isinstance(value.pilot_config, PilotConfig):
-            raise TypeError(f"{system_name}.pilot_config must be a PilotConfig")
-        value.pilot_config.validate()
+        canonical_pilot_config = _canonical_pilot_config(
+            value.pilot_config, f"{system_name}.pilot_config"
+        )
+        _require_matching_pilot_config(
+            canonical_pilot_config,
+            fingerprint,
+            f"{system_name}.run_fingerprint",
+        )
         if value.pilot_config.psnr_tolerance_db != PSNR_TOLERANCE_DB:
             raise ValueError(
                 f"{system_name} pilot PSNR tolerance must equal {PSNR_TOLERANCE_DB}"
@@ -1048,6 +1049,14 @@ def _validate_provenance(
             identity.run_fingerprint, "resolved checkpoint run_fingerprint"
         ) != fingerprint:
             raise ValueError(f"{system_name} checkpoint run_fingerprint mismatch")
+        inspected_fingerprint = _run_fingerprint(
+            identity.run_fingerprint, "resolved checkpoint run_fingerprint"
+        )
+        _require_matching_pilot_config(
+            canonical_pilot_config,
+            inspected_fingerprint,
+            f"{system_name} inspected best run_fingerprint",
+        )
     result = {
         "scene_id": scene_id,
         "checkpoint_path": str(resolved_path),
@@ -1240,10 +1249,19 @@ def _load_latest_checkpoint_artifact(
     run_fingerprint = _run_fingerprint(
         value.run_fingerprint, f"{system_name}.worker run_fingerprint"
     )
-    if run_fingerprint != _run_fingerprint(
+    checkpoint_fingerprint = _run_fingerprint(
         checkpoint.run_fingerprint, f"{system_name}.checkpoint run_fingerprint"
-    ):
+    )
+    if not _strict_json_equal(run_fingerprint, checkpoint_fingerprint):
         raise ValueError(f"{system_name} latest/best run_fingerprint mismatch")
+    canonical_pilot_config = _canonical_pilot_config(
+        checkpoint.pilot_config, f"{system_name}.pilot_config"
+    )
+    _require_matching_pilot_config(
+        canonical_pilot_config,
+        run_fingerprint,
+        f"{system_name}.worker run_fingerprint",
+    )
     before = _artifact_identity_tuple(path)
     resolved = path.resolve(strict=True)
     cached = cache.get(resolved)
@@ -1293,10 +1311,16 @@ def _load_latest_checkpoint_artifact(
         raise ValueError(f"{system_name} latest checkpoint stage must be complete")
     if state.generation != generation:
         raise ValueError(f"{system_name} latest checkpoint generation mismatch")
-    if _run_fingerprint(
+    inspected_fingerprint = _run_fingerprint(
         state.run_fingerprint, f"{system_name} inspected latest run_fingerprint"
-    ) != run_fingerprint:
+    )
+    if not _strict_json_equal(inspected_fingerprint, run_fingerprint):
         raise ValueError(f"{system_name} inspected latest run_fingerprint mismatch")
+    _require_matching_pilot_config(
+        canonical_pilot_config,
+        inspected_fingerprint,
+        f"{system_name} inspected latest run_fingerprint",
+    )
     return state, resolved
 
 
@@ -2416,13 +2440,36 @@ def _read_durability_warnings(output_fd: int, digest: str) -> tuple[str, ...]:
         except FileNotFoundError:
             return ()
         metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024 * 1024:
+        before = (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+            metadata.st_nlink,
+        )
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size > 1024 * 1024
+        ):
             raise ValueError("durability warning sidecar is unsafe")
         data = b""
         while block := os.read(descriptor, 64 * 1024):
             data += block
             if len(data) > 1024 * 1024:
                 raise ValueError("durability warning sidecar is too large")
+        after_metadata = os.fstat(descriptor)
+        after = (
+            after_metadata.st_dev,
+            after_metadata.st_ino,
+            after_metadata.st_size,
+            after_metadata.st_mtime_ns,
+            after_metadata.st_ctime_ns,
+            after_metadata.st_nlink,
+        )
+        if after != before or after_metadata.st_nlink != 1:
+            raise ValueError("durability warning sidecar changed while reading")
         payload = json.loads(data.decode("utf-8"))
         if (
             not isinstance(payload, dict)

@@ -769,6 +769,136 @@ def test_build_comparison_ready_and_writes_exact_deterministic_files(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "field,value",
+    [
+        ("warmup_steps", 2),
+        ("joint_steps", 4),
+        ("validation_interval", 2),
+        ("minimum_joint_steps", 1),
+        ("patience", 3),
+        ("minimum_relative_improvement", 0.02),
+        ("quick_validation_samples", 33),
+        ("psnr_tolerance_db", 0.4),
+        ("ssim_tolerance", 0.02),
+    ],
+)
+def test_report_rejects_every_pilot_behavior_mismatch(tmp_path, field, value):
+    systems = _ready_systems(tmp_path)
+    checkpoint = systems[1].provenance.checkpoint
+    mismatched = replace(
+        checkpoint,
+        pilot_config=replace(checkpoint.pilot_config, **{field: value}),
+    )
+    systems[1] = replace(
+        systems[1],
+        provenance=replace(systems[1].provenance, checkpoint=mismatched),
+    )
+
+    assert not decide_long_training(systems).ready
+    with pytest.raises((TypeError, ValueError), match="pilot|tolerance"):
+        build_comparison(systems, tmp_path / "report")
+    assert not (tmp_path / "report" / "current").exists()
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value.__setitem__("warmup_steps", True),
+        lambda value: value.__setitem__("warmup_steps", 1.0),
+        lambda value: value.__setitem__("minimum_relative_improvement", 1),
+        lambda value: value.__setitem__("extra", 1),
+        lambda value: value.pop("warmup_steps"),
+    ],
+)
+def test_pilot_config_binding_rejects_type_coercion_and_key_drift(mutate):
+    canonical = report_module._canonical_pilot_config(
+        PilotConfig(
+            warmup_steps=1,
+            joint_steps=3,
+            validation_interval=1,
+            minimum_joint_steps=0,
+            patience=2,
+            minimum_relative_improvement=0.01,
+            psnr_tolerance_db=0.5,
+            ssim_tolerance=0.01,
+        ),
+        "pilot",
+    )
+    fingerprint_config = copy.deepcopy(canonical)
+    mutate(fingerprint_config)
+    fingerprint = {"inputs": {"pilot_config": fingerprint_config}}
+
+    with pytest.raises((TypeError, ValueError), match="pilot_config"):
+        report_module._require_matching_pilot_config(
+            canonical, fingerprint, "fingerprint"
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("warmup_steps", True),
+        ("warmup_steps", 1.0),
+        ("minimum_relative_improvement", 1),
+    ],
+)
+def test_provenance_pilot_config_rejects_bool_and_numeric_coercion(field, value):
+    with pytest.raises(TypeError, match="exact type"):
+        report_module._canonical_pilot_config(
+            replace(PilotConfig(), **{field: value}),
+            "pilot",
+        )
+
+
+def test_warmup_config_drift_is_not_ready_then_canonical_run_is_green(tmp_path):
+    systems = _ready_systems(tmp_path)
+    checkpoint = systems[1].provenance.checkpoint
+    drifted = replace(
+        checkpoint,
+        pilot_config=replace(
+            checkpoint.pilot_config,
+            warmup_steps=checkpoint.pilot_config.warmup_steps + 999,
+        ),
+    )
+    systems[1] = replace(
+        systems[1],
+        provenance=replace(systems[1].provenance, checkpoint=drifted),
+    )
+    assert not decide_long_training(systems).ready
+
+    clean_root = tmp_path / "clean"
+    clean_root.mkdir()
+    clean = _ready_systems(clean_root)
+    result = build_comparison(clean, tmp_path / "green-report")
+    assert result.decision.ready
+    assert "# Pilot comparison: READY" in (
+        tmp_path / "green-report" / "comparison.md"
+    ).read_text()
+
+
+def test_durability_warning_sidecar_must_have_one_link(tmp_path):
+    report_dir = tmp_path / "report"
+    published = build_comparison(_ready_systems(tmp_path), report_dir)
+    warnings_dir = report_dir / ".report-warnings"
+    warnings_dir.mkdir()
+    sidecar = warnings_dir / f"{published.content_digest}.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "schema": "avgaussianv2.report-durability-warnings",
+                "version": 1,
+                "content_digest": published.content_digest,
+                "warnings": ["test warning"],
+            }
+        )
+    )
+    (warnings_dir / "second-link.json").hardlink_to(sidecar)
+
+    with pytest.raises(ValueError, match="sidecar is unsafe"):
+        resolve_current_report(report_dir, include_warnings=True)
+
+
+@pytest.mark.parametrize(
     "mutator,reason",
     [
         (
