@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -20,6 +22,7 @@ from avgaussianv2.benchmark.evaluation import (
 )
 from avgaussianv2.benchmark.native import (
     NativeContractError,
+    _checkpoint_metadata,
     finalize_native_contract,
     verify_native_contract,
     write_audiogs_seed_record,
@@ -34,6 +37,128 @@ from avgaussianv2.contracts import AlignedAVSample
 
 def _sha_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+FTGSPP_GAUSSIAN_PARAMETERS = {
+    "means",
+    "scales",
+    "quats",
+    "opacities",
+    "sh_0",
+    "sh_n",
+    "times",
+    "durations",
+    "marginal_gates",
+}
+FTGSPP_GAUSSIAN_GLOBALS = {
+    "ftgspp.models.gaussians Gaussians",
+    "torch._utils _rebuild_parameter",
+    "torch._utils _rebuild_tensor_v2",
+    "torch FloatStorage",
+    "collections OrderedDict",
+    "__builtin__ set",
+}
+
+
+def _save_ftgspp_gaussians_fixture(path: Path) -> None:
+    module_names = ("ftgspp", "ftgspp.models", "ftgspp.models.gaussians")
+    previous = {name: sys.modules.get(name) for name in module_names}
+    package = types.ModuleType("ftgspp")
+    package.__path__ = []
+    models = types.ModuleType("ftgspp.models")
+    models.__path__ = []
+    gaussians = types.ModuleType("ftgspp.models.gaussians")
+    cls = type(
+        "Gaussians",
+        (torch.nn.Module,),
+        {"__module__": "ftgspp.models.gaussians"},
+    )
+    gaussians.Gaussians = cls
+    package.models = models
+    models.gaussians = gaussians
+    sys.modules.update(
+        {
+            "ftgspp": package,
+            "ftgspp.models": models,
+            "ftgspp.models.gaussians": gaussians,
+        }
+    )
+    try:
+        value = cls()
+        for name in (*sorted(FTGSPP_GAUSSIAN_PARAMETERS), "velocity_model"):
+            setattr(value, name, torch.nn.Parameter(torch.ones(1)))
+        value.max_duration = 1.0
+        value.sh_degree = 3
+        torch.save(value, path)
+    finally:
+        for name, old in previous.items():
+            if old is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = old
+
+
+def test_ftgspp_checkpoint_requires_real_pickle_global_and_exact_state_schema() -> None:
+    metadata = _checkpoint_metadata(
+        {"sh_degree": 3},
+        {
+            *FTGSPP_GAUSSIAN_PARAMETERS,
+            "velocity_model",
+            "max_duration",
+            "sh_degree",
+        },
+        FTGSPP_GAUSSIAN_GLOBALS,
+        model_kind="ftgspp",
+        scene_id="scene1_opera",
+    )
+    assert metadata["model_class"] == "ftgspp.models.gaussians.Gaussians"
+
+    with pytest.raises(NativeContractError, match="schema mismatch"):
+        _checkpoint_metadata(
+            {"sh_degree": 3},
+            {
+                *FTGSPP_GAUSSIAN_PARAMETERS,
+                "velocity_model",
+                "max_duration",
+                "sh_degree",
+                # A Unicode string must not impersonate a pickle GLOBAL opcode.
+                "ftgspp.models.gaussians Gaussians",
+            },
+            FTGSPP_GAUSSIAN_GLOBALS - {"ftgspp.models.gaussians Gaussians"},
+            model_kind="ftgspp",
+            scene_id="scene1_opera",
+        )
+
+    for globals_, strings in (
+        (
+            FTGSPP_GAUSSIAN_GLOBALS
+            - {"ftgspp.models.gaussians Gaussians"}
+            | {"attacker.models Gaussians"},
+            {
+                *FTGSPP_GAUSSIAN_PARAMETERS,
+                "velocity_model",
+                "max_duration",
+                "sh_degree",
+            },
+        ),
+        (
+            FTGSPP_GAUSSIAN_GLOBALS,
+            {
+                *(FTGSPP_GAUSSIAN_PARAMETERS - {"means"}),
+                "velocity_model",
+                "max_duration",
+                "sh_degree",
+            },
+        ),
+    ):
+        with pytest.raises(NativeContractError, match="schema mismatch"):
+            _checkpoint_metadata(
+                {"sh_degree": 3},
+                strings,
+                globals_,
+                model_kind="ftgspp",
+                scene_id="scene1_opera",
+            )
 
 
 def _install_native_audit_stubs(monkeypatch):
@@ -126,27 +251,7 @@ def _make_native_contract(
             checkpoint,
         )
     else:
-        torch.save(
-            {
-                "module": "ftgspp.models.gaussians",
-                "class": "Gaussians",
-                **{
-                    name: torch.ones(1)
-                    for name in (
-                        "means",
-                        "scales",
-                        "quats",
-                        "opacities",
-                        "sh_0",
-                        "sh_n",
-                        "times",
-                        "durations",
-                        "marginal_gates",
-                    )
-                },
-            },
-            checkpoint,
-        )
+        _save_ftgspp_gaussians_fixture(checkpoint)
     protocols[str(config.resolve())] = {
         "scene": {
             "id": scene,

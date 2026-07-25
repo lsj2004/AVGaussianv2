@@ -45,6 +45,7 @@ def main() -> None:
     parser.add_argument("--ftgspp-termination-log")
     parser.add_argument("--ftgspp-quarantine-root")
     parser.add_argument("--ftgspp-seed-record")
+    parser.add_argument("--ftgspp-train-seed-record")
     args = parser.parse_args()
     raw = audit_protocol_config(args.config)
     scene_id = raw["scene"]["id"]
@@ -164,12 +165,13 @@ def main() -> None:
                 args.ftgspp_run_root,
                 args.ftgspp_marker_root,
                 args.ftgspp_seed_record,
+                args.ftgspp_train_seed_record,
             )
             if not all(required):
                 parser.error(
                     "--audit-ftgspp-resume requires --ftgspp-train-source, "
                     "--ftgspp-run-root, --ftgspp-marker-root, and "
-                    "--ftgspp-seed-record"
+                    "--ftgspp-seed-record/--ftgspp-train-seed-record"
                 )
             details["ftgspp_resume"] = audit_ftgspp_resume_state(
                 scene_id=scene_id,
@@ -179,6 +181,7 @@ def main() -> None:
                 run_root=args.ftgspp_run_root,
                 marker_root=args.ftgspp_marker_root,
                 prep_seed_record=args.ftgspp_seed_record,
+                train_seed_record=args.ftgspp_train_seed_record,
                 frame_count=raw["benchmark"]["expected_test_samples"],
                 keyframe_stride=10,
             )

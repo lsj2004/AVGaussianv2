@@ -10,10 +10,12 @@ import numpy as np
 import pytest
 import yaml
 
+import avgaussianv2.cli.run_seeded_ftgspp as seeded_ftgspp_module
 from avgaussianv2.benchmark.assets import (
     AssetAuditError,
     audit_audiogs_conversion,
     audit_ftgspp_flow_cache,
+    audit_ftgspp_point_cache,
     audit_ftgspp_seed_record,
     audit_ftgspp_train_source,
     audit_ftgspp_upstream_config,
@@ -23,7 +25,10 @@ from avgaussianv2.benchmark.assets import (
     quarantine_interrupted_ftgspp_flow_tail,
     render_ftgspp_config,
 )
-from avgaussianv2.cli.run_seeded_ftgspp import seed_everything
+from avgaussianv2.cli.run_seeded_ftgspp import (
+    _strict_point_prefix,
+    seed_everything,
+)
 from avgaussianv2.config import load_project_config
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -413,6 +418,7 @@ def test_flow_cache_requires_every_train_camera_and_no_cam38(tmp_path: Path) -> 
     write_flow(forward / "c038.npz", 0, 10, 38)
     with pytest.raises(AssetAuditError, match="complete"):
         audit_ftgspp_flow_cache(root, frame_count=11, keyframe_stride=10)
+
     (forward / "c038.npz").unlink()
 
     extra_pair = root / "f000010_f000020"
@@ -438,6 +444,112 @@ def test_flow_cache_requires_every_train_camera_and_no_cam38(tmp_path: Path) -> 
     assert partial["complete"] is False
     with pytest.raises(AssetAuditError, match="complete"):
         audit_ftgspp_flow_cache(root, frame_count=11, keyframe_stride=10)
+
+
+def _write_strict_point_ply(path: Path, *, vertices: int = 2) -> None:
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        f"element vertex {vertices}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "property uchar red\n"
+        "property uchar green\n"
+        "property uchar blue\n"
+        "end_header\n"
+    ).encode("ascii")
+    path.write_bytes(header + (b"\0" * (vertices * 15)))
+
+
+def test_point_cache_requires_valid_exact_keyframe_prefix(tmp_path: Path) -> None:
+    root = tmp_path / "points"
+    root.mkdir()
+    _write_strict_point_ply(root / "f000000.ply")
+    partial = audit_ftgspp_point_cache(
+        root, frame_count=21, keyframe_stride=10, allow_partial=True
+    )
+    assert partial == {"files": 1, "expected_files": 3, "complete": False}
+
+    _write_strict_point_ply(root / "f000010.ply")
+    _write_strict_point_ply(root / "f000020.ply")
+    assert audit_ftgspp_point_cache(
+        root, frame_count=21, keyframe_stride=10
+    )["complete"] is True
+
+    (root / "f000010.ply").unlink()
+    with pytest.raises(AssetAuditError, match="exact prefix"):
+        audit_ftgspp_point_cache(
+            root, frame_count=21, keyframe_stride=10, allow_partial=True
+        )
+
+    _write_strict_point_ply(root / "f000010.ply")
+    (root / "f000020.ply").write_bytes(b"ply\ntruncated")
+    with pytest.raises(AssetAuditError, match="invalid FTGS\\+\\+ point PLY"):
+        audit_ftgspp_point_cache(
+            root, frame_count=21, keyframe_stride=10, allow_partial=True
+        )
+
+
+def test_seed_wrapper_revalidates_point_prefix_before_skipping(tmp_path: Path) -> None:
+    points = tmp_path / "points"
+    points.mkdir()
+    _write_strict_point_ply(points / "f000000.ply")
+    config = tmp_path / "scene.toml"
+    config.write_text(
+        f"""
+[data]
+frames = {{ start = 0, stop = 21 }}
+[init]
+keyframe_stride = 10
+points_path = "{points}"
+"""
+    )
+    assert _strict_point_prefix(config) == ([0, 10, 20], 1)
+
+    (points / "f000000.ply").write_bytes(b"ply\ntruncated")
+    with pytest.raises(RuntimeError, match="invalid FTGS\\+\\+ point"):
+        _strict_point_prefix(config)
+
+
+def test_seed_wrapper_records_but_does_not_forward_resume_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = tmp_path / "seed.json"
+    recorded = {}
+    launched = {}
+    monkeypatch.setattr(
+        seeded_ftgspp_module, "_install_point_resume_guard", lambda _: 1
+    )
+    monkeypatch.setattr(
+        seeded_ftgspp_module,
+        "seed_everything",
+        lambda _, argv: recorded.setdefault("argv", list(argv)) or {},
+    )
+    monkeypatch.setattr(
+        seeded_ftgspp_module.runpy,
+        "run_module",
+        lambda *_args, **_kwargs: launched.setdefault("argv", list(sys.argv)),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_seeded_ftgspp.py",
+            "--seed",
+            "42",
+            "--record",
+            str(record),
+            "--resume-points",
+            "--module",
+            "fake.module",
+            "--",
+            "dynerf",
+        ],
+    )
+    seeded_ftgspp_module.main()
+    assert recorded["argv"][-1] == "avgaussianv2:resume-points-prefix=1"
+    assert launched["argv"] == ["fake.module", "dynerf"]
 
 
 def test_interrupted_flow_recovery_only_quarantines_proven_latest_tail(

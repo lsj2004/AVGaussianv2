@@ -782,6 +782,118 @@ def _ftgspp_flow_items(
     return pairs, items
 
 
+def _ftgspp_keyframes(frame_count: int, keyframe_stride: int) -> list[int]:
+    if frame_count <= 0 or keyframe_stride <= 0:
+        raise AssetAuditError("point frame_count/stride are invalid")
+    frames = list(range(0, frame_count, keyframe_stride))
+    if frames[-1] != frame_count - 1:
+        frames.append(frame_count - 1)
+    return frames
+
+
+def _audit_ftgspp_point_file(path: Path) -> None:
+    metadata = _secure_regular_metadata(path, str(path))
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise AssetAuditError(f"{path} changed during audit")
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            expected_lines = [
+                b"ply\n",
+                b"format binary_little_endian 1.0\n",
+            ]
+            if [stream.readline(), stream.readline()] != expected_lines:
+                raise ValueError("header")
+            vertex_line = stream.readline()
+            match = re.fullmatch(rb"element vertex ([1-9][0-9]*)\n", vertex_line)
+            if match is None:
+                raise ValueError("vertex count")
+            vertex_count = int(match.group(1))
+            properties = [
+                b"property float x\n",
+                b"property float y\n",
+                b"property float z\n",
+                b"property uchar red\n",
+                b"property uchar green\n",
+                b"property uchar blue\n",
+                b"end_header\n",
+            ]
+            if [stream.readline() for _ in properties] != properties:
+                raise ValueError("properties")
+            expected_size = stream.tell() + vertex_count * 15
+            vertices = np.fromfile(
+                stream,
+                dtype=np.dtype(
+                    [
+                        ("x", "<f4"),
+                        ("y", "<f4"),
+                        ("z", "<f4"),
+                        ("red", "u1"),
+                        ("green", "u1"),
+                        ("blue", "u1"),
+                    ]
+                ),
+                count=vertex_count,
+            )
+            if len(vertices) != vertex_count or not all(
+                np.isfinite(vertices[axis]).all() for axis in ("x", "y", "z")
+            ):
+                raise ValueError("coordinates")
+        if opened.st_size != expected_size:
+            raise ValueError("payload size")
+        current = os.stat(path, follow_symlinks=False)
+        if (current.st_dev, current.st_ino, current.st_size) != (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+        ):
+            raise AssetAuditError(f"{path} changed during audit")
+    except (OSError, ValueError) as exc:
+        raise AssetAuditError(f"invalid FTGS++ point PLY {path}") from exc
+    finally:
+        os.close(descriptor)
+
+
+def audit_ftgspp_point_cache(
+    path: str | Path,
+    *,
+    frame_count: int,
+    keyframe_stride: int,
+    allow_partial: bool = False,
+) -> dict[str, Any]:
+    """Require strict binary PLYs for an exact keyframe prefix."""
+    root = Path(path)
+    if root.is_symlink() or not root.is_dir():
+        raise AssetAuditError("FTGS++ point cache root must be a directory")
+    expected = [
+        f"f{frame:06d}.ply"
+        for frame in _ftgspp_keyframes(frame_count, keyframe_stride)
+    ]
+    entries = list(root.iterdir())
+    actual = {entry.name for entry in entries}
+    if any(entry.is_symlink() or not entry.is_file() for entry in entries):
+        raise AssetAuditError("FTGS++ point cache contains unsafe entries")
+    if not actual.issubset(expected):
+        raise AssetAuditError("FTGS++ point cache contains unknown entries")
+    if actual != set(expected[: len(actual)]):
+        raise AssetAuditError("FTGS++ partial point cache must be an exact prefix")
+    if not allow_partial and len(actual) != len(expected):
+        raise AssetAuditError("FTGS++ point cache is incomplete")
+    for name in expected[: len(actual)]:
+        _audit_ftgspp_point_file(root / name)
+    return {
+        "files": len(actual),
+        "expected_files": len(expected),
+        "complete": len(actual) == len(expected),
+    }
+
+
 def _audit_ftgspp_flow_file(
     flow_path: Path, *, left: int, right: int, camera: int
 ) -> None:
@@ -991,6 +1103,7 @@ def audit_ftgspp_resume_state(
     run_root: str | Path,
     marker_root: str | Path,
     prep_seed_record: str | Path,
+    train_seed_record: str | Path,
     frame_count: int,
     keyframe_stride: int,
 ) -> dict[str, Any]:
@@ -1065,11 +1178,6 @@ def audit_ftgspp_resume_state(
     for name in expected_colmap:
         if _secure_regular_metadata(colmap / name, name).st_size <= 0:
             raise AssetAuditError(f"FTGS++ COLMAP entry {name} is empty")
-    if any(points.iterdir()) or any(run.iterdir()):
-        raise AssetAuditError(
-            "FTGS++ points/train already started and cannot be safely resumed"
-        )
-
     marker = {
         "protocol": PROTOCOL,
         "scene_id": scene_id,
@@ -1097,7 +1205,120 @@ def audit_ftgspp_resume_state(
         keyframe_stride=keyframe_stride,
         allow_partial=True,
     )
-    return {"flow": flow_result, "scene_id": scene_id}
+    point_result = audit_ftgspp_point_cache(
+        points,
+        frame_count=frame_count,
+        keyframe_stride=keyframe_stride,
+        allow_partial=True,
+    )
+    run_entries = list(run.iterdir())
+    if not run_entries:
+        if point_result["files"] and not flow_result["complete"]:
+            raise AssetAuditError(
+                "FTGS++ points cannot precede a complete flow cache"
+            )
+        return {
+            "flow": flow_result,
+            "points": point_result,
+            "resume_points": bool(point_result["files"]),
+            "finalize_only": False,
+            "scene_id": scene_id,
+        }
+
+    if not flow_result["complete"] or not point_result["complete"]:
+        raise AssetAuditError(
+            "FTGS++ train output requires complete flow and point caches"
+        )
+    train_seed = audit_ftgspp_seed_record(
+        train_seed_record, expected_scene=scene_id
+    )
+    if "--from points --to train" not in " ".join(train_seed["argv"]):
+        raise AssetAuditError("FTGS++ train seed record does not bind points-to-train")
+    expected_run_files = {
+        "color_correctors.pt",
+        "config.toml",
+        "gaussians.pt",
+        "init.ply",
+        "init.pt",
+        "train.log",
+    }
+    expected_run_entries = {scene_id}
+    if {entry.name for entry in run_entries} != expected_run_entries:
+        raise AssetAuditError("FTGS++ completed run root inventory is invalid")
+    scene_run = run / scene_id
+    if scene_run.is_symlink() or not scene_run.is_dir():
+        raise AssetAuditError("FTGS++ completed scene run is unsafe")
+    if {entry.name for entry in scene_run.iterdir()} != {"00"}:
+        raise AssetAuditError("FTGS++ completed scene run index is invalid")
+    final_run = scene_run / "00"
+    if final_run.is_symlink() or not final_run.is_dir():
+        raise AssetAuditError("FTGS++ completed run directory is unsafe")
+    if {entry.name for entry in final_run.iterdir()} != expected_run_files:
+        raise AssetAuditError("FTGS++ completed run inventory is invalid")
+    for name in expected_run_files:
+        if _secure_regular_metadata(final_run / name, name).st_size <= 0:
+            raise AssetAuditError(f"FTGS++ completed run file {name} is empty")
+    try:
+        run_config = tomllib.loads(
+            _read_bounded_regular_nofollow(
+                final_run / "config.toml", maximum=MAX_METADATA_BYTES
+            ).decode("utf-8", errors="strict")
+        )
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise AssetAuditError("FTGS++ completed run config is invalid") from exc
+    expected_run_config = {
+        ("model", "velocity_model"): "explicit",
+        ("data", "video_path"): str(Path(train_source).resolve(strict=True)),
+        ("data", "calibration_path"): str(source / "poses_bounds.npy"),
+        ("data", "extracted_path"): str(extracted),
+        ("data", "memmap_path"): str(memmap),
+        ("data", "colmap_path"): str(colmap),
+        ("data", "eval_cameras"): [37],
+        ("data", "train_cameras"): {"start": 0, "stop": 38},
+        ("data", "frames"): {"start": 0, "stop": frame_count},
+        ("init", "points_path"): str(points),
+        ("init", "keyframe_stride"): keyframe_stride,
+        ("init", "sh_degree"): 3,
+        ("init", "temporal_flow_path"): str(flow),
+        ("init", "temporal_flow_cameras"): {"start": 0, "stop": 38},
+        ("train", "iterations"): 30_000,
+        ("train", "batch_size"): 1,
+        ("train", "color_correction"): True,
+        ("train", "hard_separation"): False,
+    }
+    for (section, key), expected_value in expected_run_config.items():
+        value = run_config.get(section, {}).get(key)
+        if not _equals_typed(value, expected_value):
+            raise AssetAuditError(
+                f"FTGS++ completed run config {section}.{key} mismatches"
+            )
+    train_log = _read_bounded_regular_nofollow(
+        final_run / "train.log", maximum=MAX_METADATA_BYTES
+    ).decode("utf-8", errors="strict")
+    required_markers = {
+        "Starting training",
+        "Iteration 29500 PSNR",
+        "Done training",
+        "Running stage: separate",
+        "Skipping hard separation stage",
+    }
+    if not all(marker in train_log for marker in required_markers):
+        raise AssetAuditError("FTGS++ completed train log evidence is invalid")
+    from avgaussianv2.benchmark.native import inspect_native_checkpoint
+
+    checkpoint = inspect_native_checkpoint(
+        final_run / "gaussians.pt",
+        model_kind="ftgspp",
+        scene_id=scene_id,
+    )
+    return {
+        "flow": flow_result,
+        "points": point_result,
+        "checkpoint": checkpoint,
+        "resume_points": False,
+        "finalize_only": True,
+        "scene_id": scene_id,
+    }
 
 
 def audit_ftgspp_seed_record(
@@ -1137,6 +1358,18 @@ def audit_ftgspp_seed_record(
         if index + 1 >= len(argv) or argv[index + 1] != "0-37":
             raise AssetAuditError("FTGS++ flow must use exactly cameras 0-37")
     elif Path(argv[0]).name == "run":
+        resume_tokens = [
+            item for item in argv if item.startswith("avgaussianv2:")
+        ]
+        if len(resume_tokens) > 1 or (
+            resume_tokens
+            and re.fullmatch(
+                r"avgaussianv2:resume-points-prefix=[1-9][0-9]*",
+                resume_tokens[0],
+            )
+            is None
+        ):
+            raise AssetAuditError("FTGS++ point-resume seed marker is invalid")
         if (
             "eval" in argv
             or argv.count("--from") != 1
@@ -1158,6 +1391,10 @@ def audit_ftgspp_seed_record(
             raise AssetAuditError("FTGS++ run seed record scene is not exact")
         if stage_range not in {("extract", "prep"), ("points", "train")}:
             raise AssetAuditError("FTGS++ run seed record has an invalid stage range")
+        if resume_tokens and stage_range != ("points", "train"):
+            raise AssetAuditError(
+                "FTGS++ point-resume marker requires points-to-train"
+            )
     else:
         raise AssetAuditError("FTGS++ seed record target is not an approved entrypoint")
     return dict(payload)

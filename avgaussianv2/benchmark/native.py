@@ -232,7 +232,9 @@ def _json(path: Path, label: str) -> Mapping[str, Any]:
     return value
 
 
-def _torch_pickle_ops_fd(fd: int) -> tuple[dict[str, int], set[str]]:
+def _torch_pickle_ops_fd(
+    fd: int,
+) -> tuple[dict[str, int], set[str], set[str]]:
     """Inspect Torch's pickle opcode stream without executing pickle globals."""
     try:
         with os.fdopen(os.dup(fd), "rb") as stream, zipfile.ZipFile(stream) as archive:
@@ -253,10 +255,14 @@ def _torch_pickle_ops_fd(fd: int) -> tuple[dict[str, int], set[str]]:
         ) from error
     integers: dict[str, int] = {}
     strings: set[str] = set()
+    globals_: set[str] = set()
     pending_key: str | None = None
     try:
         for opcode, argument, _ in pickletools.genops(data):
-            if opcode.name in {
+            if opcode.name == "GLOBAL" and isinstance(argument, str):
+                globals_.add(argument)
+                pending_key = None
+            elif opcode.name in {
                 "BINUNICODE",
                 "SHORT_BINUNICODE",
                 "UNICODE",
@@ -274,7 +280,7 @@ def _torch_pickle_ops_fd(fd: int) -> tuple[dict[str, int], set[str]]:
         raise NativeContractError(
             f"native checkpoint pickle opcode stream is invalid: {error}"
         ) from error
-    return integers, strings
+    return integers, strings, globals_
 
 
 def inspect_native_checkpoint(
@@ -287,18 +293,23 @@ def inspect_native_checkpoint(
     descriptor = _open_absolute_regular(checkpoint, "native checkpoint")
     try:
         _hash_fd(descriptor, "native checkpoint")
-        integers, strings = _torch_pickle_ops_fd(descriptor)
+        integers, strings, globals_ = _torch_pickle_ops_fd(descriptor)
         _verify_retained_path(checkpoint, descriptor, "native checkpoint")
     finally:
         os.close(descriptor)
     return _checkpoint_metadata(
-        integers, strings, model_kind=model_kind, scene_id=scene_id
+        integers,
+        strings,
+        globals_,
+        model_kind=model_kind,
+        scene_id=scene_id,
     )
 
 
 def _checkpoint_metadata(
     integers: Mapping[str, int],
     strings: set[str],
+    globals_: set[str],
     *,
     model_kind: str,
     scene_id: str,
@@ -327,20 +338,34 @@ def _checkpoint_metadata(
             "test_viewpoint": 39,
         }
     elif model_kind == "ftgspp":
-        if not (
-            "ftgspp.models.gaussians" in strings
-            and "Gaussians" in strings
-            and {
-                "means",
-                "scales",
-                "quats",
-                "opacities",
-                "sh_0",
-                "sh_n",
-                "times",
-                "durations",
-                "marginal_gates",
+        required_parameters = {
+            "means",
+            "scales",
+            "quats",
+            "opacities",
+            "sh_0",
+            "sh_n",
+            "times",
+            "durations",
+            "marginal_gates",
+        }
+        expected_globals = {
+            "ftgspp.models.gaussians Gaussians",
+            "torch._utils _rebuild_parameter",
+            "torch._utils _rebuild_tensor_v2",
+            "torch FloatStorage",
+            "collections OrderedDict",
+            "__builtin__ set",
+        }
+        if (
+            globals_ != expected_globals
+            or not {
+                *required_parameters,
+                "velocity_model",
+                "max_duration",
+                "sh_degree",
             }.issubset(strings)
+            or integers.get("sh_degree") != 3
         ):
             raise NativeContractError(
                 "FreeTimeGS++ Gaussians checkpoint schema mismatch"

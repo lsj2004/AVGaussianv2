@@ -100,6 +100,8 @@ prepare_scene() {
   local seed_root="${ROOT}/runs/cam38_strict/${scene}/protocol/seed_records"
   local seeded_wrapper="${ROOT}/avgaussianv2/cli/run_seeded_ftgspp.py"
   local flow_complete=0
+  local finalize_only=0
+  local resume_points=0
   local resume_report=""
 
   echo "Train-only source for ${scene}: cam00..cam37; cam38 RGB is not linked."
@@ -115,9 +117,15 @@ prepare_scene() {
       --ftgspp-run-root "${run_root}" \
       --ftgspp-marker-root "${marker_root}" \
       --ftgspp-seed-record "${seed_root}/prep.json" \
+      --ftgspp-train-seed-record "${seed_root}/train.json" \
       --audit-ftgspp-resume)"
     printf '%s\n' "${resume_report}"
-    if [[ "${resume_report}" == *'"complete": true'* ]]; then
+    flow_complete="$("${PYTHON}" -c 'import json,sys; print(int(json.loads(sys.argv[1])["ftgspp_resume"]["flow"]["complete"]))' "${resume_report}")"
+    finalize_only="$("${PYTHON}" -c 'import json,sys; print(int(json.loads(sys.argv[1])["ftgspp_resume"]["finalize_only"]))' "${resume_report}")"
+    resume_points="$("${PYTHON}" -c 'import json,sys; print(int(json.loads(sys.argv[1])["ftgspp_resume"]["resume_points"]))' "${resume_report}")"
+    if [[ "${finalize_only}" -eq 1 ]]; then
+      echo "Resume audit: completed native training will only be finalized for ${scene}."
+    elif [[ "${flow_complete}" -eq 1 ]]; then
       flow_complete=1
       echo "Resume audit: complete flow cache will be reused for ${scene}."
     else
@@ -192,17 +200,24 @@ prepare_scene() {
     echo "pre-init audit: --audit-ftgspp-flow --ftgspp-seed-record ${seed_root}/flow.json"
   fi
 
-  (
-    cd "${FTGSPP_ROOT}"
-    run_command env CUDA_VISIBLE_DEVICES="${PHYSICAL_GPU}" \
-      PYTHONHASHSEED=42 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
-      .venv/bin/python "${seeded_wrapper}" \
-      --seed 42 --record "${seed_root}/train.json" \
-      --script "${FTGSPP_ROOT}/run" -- dynerf \
-      "${generated_config_dir}" \
-      "${run_root}" \
-      --scenes "${scene}" --from points --to train
-  )
+  if [[ "${finalize_only}" -ne 1 ]]; then
+    resume_wrapper_args=()
+    if [[ "${resume_points}" -eq 1 ]]; then
+      resume_wrapper_args+=(--resume-points)
+    fi
+    (
+      cd "${FTGSPP_ROOT}"
+      run_command env CUDA_VISIBLE_DEVICES="${PHYSICAL_GPU}" \
+        PYTHONHASHSEED=42 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+        .venv/bin/python "${seeded_wrapper}" \
+        --seed 42 --record "${seed_root}/train.json" \
+        "${resume_wrapper_args[@]}" \
+        --script "${FTGSPP_ROOT}/run" -- dynerf \
+        "${generated_config_dir}" \
+        "${run_root}" \
+        --scenes "${scene}" --from points --to train
+    )
+  fi
 
   if [[ "${EXECUTE}" -eq 1 ]]; then
     "${PYTHON}" -m avgaussianv2.cli.audit_cam38_assets \

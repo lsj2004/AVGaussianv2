@@ -1186,6 +1186,7 @@ def _require_native_partial_resume_state(repository: Path) -> None:
             run_root=strict_root / "ftgspp" / "native",
             marker_root=protocol / "namespace_markers",
             prep_seed_record=protocol / "seed_records" / "prep.json",
+            train_seed_record=protocol / "seed_records" / "train.json",
             frame_count=EXPECTED[scene]["test_samples"],
             keyframe_stride=10,
         )
