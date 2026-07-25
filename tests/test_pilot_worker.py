@@ -162,6 +162,10 @@ def _manifest_files(
             "joint": shared["joint"],
         },
         "quick_heldout_indices": shared["quick_heldout"],
+        "config_identity": {
+            "source_config_sha256": sha256_file(config_path),
+            "runtime_config_sha256": sha256_file(config_path),
+        },
         "source_hashes": {
             "project_config_sha256": sha256_file(config_path),
             "dataset_manifest_sha256": sha256_file(config.paths.manifest),
@@ -891,6 +895,7 @@ def test_resume_rejects_changed_project_config_before_runtime_factory(tmp_path) 
     config.write_text(config.read_text().replace("embedding_dim: 8", "embedding_dim: 9"))
     payload = json.loads(manifest.read_text())
     payload["source_hashes"]["project_config_sha256"] = sha256_file(config)
+    payload["config_identity"]["runtime_config_sha256"] = sha256_file(config)
     manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     calls = []
     with pytest.raises(PilotResumeError, match="fingerprint"):

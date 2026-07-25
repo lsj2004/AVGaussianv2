@@ -164,6 +164,8 @@ def _worker(
             "device": "cuda:0",
             "scene_id": "scene1_opera",
             "config_sha256": "a" * 64,
+            "source_config_sha256": "a" * 64,
+            "runtime_config_sha256": "a" * 64,
             "manifest_sha256": "b" * 64,
             "visual_baseline_sha256": "c" * 64,
             "trusted_upstream_artifacts": False,

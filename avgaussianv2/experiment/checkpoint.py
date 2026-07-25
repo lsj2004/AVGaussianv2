@@ -1385,7 +1385,19 @@ class PilotCheckpointStore:
         if self._lock_stream is not None:
             self._lock_depth += 1
             return
-        if self.output_dir.is_symlink():
+        output_parts = self.output_dir.absolute().parts
+        inherited_output_fd = (
+            len(output_parts) == 5
+            and output_parts[0] == "/"
+            and output_parts[1] == "proc"
+            and output_parts[2].isdigit()
+            and output_parts[3] == "fd"
+            and output_parts[4].isdigit()
+            and os.environ.get("AVGAUSSIANV2_ORCHESTRATOR_PID")
+            == output_parts[2]
+            and int(output_parts[2]) == os.getppid()
+        )
+        if self.output_dir.is_symlink() and not inherited_output_fd:
             raise PilotResumeError("pilot output directory must not be a symlink")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         for path in (
@@ -1406,10 +1418,14 @@ class PilotCheckpointStore:
             self.output_dir,
             os.O_RDONLY
             | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
+            | (0 if inherited_output_fd else getattr(os, "O_NOFOLLOW", 0)),
         )
         directory_stat = os.fstat(directory_fd)
-        path_stat = self.output_dir.lstat()
+        path_stat = (
+            self.output_dir.stat()
+            if inherited_output_fd
+            else self.output_dir.lstat()
+        )
         if (
             not stat.S_ISDIR(directory_stat.st_mode)
             or (directory_stat.st_dev, directory_stat.st_ino)

@@ -366,7 +366,7 @@ def test_evaluation_rejects_registered_buffer_mutation(tmp_path) -> None:
     class MutatingEvaluator(_Evaluator):
         def evaluate(self, *args, **kwargs):
             result = super().evaluate(*args, **kwargs)
-            self.model.carrier.add_(1)
+            self.model.carrier.data.add_(1)
             return result
 
     with pytest.raises(ValueError, match="registered state mutated"):
@@ -403,3 +403,13 @@ def test_evaluation_rejects_hardlinked_lock(tmp_path) -> None:
             evaluator_factory=_Evaluator,
         )
     assert target.read_text() == "keep"
+
+
+def test_arbitrary_proc_fd_input_requires_live_orchestrator_contract(
+    monkeypatch,
+) -> None:
+    from avgaussianv2.cli.pilot_eval import _validate_orchestrator_proc_paths
+
+    monkeypatch.delenv("AVGAUSSIANV2_ORCHESTRATOR_PID", raising=False)
+    with pytest.raises(PermissionError, match="orchestrator parent contract"):
+        _validate_orchestrator_proc_paths((Path("/proc/1/fd/0"),))

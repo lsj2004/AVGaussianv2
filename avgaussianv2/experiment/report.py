@@ -82,6 +82,8 @@ _WORKER_IDENTITY_FIELDS = {
     "device",
     "scene_id",
     "config_sha256",
+    "source_config_sha256",
+    "runtime_config_sha256",
     "manifest_sha256",
     "visual_baseline_sha256",
     "trusted_upstream_artifacts",
@@ -902,7 +904,13 @@ def _validate_worker(
     if identity["scene_id"] != scene_id:
         raise ValueError(f"{system_name} worker scene mismatch")
     _text(identity["device"], f"{system_name}.worker.device")
-    for field in ("config_sha256", "manifest_sha256", "visual_baseline_sha256"):
+    for field in (
+        "config_sha256",
+        "source_config_sha256",
+        "runtime_config_sha256",
+        "manifest_sha256",
+        "visual_baseline_sha256",
+    ):
         _digest(identity[field], f"{system_name}.worker.{field}")
     if not isinstance(identity["trusted_upstream_artifacts"], bool):
         raise TypeError(
@@ -916,6 +924,8 @@ def _validate_worker(
         "stop_reason": stop_reason,
         "max_audio_to_visual_grad_norm": max(gradients),
         "config_sha256": identity["config_sha256"],
+        "source_config_sha256": identity["source_config_sha256"],
+        "runtime_config_sha256": identity["runtime_config_sha256"],
         "manifest_sha256": identity["manifest_sha256"],
         "quick_best_summary": quick_best_summary,
         "quick_visual_baseline": selector["visual_baseline"],

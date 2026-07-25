@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import json
+import os
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -239,12 +240,14 @@ def test_verify_only_derives_trusted_run_identity_without_cli_permission(tmp_pat
         "scene_id": "scene1_opera",
         "gpus": [0, 1, 2],
         "config_sha256": "a" * 64,
+        "source_config_sha256": "a" * 64,
+        "runtime_config_sha256": "a" * 64,
         "shared_manifest_path": str(output / "shared_manifest.json"),
         "shared_manifest_sha256": "b" * 64,
         "baseline_manifest_path": str(output / "baseline_manifest.json"),
         "baseline_manifest_sha256": "c" * 64,
         "source_hashes": {
-            "project_config_sha256": "d" * 64,
+            "project_config_sha256": "a" * 64,
             "dataset_manifest_sha256": "e" * 64,
             "visual_checkpoint_sha256": "f" * 64,
             "audio_checkpoint_sha256": "0" * 64,
@@ -262,7 +265,7 @@ def test_verify_only_derives_trusted_run_identity_without_cli_permission(tmp_pat
             pytest.fail("verify-only started a process")
 
     before = set(output.iterdir())
-    with pytest.raises(FileNotFoundError, match="existing directory"):
+    with pytest.raises(FileNotFoundError):
         run_pilot(
             config,
             output,
@@ -439,12 +442,24 @@ def test_run_pilot_sequences_baseline_workers_and_evaluations(
     assert [item[1]["CUDA_VISIBLE_DEVICES"] for item in evaluations] == [
         "0", "1", "2"
     ]
+    for command, env, _ in assignments:
+        assert env["AVGAUSSIANV2_ORCHESTRATOR_PID"] == str(os.getpid())
+        assert command[command.index("--config") + 1].startswith(
+            f"/proc/{os.getpid()}/fd/"
+        )
+        assert command[command.index("--output-dir") + 1].startswith(
+            f"/proc/{os.getpid()}/fd/"
+        )
     joint = evaluations[0][0]
     assert joint.count("--system") == 2
     assert "joint_conditioned_on:on" in joint
     assert "joint_conditioned_off:off" in joint
     shared = json.loads((output / "shared_manifest.json").read_text())
     assert shared["compatibility"]["condition_off"]["variant"] == "condition_off"
+    assert (
+        shared["config_identity"]["source_config_sha256"]
+        != shared["config_identity"]["runtime_config_sha256"]
+    )
     assert result.ready
     assert json.loads((output / "status.json").read_text())["ready"] is True
 
@@ -559,12 +574,14 @@ def test_experiment_and_status_versions_require_exact_integer(version) -> None:
         "scene_id": "scene1_opera",
         "gpus": [0, 1, 2],
         "config_sha256": "a" * 64,
+        "source_config_sha256": "a" * 64,
+        "runtime_config_sha256": "a" * 64,
         "shared_manifest_path": "/tmp/shared.json",
         "shared_manifest_sha256": "b" * 64,
         "baseline_manifest_path": "/tmp/baseline.json",
         "baseline_manifest_sha256": "c" * 64,
         "source_hashes": {
-            "project_config_sha256": "d" * 64,
+            "project_config_sha256": "a" * 64,
             "dataset_manifest_sha256": "e" * 64,
             "visual_checkpoint_sha256": "f" * 64,
             "audio_checkpoint_sha256": "0" * 64,

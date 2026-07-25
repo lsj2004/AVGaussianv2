@@ -55,6 +55,7 @@ _ROOT_FIELDS = {
     "pilot_config",
     "shared_indices",
     "quick_heldout_indices",
+    "config_identity",
     "source_hashes",
     "compatibility",
     "component_identities",
@@ -332,6 +333,8 @@ class WorkerManifest:
     pilot_config: PilotConfig
     shared_indices: SharedIndices
     quick_heldout_indices: tuple[int, ...]
+    source_config_sha256: str
+    runtime_config_sha256: str
     source_hashes: dict[str, str]
     compatibility: dict[Variant, PilotCompatibility]
     component_identities: dict[str, str]
@@ -409,6 +412,19 @@ def load_worker_manifest(
     if len(set(heldout)) != len(heldout):
         raise ValueError("quick held-out indices must not contain duplicates")
 
+    config_identity = _exact(
+        raw["config_identity"],
+        {"source_config_sha256", "runtime_config_sha256"},
+        "config_identity",
+    )
+    source_config_sha256 = _digest(
+        config_identity["source_config_sha256"],
+        "config_identity.source_config_sha256",
+    )
+    runtime_config_sha256 = _digest(
+        config_identity["runtime_config_sha256"],
+        "config_identity.runtime_config_sha256",
+    )
     hashes_raw = _exact(raw["source_hashes"], _SOURCE_HASH_FIELDS, "source_hashes")
     source_hashes = {
         name: _digest(hashes_raw[name], f"source_hashes.{name}")
@@ -441,6 +457,8 @@ def load_worker_manifest(
     for name, actual in actual_hashes.items():
         if source_hashes[name] != actual:
             raise ValueError(f"{labels[name]} hash mismatch")
+    if runtime_config_sha256 != source_hashes["project_config_sha256"]:
+        raise ValueError("runtime config identity/hash mismatch")
 
     compatibility_raw = _exact(
         raw["compatibility"], {item.value for item in Variant}, "compatibility"
@@ -525,6 +543,8 @@ def load_worker_manifest(
         pilot_config=pilot,
         shared_indices=shared,
         quick_heldout_indices=heldout,
+        source_config_sha256=source_config_sha256,
+        runtime_config_sha256=runtime_config_sha256,
         source_hashes=source_hashes,
         compatibility=compatibilities,
         component_identities=identities,
@@ -949,6 +969,7 @@ def verify_worker_output(
         summary["worker"],
         {
             "variant", "device", "scene_id", "config_sha256",
+            "source_config_sha256", "runtime_config_sha256",
             "manifest_sha256", "visual_baseline_sha256",
             "trusted_upstream_artifacts",
         },
@@ -958,6 +979,8 @@ def verify_worker_output(
         "variant": resolved_variant.value,
         "scene_id": manifest.scene_id,
         "config_sha256": manifest.source_hashes["project_config_sha256"],
+        "source_config_sha256": manifest.source_config_sha256,
+        "runtime_config_sha256": manifest.runtime_config_sha256,
         "manifest_sha256": manifest.sha256,
         "visual_baseline_sha256": manifest.visual_baseline_sha256,
         "trusted_upstream_artifacts": trust_upstream_artifacts,
@@ -1262,6 +1285,8 @@ def _run_worker_locked(
         "device": str(device),
         "scene_id": manifest.scene_id,
         "config_sha256": manifest.source_hashes["project_config_sha256"],
+        "source_config_sha256": manifest.source_config_sha256,
+        "runtime_config_sha256": manifest.runtime_config_sha256,
         "manifest_sha256": manifest.sha256,
         "visual_baseline_sha256": manifest.visual_baseline_sha256,
         "trusted_upstream_artifacts": trust_upstream_artifacts,
@@ -1293,6 +1318,16 @@ def run_worker(
         validate_device(device) if isinstance(device, str) else torch.device(device)
     )
     config_source = Path(config_path)
+    from avgaussianv2.cli.pilot_eval import _validate_orchestrator_proc_paths
+
+    _validate_orchestrator_proc_paths(
+        (
+            config_source,
+            Path(shared_indices_path),
+            Path(visual_baseline_path),
+            Path(output_dir),
+        )
+    )
     config_bytes = _read_bounded_regular_bytes(
         config_source, MAX_SMALL_INPUT_BYTES
     )

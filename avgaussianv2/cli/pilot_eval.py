@@ -101,6 +101,35 @@ def _json_absolute_path(value: object, name: str) -> Path:
     return result
 
 
+def _validate_orchestrator_proc_paths(paths: Sequence[Path | None]) -> None:
+    inherited_pids: set[int] = set()
+    for candidate in paths:
+        if candidate is None:
+            continue
+        parts = candidate.absolute().parts
+        if (
+            len(parts) >= 5
+            and parts[0] == "/"
+            and parts[1] == "proc"
+            and parts[2].isdigit()
+            and parts[3] == "fd"
+            and parts[4].isdigit()
+        ):
+            inherited_pids.add(int(parts[2]))
+    if not inherited_pids:
+        return
+    expected_text = os.environ.get("AVGAUSSIANV2_ORCHESTRATOR_PID")
+    if (
+        expected_text is None
+        or not expected_text.isdigit()
+        or inherited_pids != {int(expected_text)}
+        or int(expected_text) != os.getppid()
+    ):
+        raise PermissionError(
+            "inherited /proc fd paths require the active orchestrator parent contract"
+        )
+
+
 def _strict_json_equal(left: object, right: object) -> bool:
     if type(left) is not type(right):
         return False
@@ -215,7 +244,16 @@ def _snapshot(path: Path) -> SourceSnapshot:
     original = path.lstat()
     if stat.S_ISLNK(original.st_mode) or not stat.S_ISREG(original.st_mode):
         raise ValueError(f"source must be a non-symlink regular file: {path}")
-    resolved = path.resolve(strict=True)
+    parts = path.absolute().parts
+    inherited_parent_fd_path = (
+        len(parts) >= 6
+        and parts[0] == "/"
+        and parts[1] == "proc"
+        and parts[2].isdigit()
+        and parts[3] == "fd"
+        and parts[4].isdigit()
+    )
+    resolved = path.absolute() if inherited_parent_fd_path else path.resolve(strict=True)
     metadata = resolved.lstat()
     return SourceSnapshot(
         resolved,
@@ -272,6 +310,27 @@ def _strict_json(path: Path) -> Mapping[str, object]:
 
 
 def _preflight_output(output: Path, *, resume: bool, overwrite: bool) -> None:
+    parts = output.absolute().parts
+    inherited_fd_root = (
+        len(parts) == 5
+        and parts[0] == "/"
+        and parts[1] == "proc"
+        and parts[2].isdigit()
+        and parts[3] == "fd"
+        and parts[4].isdigit()
+    )
+    if inherited_fd_root:
+        descriptor = os.open(output, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            entries = [
+                name for name in os.listdir(descriptor)
+                if name != ".evaluation.lock"
+            ]
+        finally:
+            os.close(descriptor)
+        if entries and not (resume or overwrite):
+            raise FileExistsError(f"evaluation output is nonempty: {output}")
+        return
     current = Path(output.anchor)
     for part in output.parts[1:-1]:
         current /= part
@@ -599,11 +658,18 @@ def _verify_existing(
 
 
 def _clean_owned_partial(output: Path, specs: Sequence[EvaluationSpec]) -> None:
+    inherited_fd_root = (
+        len(output.absolute().parts) == 5
+        and output.absolute().parts[1] == "proc"
+        and output.absolute().parts[2].isdigit()
+        and output.absolute().parts[3] == "fd"
+        and output.absolute().parts[4].isdigit()
+    )
     output_fd = os.open(
         output,
         os.O_RDONLY
         | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
+        | (0 if inherited_fd_root else getattr(os, "O_NOFOLLOW", 0)),
     )
     system_fds: dict[str, tuple[int, tuple[str, ...]]] = {}
     root_temps: list[str] = []
@@ -722,8 +788,7 @@ def _registered_state_identity(model: object) -> tuple[tuple[object, ...], ...]:
         if not callable(iterator):
             continue
         for name, tensor in iterator():
-            records.append(
-                (
+            record: tuple[object, ...] = (
                     kind,
                     name,
                     id(tensor),
@@ -732,8 +797,20 @@ def _registered_state_identity(model: object) -> tuple[tuple[object, ...], ...]:
                     str(tensor.dtype),
                     str(tensor.device),
                     int(getattr(tensor, "_version", -1)),
-                )
             )
+            if kind == "buffer":
+                import torch
+
+                raw = (
+                    tensor.detach()
+                    .contiguous()
+                    .view(torch.uint8)
+                    .cpu()
+                    .numpy()
+                    .tobytes()
+                )
+                record = (*record, hashlib.sha256(raw).hexdigest())
+            records.append(record)
     return tuple(records)
 
 
@@ -891,6 +968,14 @@ def run_evaluation(
             raise ValueError(f"CUDA device is unavailable: {device}")
 
     config_source = Path(config_path)
+    _validate_orchestrator_proc_paths(
+        (
+            config_source,
+            None if checkpoint is None else Path(checkpoint),
+            None if manifest is None else Path(manifest),
+            Path(output_dir),
+        )
+    )
     config_snapshot = _snapshot(config_source)
     config_source = config_snapshot.path
     config_bytes = _read_regular(config_snapshot.path)

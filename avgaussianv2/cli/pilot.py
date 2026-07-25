@@ -72,6 +72,7 @@ EVAL_SPECS = {
 }
 _EXPERIMENT_FIELDS = {
     "schema", "version", "scene_id", "gpus", "config_sha256",
+    "source_config_sha256", "runtime_config_sha256",
     "shared_manifest_path", "shared_manifest_sha256",
     "baseline_manifest_path", "baseline_manifest_sha256", "source_hashes",
     "trusted_upstream_artifacts",
@@ -237,7 +238,8 @@ def _validate_experiment_types(value: object) -> Mapping[str, object]:
     if type(value["trusted_upstream_artifacts"]) is not bool:
         raise TypeError("experiment trusted_upstream_artifacts must be boolean")
     for name in (
-        "config_sha256", "shared_manifest_sha256", "baseline_manifest_sha256"
+        "config_sha256", "source_config_sha256", "runtime_config_sha256",
+        "shared_manifest_sha256", "baseline_manifest_sha256"
     ):
         digest = value[name]
         if (
@@ -269,6 +271,11 @@ def _validate_experiment_types(value: object) -> Mapping[str, object]:
             or any(char not in "0123456789abcdef" for char in digest)
         ):
             raise ValueError(f"experiment source_hashes.{name} is invalid")
+    if (
+        value["config_sha256"] != value["runtime_config_sha256"]
+        or sources["project_config_sha256"] != value["runtime_config_sha256"]
+    ):
+        raise ValueError("experiment runtime config hashes are inconsistent")
     return value
 
 
@@ -460,6 +467,124 @@ def _atomic_bytes(path: Path, data: bytes) -> None:
         if descriptor >= 0:
             os.close(descriptor)
         temporary.unlink(missing_ok=True)
+
+
+def _canonical_config_bytes(
+    original: bytes, config: object
+) -> bytes:
+    import yaml
+
+    value = yaml.safe_load(original)
+    if not isinstance(value, dict) or not isinstance(value.get("paths"), dict):
+        raise ValueError("project config must contain a paths mapping")
+    for name in (
+        "visual_upstream_root",
+        "audio_upstream_root",
+        "visual_checkpoint",
+        "audio_checkpoint",
+        "manifest",
+    ):
+        value["paths"][name] = str(getattr(config.paths, name).resolve(strict=True))
+    if config.paths.visual_memmap is not None:
+        value["paths"]["visual_memmap"] = str(
+            config.paths.visual_memmap.resolve(strict=True)
+        )
+    return yaml.safe_dump(value, sort_keys=True).encode("utf-8")
+
+
+def _open_config_snapshot(
+    output_fd: int,
+    output: Path,
+    content: bytes,
+    *,
+    create: bool,
+) -> tuple[int, int, Path, tuple[int, int, int, int]]:
+    inputs_fd, inputs_path, _ = _open_secure_child_directory(
+        output_fd, output, ".orchestrator-inputs", create=create
+    )
+    name = "project_config.yaml"
+    if not create:
+        existing = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=inputs_fd,
+        )
+        metadata = os.fstat(existing)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or os.read(existing, len(content) + 1) != content
+        ):
+            os.close(existing)
+            os.close(inputs_fd)
+            raise ValueError("pinned project config snapshot mismatch")
+        os.lseek(existing, 0, os.SEEK_SET)
+        config_fd = existing
+    else:
+        try:
+            descriptor = os.open(
+                name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o400,
+                dir_fd=inputs_fd,
+            )
+        except FileExistsError:
+            existing = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=inputs_fd,
+            )
+            metadata = os.fstat(existing)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or os.read(existing, len(content) + 1) != content
+            ):
+                os.close(existing)
+                os.close(inputs_fd)
+                raise ValueError("pinned project config snapshot mismatch")
+            os.lseek(existing, 0, os.SEEK_SET)
+            config_fd = existing
+        else:
+            try:
+                remaining = memoryview(content)
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    if written <= 0:
+                        raise OSError("short write while pinning project config")
+                    remaining = remaining[written:]
+                os.fsync(descriptor)
+                os.fchmod(descriptor, 0o400)
+            finally:
+                os.close(descriptor)
+            os.fsync(inputs_fd)
+            config_fd = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=inputs_fd,
+            )
+    metadata = os.fstat(config_fd)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_mode & 0o222
+    ):
+        os.close(config_fd)
+        os.close(inputs_fd)
+        raise ValueError("pinned project config must be single-link regular")
+    identity = (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+    child_path = Path(
+        f"/proc/{os.getpid()}/fd/{inputs_fd}/{name}"
+    )
+    return inputs_fd, config_fd, child_path, identity
 
 
 def _stage_status(
@@ -654,6 +779,7 @@ class _FailedStartHandle:
 def _command_env(gpu: int) -> dict[str, str]:
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    env["AVGAUSSIANV2_ORCHESTRATOR_PID"] = str(os.getpid())
     return env
 
 
@@ -671,6 +797,7 @@ def _worker_manifest(
     *,
     config: object,
     config_bytes: bytes,
+    source_config_sha256: str,
     pilot: PilotConfig,
     shared: SharedIndices,
     heldout: tuple[int, ...],
@@ -705,6 +832,10 @@ def _worker_manifest(
         "pilot_config": asdict(pilot),
         "shared_indices": asdict(shared),
         "quick_heldout_indices": list(heldout),
+        "config_identity": {
+            "source_config_sha256": source_config_sha256,
+            "runtime_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        },
         "source_hashes": hashes,
         "compatibility": compatibilities,
         "component_identities": build_worker_component_identities(
@@ -822,6 +953,7 @@ def run_pilot(
         )
     requested_config = Path(config_path)
     config_bytes = _read_regular(requested_config)
+    source_config_sha256 = hashlib.sha256(config_bytes).hexdigest()
     config_source = requested_config.resolve(strict=True)
     config = load_project_config_bytes(config_bytes, base_dir=config_source.parent)
     if config.scene.scene_id != "scene1_opera":
@@ -868,6 +1000,23 @@ def run_pilot(
         | getattr(os, "O_DIRECTORY", 0)
         | getattr(os, "O_NOFOLLOW", 0),
     )
+    canonical_config = _canonical_config_bytes(config_bytes, config)
+    try:
+        (
+            inputs_fd,
+            pinned_config_fd,
+            config_source,
+            pinned_config_identity,
+        ) = _open_config_snapshot(
+            output_fd,
+            output,
+            canonical_config,
+            create=not verify_only,
+        )
+    except BaseException:
+        os.close(output_fd)
+        raise
+    config_bytes = canonical_config
     try:
         lock_fd = os.open(
             ".pilot-orchestrator.lock",
@@ -879,6 +1028,8 @@ def run_pilot(
             dir_fd=output_fd,
         )
     except BaseException:
+        os.close(pinned_config_fd)
+        os.close(inputs_fd)
         os.close(output_fd)
         raise
     child_directory_fds: list[tuple[int, Path, tuple[int, int]]] = []
@@ -914,9 +1065,47 @@ def run_pilot(
         logs = child_directory_fds[0][1]
         workers_root = child_directory_fds[1][1]
         eval_root = child_directory_fds[2][1]
+        logs = Path(f"/proc/self/fd/{child_directory_fds[0][0]}")
+        baseline_entry = _open_secure_child_directory(
+            output_fd,
+            output,
+            "baseline",
+            create=not verify_only,
+        )
+        child_directory_fds.append(baseline_entry)
+        baseline_dir = Path(f"/proc/self/fd/{baseline_entry[0]}")
+        baseline_child_dir = Path(
+            f"/proc/{os.getpid()}/fd/{baseline_entry[0]}"
+        )
+        worker_dirs: dict[Variant, tuple[Path, Path]] = {}
+        evaluation_dirs: dict[Variant, tuple[Path, Path]] = {}
+        workers_fd = child_directory_fds[1][0]
+        evaluations_fd = child_directory_fds[2][0]
+        for variant in VARIANT_GPU_ORDER:
+            worker_entry = _open_secure_child_directory(
+                workers_fd,
+                workers_root,
+                variant.value,
+                create=not verify_only,
+            )
+            child_directory_fds.append(worker_entry)
+            worker_dirs[variant] = (
+                Path(f"/proc/self/fd/{worker_entry[0]}"),
+                Path(f"/proc/{os.getpid()}/fd/{worker_entry[0]}"),
+            )
+            evaluation_entry = _open_secure_child_directory(
+                evaluations_fd,
+                eval_root,
+                variant.value,
+                create=not verify_only,
+            )
+            child_directory_fds.append(evaluation_entry)
+            evaluation_dirs[variant] = (
+                Path(f"/proc/self/fd/{evaluation_entry[0]}"),
+                Path(f"/proc/{os.getpid()}/fd/{evaluation_entry[0]}"),
+            )
 
         baseline_specs = (EvaluationSpec("baseline_imported", False),)
-        baseline_dir = output / "baseline"
         baseline_manifest = baseline_dir / "evaluation_manifest.json"
         baseline_launched = False
         if not baseline_manifest.exists():
@@ -926,13 +1115,14 @@ def run_pilot(
                 python, "-m", "avgaussianv2.cli.pilot_eval",
                 "--config", str(config_source),
                 "--system", "baseline_imported:off",
-                "--output-dir", str(baseline_dir),
+                "--output-dir", str(baseline_child_dir),
                 "--device", "cuda:0",
             ]
             if trust_upstream_artifacts:
                 command.append("--trust-upstream-artifacts")
             if resume and baseline_dir.exists():
                 command.append("--resume")
+            if resume:
                 _stage_status(
                     output,
                     baseline="mutating",
@@ -987,6 +1177,7 @@ def run_pilot(
                 _worker_manifest(
                     config=config,
                     config_bytes=config_bytes,
+                    source_config_sha256=source_config_sha256,
                     pilot=pilot,
                     shared=shared,
                     heldout=heldout,
@@ -1021,6 +1212,8 @@ def run_pilot(
             "scene_id": config.scene.scene_id,
             "gpus": list(gpus),
             "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+            "source_config_sha256": source_config_sha256,
+            "runtime_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
             "shared_manifest_path": str(shared_path.resolve()),
             "shared_manifest_sha256": loaded.sha256,
             "baseline_manifest_path": str(baseline_manifest.resolve()),
@@ -1043,7 +1236,7 @@ def run_pilot(
         verified_workers: dict[Variant, object] = {}
         resumed_variants: set[Variant] = set()
         for variant, gpu in zip(VARIANT_GPU_ORDER, gpus, strict=True):
-            worker_dir = workers_root / variant.value
+            worker_dir, worker_child_dir = worker_dirs[variant]
             has_entries = worker_dir.is_dir() and any(worker_dir.iterdir())
             if has_entries:
                 try:
@@ -1077,7 +1270,7 @@ def run_pilot(
                 "--variant", variant.value,
                 "--shared-indices", str(shared_path),
                 "--visual-baseline", str(visual_baseline),
-                "--output-dir", str(worker_dir),
+                "--output-dir", str(worker_child_dir),
                 "--device", "cuda:0",
             ]
             if resume and has_entries:
@@ -1107,7 +1300,7 @@ def run_pilot(
                 config_source,
                 shared_path,
                 visual_baseline,
-                workers_root / variant.value,
+                worker_dirs[variant][0],
                 variant,
                 trust_upstream_artifacts=effective_trust,
             )
@@ -1123,7 +1316,7 @@ def run_pilot(
         eval_jobs: dict[Variant, EvaluationJobResult] = {}
         pending: list[LaunchSpec] = []
         for variant, gpu in zip(VARIANT_GPU_ORDER, gpus, strict=True):
-            destination = eval_root / variant.value
+            destination, child_destination = evaluation_dirs[variant]
             specs = EVAL_SPECS[variant]
             replace_stale = variant in resumed_variants
             if (
@@ -1143,10 +1336,10 @@ def run_pilot(
             command = [
                 python, "-m", "avgaussianv2.cli.pilot_eval",
                 "--config", str(config_source),
-                "--checkpoint", str(workers_root / variant.value / "best.pt"),
+                "--checkpoint", str(worker_dirs[variant][1] / "best.pt"),
                 "--manifest", str(shared_path),
                 "--variant", variant.value,
-                "--output-dir", str(destination),
+                "--output-dir", str(child_destination),
                 "--device", "cuda:0",
             ]
             for spec in specs:
@@ -1178,7 +1371,7 @@ def run_pilot(
                 _verify_directory_identity(descriptor, path, identity)
             for variant in VARIANT_GPU_ORDER:
                 eval_jobs[variant] = _verify_existing(
-                    eval_root / variant.value,
+                    evaluation_dirs[variant][0],
                     EVAL_SPECS[variant],
                     config_path=config_source,
                     shared_manifest=shared_path,
@@ -1195,6 +1388,14 @@ def run_pilot(
 
         if _read_regular(config_source) != config_bytes:
             raise ValueError("project config changed during orchestration")
+        current_config = os.fstat(pinned_config_fd)
+        if (
+            current_config.st_dev,
+            current_config.st_ino,
+            current_config.st_size,
+            current_config.st_mtime_ns,
+        ) != pinned_config_identity:
+            raise ValueError("pinned project config identity changed")
         if _source_hashes(config_bytes, config) != desired_shared["source_hashes"]:
             raise ValueError("upstream source changed during orchestration")
         if load_worker_manifest(
@@ -1234,24 +1435,36 @@ def run_pilot(
             and not baseline_launched
             and not worker_specs
             and not pending
-            and (output / "report" / "current").is_symlink()
         ):
-            comparison = verify_current_comparison(
-                report_inputs, output / "report"
-            )
-            status_valid = False
+            complete_status = False
+            status: Mapping[str, object] | None = None
             try:
                 status = _validate_complete_status(
                     json.loads(_read_regular(output / "status.json").decode())
                 )
+                complete_status = True
+            except (FileNotFoundError, TypeError, ValueError, json.JSONDecodeError):
+                complete_status = False
+            try:
+                comparison = verify_current_comparison(
+                    report_inputs, output / "report"
+                )
+            except (FileNotFoundError, TypeError, ValueError):
+                if complete_status:
+                    raise
+                comparison = _build_report(
+                    output, baseline_job, eval_jobs, verified_workers
+                )
+            status_valid = False
+            if complete_status and status is not None:
                 status_valid = (
                     status["report_digest"] == comparison.content_digest
                     and status["ready"] is comparison.decision.ready
                     and status["durability_warnings"]
                     == list(comparison.durability_warnings)
                 )
-            except (FileNotFoundError, TypeError, ValueError, json.JSONDecodeError):
-                status_valid = False
+                if not status_valid:
+                    raise ValueError("completed resume status/report mismatch")
             if not status_valid:
                 _stage_status(
                     output,
@@ -1293,6 +1506,8 @@ def run_pilot(
         os.close(lock_fd)
         for descriptor, _, _ in child_directory_fds:
             os.close(descriptor)
+        os.close(pinned_config_fd)
+        os.close(inputs_fd)
         os.close(output_fd)
 
 
