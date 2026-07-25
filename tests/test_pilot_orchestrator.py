@@ -22,6 +22,7 @@ from avgaussianv2.cli.pilot import (
     parse_gpus,
     run_pilot,
 )
+from avgaussianv2.cli.pilot_eval import EvaluationSpec
 from avgaussianv2.cli.pilot_worker import build_worker_component_identities
 from avgaussianv2.experiment.contracts import PilotConfig, Variant
 
@@ -212,20 +213,30 @@ def test_expired_proc_checkpoint_provenance_is_a_targeted_migration(
 
     manifest = tmp_path / "evaluation_manifest.json"
     manifest.write_text(json.dumps({
+        "schema": "avgaussianv2.pilot-evaluation-job",
+        "version": 1,
+        "scene_id": "scene1_opera",
+        "condition_specs": [{
+            "system_name": "condition_off",
+            "condition_enabled": False,
+        }],
         "systems": [{
+            "system_name": "condition_off",
+            "condition_enabled": False,
             "checkpoint": {
                 "checkpoint_path": "/proc/999999999/fd/47/best.pt"
             }
         }]
     }))
-    assert _has_expired_proc_checkpoint_provenance(manifest)
+    specs = (EvaluationSpec("condition_off", False),)
+    assert _has_expired_proc_checkpoint_provenance(manifest, specs)
 
     payload = json.loads(manifest.read_text())
     payload["systems"][0]["checkpoint"]["checkpoint_path"] = str(
         tmp_path / "missing.pt"
     )
     manifest.write_text(json.dumps(payload))
-    assert not _has_expired_proc_checkpoint_provenance(manifest)
+    assert not _has_expired_proc_checkpoint_provenance(manifest, specs)
 
 
 def _verify_config(tmp_path):
@@ -506,6 +517,14 @@ def test_run_pilot_sequences_baseline_workers_and_evaluations(
     ]
     assert len(relaunched) == 3
     assert all("--resume" not in item[0] for item in relaunched)
+    reevaluated = [
+        item
+        for item in assignments[starts_before:]
+        if item[0][2] == "avgaussianv2.cli.pilot_eval"
+        and "--checkpoint" in item[0]
+    ]
+    assert len(reevaluated) == 3
+    assert all("--overwrite" in item[0] for item in reevaluated)
 
     starts_before = len(assignments)
     tree_before = {

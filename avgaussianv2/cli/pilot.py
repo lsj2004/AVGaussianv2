@@ -28,6 +28,8 @@ from typing import Protocol
 from avgaussianv2.cli.pilot_eval import (
     EvaluationJobResult,
     EvaluationSpec,
+    JOB_SCHEMA,
+    JOB_VERSION,
     _verify_existing,
 )
 from avgaussianv2.cli.pilot_worker import (
@@ -219,11 +221,38 @@ def _strict_json_equal(left: object, right: object) -> bool:
     return left == right
 
 
-def _has_expired_proc_checkpoint_provenance(manifest_path: Path) -> bool:
+def _has_expired_proc_checkpoint_provenance(
+    manifest_path: Path,
+    specs: Sequence[EvaluationSpec],
+) -> bool:
     """Recognize the pre-fix evaluation manifest migration case only."""
     try:
         payload = json.loads(_read_regular(manifest_path).decode())
         systems = payload["systems"]
+        expected = [
+            {
+                "system_name": spec.system_name,
+                "condition_enabled": spec.condition_enabled,
+            }
+            for spec in specs
+        ]
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("schema") != JOB_SCHEMA
+            or type(payload.get("version")) is not int
+            or payload["version"] != JOB_VERSION
+            or payload.get("scene_id") != "scene1_opera"
+            or payload.get("condition_specs") != expected
+            or not isinstance(systems, list)
+            or [
+                {
+                    "system_name": item["system_name"],
+                    "condition_enabled": item["condition_enabled"],
+                }
+                for item in systems
+            ] != expected
+        ):
+            return False
         paths = [
             Path(item["checkpoint"]["checkpoint_path"])
             for item in systems
@@ -1303,8 +1332,9 @@ def run_pilot(
                 "--output-dir", str(worker_child_dir),
                 "--device", "cuda:0",
             ]
-            if resume and has_entries:
-                command.append("--resume")
+            if resume:
+                if has_entries:
+                    command.append("--resume")
                 resumed_variants.add(variant)
             if trust_upstream_artifacts:
                 command.append("--trust-upstream-artifacts")
@@ -1365,7 +1395,9 @@ def run_pilot(
                     manifest_path = destination / "evaluation_manifest.json"
                     if not (
                         resume
-                        and _has_expired_proc_checkpoint_provenance(manifest_path)
+                        and _has_expired_proc_checkpoint_provenance(
+                            manifest_path, specs
+                        )
                     ):
                         raise
                     replace_stale = True
