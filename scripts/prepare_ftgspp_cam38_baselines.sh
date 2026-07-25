@@ -7,17 +7,23 @@ SAMPLED_ROOT="/mnt/sda/lisujing/Dataset/Sampled_data/v5_0630_dynerf"
 PYTHON="${AVGAUSSIANV2_PYTHON:-${ROOT}/.venv/bin/python}"
 EXECUTE=0
 PREFLIGHT_ONLY=0
+RESUME=0
 SCENE_FILTER=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --execute) EXECUTE=1; shift ;;
     --preflight-only) PREFLIGHT_ONLY=1; shift ;;
+    --resume) RESUME=1; shift ;;
     --scene) SCENE_FILTER="${2:-}"; shift 2 ;;
-    *) echo "usage: $0 [--execute] [--preflight-only] [--scene scene1_opera|Scene7playing]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--execute] [--preflight-only] [--resume] [--scene scene1_opera|Scene7playing]" >&2; exit 2 ;;
   esac
 done
 if [[ "${EXECUTE}" -eq 1 && "${PREFLIGHT_ONLY}" -eq 1 ]]; then
   echo "--execute and --preflight-only are mutually exclusive" >&2
+  exit 2
+fi
+if [[ "${RESUME}" -eq 1 && "${EXECUTE}" -ne 1 ]]; then
+  echo "--resume requires --execute" >&2
   exit 2
 fi
 if [[ -n "${SCENE_FILTER}" && "${SCENE_FILTER}" != "scene1_opera" && "${SCENE_FILTER}" != "Scene7playing" ]]; then
@@ -93,9 +99,31 @@ prepare_scene() {
   local marker_root="${ROOT}/runs/cam38_strict/${scene}/protocol/namespace_markers"
   local seed_root="${ROOT}/runs/cam38_strict/${scene}/protocol/seed_records"
   local seeded_wrapper="${ROOT}/avgaussianv2/cli/run_seeded_ftgspp.py"
+  local flow_complete=0
+  local resume_report=""
 
   echo "Train-only source for ${scene}: cam00..cam37; cam38 RGB is not linked."
-  if [[ "${EXECUTE}" -eq 1 ]]; then
+  if [[ "${RESUME}" -eq 1 ]]; then
+    resume_report="$("${PYTHON}" -m avgaussianv2.cli.audit_cam38_assets \
+      --config "${config}" \
+      --ftgspp-train-source "${train_source}" \
+      --allowed-sampled-root "${source}" \
+      --ftgspp-template "${template}" \
+      --ftgspp-output "${generated_config}" \
+      --repo-root "${ROOT}" \
+      --ftgspp-root "${FTGSPP_ROOT}" \
+      --ftgspp-run-root "${run_root}" \
+      --ftgspp-marker-root "${marker_root}" \
+      --ftgspp-seed-record "${seed_root}/prep.json" \
+      --audit-ftgspp-resume)"
+    printf '%s\n' "${resume_report}"
+    if [[ "${resume_report}" == *'"complete": true'* ]]; then
+      flow_complete=1
+      echo "Resume audit: complete flow cache will be reused for ${scene}."
+    else
+      echo "Resume audit: valid partial flow cache will be continued for ${scene}."
+    fi
+  elif [[ "${EXECUTE}" -eq 1 ]]; then
     mkdir -p "${train_source}"
     for index in {0..37}; do
       camera="$(printf 'cam%02d' "${index}")"
@@ -125,23 +153,30 @@ prepare_scene() {
     echo "safe Python render+audit: ${template} -> ${generated_config}"
   fi
 
-  (
-    cd "${FTGSPP_ROOT}"
-    run_command env CUDA_VISIBLE_DEVICES="${PHYSICAL_GPU}" \
-      PYTHONHASHSEED=42 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
-      .venv/bin/python "${seeded_wrapper}" \
-      --seed 42 --record "${seed_root}/prep.json" \
-      --script "${FTGSPP_ROOT}/run" -- dynerf \
-      "${generated_config_dir}" \
-      "${run_root}" \
-      --scenes "${scene}" --from extract --to prep
-    run_command env CUDA_VISIBLE_DEVICES="${PHYSICAL_GPU}" \
-      PYTHONHASHSEED=42 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
-      .venv/bin/python "${seeded_wrapper}" \
-      --seed 42 --record "${seed_root}/flow.json" \
-      --module ftgspp.data.flow -- \
-      "${generated_config}" --cameras 0-37 --device "${LOCAL_DEVICE}"
-  )
+  if [[ "${RESUME}" -ne 1 ]]; then
+    (
+      cd "${FTGSPP_ROOT}"
+      run_command env CUDA_VISIBLE_DEVICES="${PHYSICAL_GPU}" \
+        PYTHONHASHSEED=42 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+        .venv/bin/python "${seeded_wrapper}" \
+        --seed 42 --record "${seed_root}/prep.json" \
+        --script "${FTGSPP_ROOT}/run" -- dynerf \
+        "${generated_config_dir}" \
+        "${run_root}" \
+        --scenes "${scene}" --from extract --to prep
+    )
+  fi
+  if [[ "${flow_complete}" -ne 1 ]]; then
+    (
+      cd "${FTGSPP_ROOT}"
+      run_command env CUDA_VISIBLE_DEVICES="${PHYSICAL_GPU}" \
+        PYTHONHASHSEED=42 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+        .venv/bin/python "${seeded_wrapper}" \
+        --seed 42 --record "${seed_root}/flow.json" \
+        --module ftgspp.data.flow -- \
+        "${generated_config}" --cameras 0-37 --device "${LOCAL_DEVICE}"
+    )
+  fi
 
   if [[ "${EXECUTE}" -eq 1 ]]; then
     "${PYTHON}" -m avgaussianv2.cli.audit_cam38_assets \

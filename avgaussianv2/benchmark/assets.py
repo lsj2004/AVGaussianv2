@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import tempfile
+import zipfile
 from collections.abc import Mapping, Sequence
 from itertools import pairwise
 from pathlib import Path
@@ -756,13 +758,9 @@ def prepare_fresh_ftgspp_namespaces(
             temporary.unlink(missing_ok=True)
 
 
-def audit_ftgspp_flow_cache(
-    path: str | Path,
-    *,
-    frame_count: int,
-    keyframe_stride: int,
-) -> dict[str, Any]:
-    """Require valid bidirectional UFM flow for every train camera and pair."""
+def _ftgspp_flow_items(
+    frame_count: int, keyframe_stride: int
+) -> tuple[list[tuple[int, int]], list[tuple[str, str, int, int, int]]]:
     if frame_count <= 1 or keyframe_stride <= 0:
         raise AssetAuditError("flow frame_count/stride are invalid")
     keyframes = list(range(0, frame_count, keyframe_stride))
@@ -770,63 +768,336 @@ def audit_ftgspp_flow_cache(
         keyframes.append(frame_count - 1)
     forward = list(pairwise(keyframes))
     pairs = [*forward, *((right, left) for left, right in forward)]
+    items = [
+        (
+            f"f{left:06d}_f{right:06d}",
+            f"c{camera:03d}.npz",
+            left,
+            right,
+            camera,
+        )
+        for left, right in pairs
+        for camera in range(38)
+    ]
+    return pairs, items
+
+
+def _audit_ftgspp_flow_file(
+    flow_path: Path, *, left: int, right: int, camera: int
+) -> None:
+    metadata = _secure_regular_metadata(flow_path, str(flow_path))
+    descriptor = os.open(
+        flow_path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise AssetAuditError(f"{flow_path} changed during audit")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            with np.load(stream, allow_pickle=False) as archive:
+                flow = np.asarray(archive["flow"])
+                covis = np.asarray(archive["covis"])
+                values = (
+                    int(archive["frame_0"]),
+                    int(archive["frame_1"]),
+                    int(archive["camera"]),
+                    int(archive["height"]),
+                    int(archive["width"]),
+                )
+    except (KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
+        raise AssetAuditError(f"invalid FTGS++ flow cache {flow_path}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (
+        flow.ndim != 3
+        or flow.shape[-1] != 2
+        or covis.shape != flow.shape[:2]
+        or values != (left, right, camera, flow.shape[0], flow.shape[1])
+    ):
+        raise AssetAuditError(f"invalid FTGS++ flow payload {flow_path}")
+
+
+def audit_ftgspp_flow_cache(
+    path: str | Path,
+    *,
+    frame_count: int,
+    keyframe_stride: int,
+    allow_partial: bool = False,
+) -> dict[str, Any]:
+    """Require valid bidirectional UFM flow without unknown or held-out assets."""
+    pairs, items = _ftgspp_flow_items(frame_count, keyframe_stride)
     root = Path(path)
+    if root.is_symlink() or not root.is_dir():
+        raise AssetAuditError("FTGS++ flow cache root must be a directory")
     expected_directories = {f"f{left:06d}_f{right:06d}" for left, right in pairs}
     actual_entries = {entry.name for entry in root.iterdir()}
-    if actual_entries != expected_directories:
+    if (
+        not actual_entries.issubset(expected_directories)
+        or (not allow_partial and actual_entries != expected_directories)
+    ):
         raise AssetAuditError("FTGS++ flow cache is not complete for all frame pairs")
-    expected_files = {f"c{camera:03d}.npz" for camera in range(38)}
-    count = 0
-    for left, right in pairs:
-        pair = root / f"f{left:06d}_f{right:06d}"
+    actual_items: set[tuple[str, str]] = set()
+    for pair_name in actual_entries:
+        pair = root / pair_name
+        if pair.is_symlink() or not pair.is_dir():
+            raise AssetAuditError(f"FTGS++ flow pair {pair} must be a directory")
         actual_files = {entry.name for entry in pair.iterdir()}
-        if actual_files != expected_files:
+        expected_files = {f"c{camera:03d}.npz" for camera in range(38)}
+        if not actual_files.issubset(expected_files):
             raise AssetAuditError(
                 "FTGS++ flow cache is not complete for all train cameras"
             )
-        for camera in range(38):
-            flow_path = pair / f"c{camera:03d}.npz"
-            metadata = _secure_regular_metadata(flow_path, str(flow_path))
-            descriptor = os.open(
-                flow_path,
-                os.O_RDONLY
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
-            )
-            try:
-                opened = os.fstat(descriptor)
-                if (opened.st_dev, opened.st_ino) != (
-                    metadata.st_dev,
-                    metadata.st_ino,
-                ):
-                    raise AssetAuditError(f"{flow_path} changed during audit")
-                with os.fdopen(descriptor, "rb") as stream:
-                    descriptor = -1
-                    with np.load(stream, allow_pickle=False) as archive:
-                        flow = np.asarray(archive["flow"])
-                        covis = np.asarray(archive["covis"])
-                        values = (
-                            int(archive["frame_0"]),
-                            int(archive["frame_1"]),
-                            int(archive["camera"]),
-                            int(archive["height"]),
-                            int(archive["width"]),
-                        )
-            except (KeyError, OSError, ValueError) as exc:
-                raise AssetAuditError(f"invalid FTGS++ flow cache {flow_path}") from exc
-            finally:
-                if descriptor >= 0:
-                    os.close(descriptor)
-            if (
-                flow.ndim != 3
-                or flow.shape[-1] != 2
-                or covis.shape != flow.shape[:2]
-                or values
-                != (left, right, camera, flow.shape[0], flow.shape[1])
-            ):
-                raise AssetAuditError(f"invalid FTGS++ flow payload {flow_path}")
-            count += 1
-    return {"pairs": len(pairs), "cameras": 38, "files": count}
+        actual_items.update((pair_name, name) for name in actual_files)
+    expected_keys = [(pair_name, file_name) for pair_name, file_name, *_ in items]
+    if actual_items != set(expected_keys[: len(actual_items)]):
+        raise AssetAuditError("FTGS++ partial flow cache must be an exact prefix")
+    if not allow_partial and len(actual_items) != len(expected_keys):
+        raise AssetAuditError("FTGS++ flow cache is not complete for all train cameras")
+    for pair_name, file_name, left, right, camera in items[: len(actual_items)]:
+        _audit_ftgspp_flow_file(
+            root / pair_name / file_name,
+            left=left,
+            right=right,
+            camera=camera,
+        )
+    count = len(actual_items)
+    expected_count = len(items)
+    return {
+        "pairs": len(pairs),
+        "cameras": 38,
+        "files": count,
+        "complete": count == expected_count,
+    }
+
+
+def quarantine_interrupted_ftgspp_flow_tail(
+    path: str | Path,
+    *,
+    frame_count: int,
+    keyframe_stride: int,
+    termination_log: str | Path,
+    quarantine_root: str | Path,
+) -> dict[str, Any]:
+    """Preserve one proven interrupted final NPZ and return the valid prefix."""
+    root = Path(path)
+    pairs, items = _ftgspp_flow_items(frame_count, keyframe_stride)
+    expected_directories = {f"f{left:06d}_f{right:06d}" for left, right in pairs}
+    actual_entries = {entry.name for entry in root.iterdir()}
+    if not actual_entries.issubset(expected_directories):
+        raise AssetAuditError("interrupted FTGS++ flow has unknown pair entries")
+    for name in actual_entries:
+        pair = root / name
+        if pair.is_symlink() or not pair.is_dir():
+            raise AssetAuditError("interrupted FTGS++ flow pair is unsafe")
+    actual_items = {
+        (pair.name, entry.name)
+        for pair in root.iterdir()
+        for entry in pair.iterdir()
+    }
+    expected_keys = [(pair_name, file_name) for pair_name, file_name, *_ in items]
+    if not actual_items or actual_items != set(expected_keys[: len(actual_items)]):
+        raise AssetAuditError("interrupted FTGS++ flow is not an exact prefix")
+    tail_index = len(actual_items) - 1
+    for pair_name, file_name, left, right, camera in items[:tail_index]:
+        _audit_ftgspp_flow_file(
+            root / pair_name / file_name,
+            left=left,
+            right=right,
+            camera=camera,
+        )
+    pair_name, file_name, left, right, camera = items[tail_index]
+    tail = root / pair_name / file_name
+    try:
+        _audit_ftgspp_flow_file(tail, left=left, right=right, camera=camera)
+    except AssetAuditError as exc:
+        if not isinstance(exc.__cause__, zipfile.BadZipFile):
+            raise AssetAuditError(
+                "only an interrupted final NPZ ZIP may be quarantined"
+            ) from exc
+        error = f"{type(exc.__cause__).__name__}: {exc.__cause__}"
+    else:
+        raise AssetAuditError("latest FTGS++ flow file is valid and cannot be quarantined")
+    tail_stat = _secure_regular_metadata(tail, str(tail))
+    newest_mtime = max(
+        (root / pair / name).stat().st_mtime_ns for pair, name in actual_items
+    )
+    if tail_stat.st_mtime_ns != newest_mtime:
+        raise AssetAuditError("interrupted FTGS++ flow file is not the newest tail")
+    log_path = Path(termination_log)
+    log_text = _read_bounded_regular_nofollow(
+        log_path, maximum=MAX_METADATA_BYTES * 8
+    ).decode("utf-8", errors="strict").replace("\r", "\n")
+    if "*** Aborted at " not in log_text or not re.search(
+        rf"\b{tail_index}/{len(items)}\b", log_text
+    ):
+        raise AssetAuditError("controlled termination evidence does not bind flow tail")
+    digest = hashlib.sha256()
+    with tail.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    sha256 = digest.hexdigest()
+    quarantine = Path(quarantine_root)
+    if quarantine.is_symlink():
+        raise AssetAuditError("flow quarantine root must not be a symlink")
+    generation = quarantine / f"generation-{sha256}"
+    if generation.exists():
+        raise AssetAuditError("flow quarantine generation already exists")
+    generation.mkdir(parents=True)
+    destination = generation / tail.name
+    record = {
+        "schema": "avgaussianv2.interrupted-ftgspp-flow-tail",
+        "version": 1,
+        "source": str(tail.resolve(strict=True)),
+        "destination": str(destination.resolve(strict=False)),
+        "device": tail_stat.st_dev,
+        "inode": tail_stat.st_ino,
+        "size": tail_stat.st_size,
+        "mtime_ns": tail_stat.st_mtime_ns,
+        "sha256": sha256,
+        "error": error,
+        "termination_log": str(log_path.resolve(strict=True)),
+        "valid_prefix_files": tail_index,
+        "expected_files": len(items),
+    }
+    manifest = generation / "manifest.json"
+    descriptor, temporary = tempfile.mkstemp(prefix=".manifest.", dir=generation)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, manifest)
+        os.rename(tail, destination)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+    if hashlib.sha256(destination.read_bytes()).hexdigest() != sha256:
+        raise AssetAuditError("quarantined FTGS++ flow tail hash changed")
+    destination.chmod(0o444)
+    return record
+
+
+def audit_ftgspp_resume_state(
+    *,
+    scene_id: str,
+    source_root: str | Path,
+    train_source: str | Path,
+    namespaces: Sequence[str | Path],
+    run_root: str | Path,
+    marker_root: str | Path,
+    prep_seed_record: str | Path,
+    frame_count: int,
+    keyframe_stride: int,
+) -> dict[str, Any]:
+    """Fail closed before resuming an interrupted native FTGS++ preparation."""
+    if scene_id not in EXPECTED or len(namespaces) != 5:
+        raise AssetAuditError("invalid FTGS++ resume scene or namespace inventory")
+    source = Path(source_root).resolve(strict=True)
+    audit_ftgspp_train_source(train_source, allowed_sampled_root=source)
+    seed = audit_ftgspp_seed_record(prep_seed_record, expected_scene=scene_id)
+    joined = " ".join(seed["argv"])
+    if "--from extract --to prep" not in joined:
+        raise AssetAuditError("FTGS++ prep seed record does not bind extract-to-prep")
+
+    raw_namespaces = [Path(value) for value in namespaces]
+    raw_run = Path(run_root)
+    if any(path.is_symlink() for path in (*raw_namespaces, raw_run)):
+        raise AssetAuditError("FTGS++ resume namespaces must not be symlinks")
+    resolved = [path.resolve(strict=True) for path in raw_namespaces]
+    extracted, memmap, colmap, points, flow = resolved
+    run = raw_run.resolve(strict=True)
+    for path in (*resolved, run):
+        if path.is_symlink() or not path.is_dir():
+            raise AssetAuditError(f"FTGS++ resume namespace {path} is unsafe")
+
+    expected_frames = {
+        f"c{camera:03d}-f{frame:06d}.webp"
+        for camera in range(38)
+        for frame in range(frame_count)
+    }
+    if {entry.name for entry in extracted.iterdir()} != expected_frames:
+        raise AssetAuditError("FTGS++ extracted cache is incomplete or has extras")
+    for name in expected_frames:
+        if _secure_regular_metadata(extracted / name, name).st_size <= 0:
+            raise AssetAuditError(f"FTGS++ extracted frame {name} is empty")
+
+    expected_memmap = {
+        "camera",
+        "camera/meta.json",
+        "frame",
+        "frame/meta.json",
+        "intrinsic.memmap",
+        "meta.json",
+        "path",
+        "path/meta.json",
+        "path/pickle.pkl",
+        "rgb.memmap",
+        "time.memmap",
+        "w2c.memmap",
+    }
+    actual_memmap = {
+        str(entry.relative_to(memmap))
+        for entry in memmap.rglob("*")
+    }
+    if actual_memmap != expected_memmap:
+        raise AssetAuditError("FTGS++ memmap cache inventory is invalid")
+    for relative in expected_memmap:
+        entry = memmap / relative
+        if entry.is_symlink():
+            raise AssetAuditError(f"FTGS++ memmap entry {relative} is a symlink")
+        if entry.is_file() and _secure_regular_metadata(entry, relative).st_size <= 0:
+            raise AssetAuditError(f"FTGS++ memmap entry {relative} is empty")
+
+    expected_colmap = {
+        "cameras.txt",
+        "frames.txt",
+        "images.txt",
+        "points3D.txt",
+        "rigs.txt",
+    }
+    if {entry.name for entry in colmap.iterdir()} != expected_colmap:
+        raise AssetAuditError("FTGS++ COLMAP cache inventory is invalid")
+    for name in expected_colmap:
+        if _secure_regular_metadata(colmap / name, name).st_size <= 0:
+            raise AssetAuditError(f"FTGS++ COLMAP entry {name} is empty")
+    if any(points.iterdir()) or any(run.iterdir()):
+        raise AssetAuditError(
+            "FTGS++ points/train already started and cannot be safely resumed"
+        )
+
+    marker = {
+        "protocol": PROTOCOL,
+        "scene_id": scene_id,
+        "test_camera": TEST_CAMERA,
+        "source_root": str(source),
+    }
+    raw_marker_directory = Path(marker_root)
+    if raw_marker_directory.is_symlink():
+        raise AssetAuditError("FTGS++ resume marker root must not be a symlink")
+    marker_directory = raw_marker_directory.resolve(strict=True)
+    expected_markers: dict[str, dict[str, str]] = {}
+    for namespace in (*resolved, run):
+        namespace_text = str(namespace)
+        marker_name = hashlib.sha256(namespace_text.encode("utf-8")).hexdigest() + ".json"
+        expected_markers[marker_name] = {**marker, "namespace": namespace_text}
+    if {entry.name for entry in marker_directory.iterdir()} != set(expected_markers):
+        raise AssetAuditError("FTGS++ resume namespace marker inventory is invalid")
+    for name, expected_payload in expected_markers.items():
+        if _load_mapping(marker_directory / name) != expected_payload:
+            raise AssetAuditError(f"FTGS++ resume namespace marker {name} mismatches")
+
+    flow_result = audit_ftgspp_flow_cache(
+        flow,
+        frame_count=frame_count,
+        keyframe_stride=keyframe_stride,
+        allow_partial=True,
+    )
+    return {"flow": flow_result, "scene_id": scene_id}
 
 
 def audit_ftgspp_seed_record(

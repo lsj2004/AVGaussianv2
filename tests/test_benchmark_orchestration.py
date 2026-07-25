@@ -725,6 +725,47 @@ def test_suite_opens_the_explicit_native_execute_gate(
     assert all("--execute" in command for command in native[3:])
 
 
+def test_suite_native_partial_resume_skips_audio_and_marks_ftgspp_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repo"
+    output = tmp_path / "suite"
+    runner = _Runner()
+    checked: list[Path] = []
+    monkeypatch.setattr(orchestration, "_native_contracts_valid", lambda *_: False)
+    monkeypatch.setattr(
+        orchestration,
+        "_require_native_partial_resume_state",
+        lambda path: checked.append(path),
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_native_contract_valid",
+        lambda _repo, _scene, system: system == "native_audiogs",
+    )
+    run_benchmark_suite(
+        repository=repository,
+        output_dir=output,
+        resume=True,
+        runner=runner,
+        _scene_runner=lambda **kwargs: SceneBenchmarkResult(
+            Path(kwargs["config_path"]).stem,
+            Path(kwargs["output_dir"]),
+            Path(kwargs["output_dir"]) / "report",
+            True,
+        ),
+        _suite_verifier=lambda _path: {"content_sha256": "a" * 64},
+        _preflight_fn=_preflight,
+    )
+
+    native = [command for command, _, _ in runner.assignments if command[0] == "bash"]
+    assert checked == [repository.absolute()]
+    assert len(native) == 4
+    assert all("train_audiogs_cam38_baselines.sh" not in command[1] for command in native)
+    assert all("--resume" not in command for command in native[:2])
+    assert all("--execute" in command and "--resume" in command for command in native[2:])
+
+
 def test_suite_partial_resume_rejects_extra_before_preflight_or_mutation(
     tmp_path: Path,
 ) -> None:

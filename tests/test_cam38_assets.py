@@ -20,6 +20,7 @@ from avgaussianv2.benchmark.assets import (
     audit_initialization_provenance,
     audit_protocol_config,
     prepare_fresh_ftgspp_namespaces,
+    quarantine_interrupted_ftgspp_flow_tail,
     render_ftgspp_config,
 )
 from avgaussianv2.cli.run_seeded_ftgspp import seed_everything
@@ -425,9 +426,79 @@ def test_flow_cache_requires_every_train_camera_and_no_cam38(tmp_path: Path) -> 
         audit_ftgspp_flow_cache(root, frame_count=11, keyframe_stride=10)
     write_flow(forward / "c000.npz", 0, 10, 0)
 
+    reverse = root / "f000010_f000000"
+    for entry in reverse.iterdir():
+        entry.unlink()
+    reverse.rmdir()
     (root / "f000000_f000010" / "c037.npz").unlink()
+    partial = audit_ftgspp_flow_cache(
+        root, frame_count=11, keyframe_stride=10, allow_partial=True
+    )
+    assert partial["files"] == 37
+    assert partial["complete"] is False
     with pytest.raises(AssetAuditError, match="complete"):
         audit_ftgspp_flow_cache(root, frame_count=11, keyframe_stride=10)
+
+
+def test_interrupted_flow_recovery_only_quarantines_proven_latest_tail(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "flow"
+    pair = root / "f000000_f000010"
+    pair.mkdir(parents=True)
+
+    def write_valid(target_pair: Path, camera: int) -> None:
+        np.savez(
+            target_pair / f"c{camera:03d}.npz",
+            flow=np.zeros((2, 3, 2), dtype=np.float32),
+            covis=np.ones((2, 3), dtype=np.float32),
+            frame_0=np.int32(0),
+            frame_1=np.int32(10),
+            camera=np.int16(camera),
+            height=np.int32(2),
+            width=np.int32(3),
+        )
+
+    write_valid(pair, 0)
+    write_valid(pair, 1)
+    tail = pair / "c002.npz"
+    tail.write_bytes(b"PK\x03\x04interrupted")
+    log = tmp_path / "native.log"
+    log.write_text(
+        "UFM flow precompute: 3%| | 2/76 [00:01<00:10]\\n"
+        "*** Aborted at 123 (unix time) ***\\n"
+    )
+    result = quarantine_interrupted_ftgspp_flow_tail(
+        root,
+        frame_count=11,
+        keyframe_stride=10,
+        termination_log=log,
+        quarantine_root=tmp_path / "quarantine",
+    )
+    assert result["valid_prefix_files"] == 2
+    assert not tail.exists()
+    destination = Path(result["destination"])
+    assert destination.read_bytes() == b"PK\x03\x04interrupted"
+    assert (destination.parent / "manifest.json").is_file()
+    partial = audit_ftgspp_flow_cache(
+        root, frame_count=11, keyframe_stride=10, allow_partial=True
+    )
+    assert partial["files"] == 2
+
+    unsafe = tmp_path / "unsafe"
+    unsafe_pair = unsafe / "f000000_f000010"
+    unsafe_pair.mkdir(parents=True)
+    (unsafe_pair / "c000.npz").write_bytes(b"PK\x03\x04tampered-middle")
+    write_valid(unsafe_pair, 1)
+    with pytest.raises(AssetAuditError, match="invalid FTGS"):
+        quarantine_interrupted_ftgspp_flow_tail(
+            unsafe,
+            frame_count=11,
+            keyframe_stride=10,
+            termination_log=log,
+            quarantine_root=tmp_path / "unsafe-quarantine",
+        )
+    assert (unsafe_pair / "c000.npz").is_file()
 
 
 def test_ftgspp_seed_wrapper_sets_and_records_determinism(

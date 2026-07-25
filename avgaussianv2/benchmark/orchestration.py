@@ -18,6 +18,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from avgaussianv2.benchmark.assets import (
+    EXPECTED,
+    audit_ftgspp_resume_state,
+    audit_ftgspp_upstream_config,
+)
 from avgaussianv2.benchmark.evaluation import (
     CONTINUATION_SYSTEMS,
     NATIVE_SYSTEMS,
@@ -1138,6 +1143,54 @@ def _native_contracts_valid(repository: Path, scenes: Sequence[str]) -> bool:
     return True
 
 
+def _native_contract_valid(repository: Path, scene: str, system: str) -> bool:
+    try:
+        verify_native_contract(
+            _native_dirs(repository, scene)[system],
+            expected_scene=scene,
+            expected_model_kind="audiogs" if system == "native_audiogs" else "ftgspp",
+        )
+    except Exception:
+        return False
+    return True
+
+
+def _require_native_partial_resume_state(repository: Path) -> None:
+    """Verify every external native asset before a failed-suite resume mutates logs."""
+    ftgspp_root = Path("/mnt/sda/lisujing/Dataset/FreeTimeGSPlusPlus")
+    sampled_root = Path("/mnt/sda/lisujing/Dataset/Sampled_data/v5_0630_dynerf")
+    for scene in SCENES:
+        if not _native_contract_valid(repository, scene, "native_audiogs"):
+            raise OrchestrationError(
+                f"{scene} AudioGS native contract is incomplete; unsafe to resume"
+            )
+        if _native_contract_valid(repository, scene, "native_ftgspp"):
+            continue
+        strict_root = repository / "runs" / "cam38_strict" / scene
+        protocol = strict_root / "protocol"
+        source = sampled_root / scene
+        config = repository / "configs" / "benchmark_cam38" / f"{scene}.yaml"
+        rendered = protocol / "ftgspp_config" / f"{scene}.toml"
+        details = audit_ftgspp_upstream_config(
+            rendered,
+            protocol_config=config,
+            repo_root=repository,
+            ftgspp_root=ftgspp_root,
+            sampled_scene_root=source,
+        )
+        audit_ftgspp_resume_state(
+            scene_id=scene,
+            source_root=source,
+            train_source=strict_root / "ftgspp" / "train_only_source",
+            namespaces=details["namespaces"],
+            run_root=strict_root / "ftgspp" / "native",
+            marker_root=protocol / "namespace_markers",
+            prep_seed_record=protocol / "seed_records" / "prep.json",
+            frame_count=EXPECTED[scene]["test_samples"],
+            keyframe_stride=10,
+        )
+
+
 def _native_jobs(
     repository: Path,
     log_root: Path,
@@ -1145,9 +1198,16 @@ def _native_jobs(
     *,
     preflight_only: bool,
     scene: str | None = None,
+    resume_native: bool = False,
 ) -> list[tuple[str, tuple[str, ...], int, Path]]:
     mode = "--preflight-only" if preflight_only else "--execute"
     scenes = (scene,) if scene is not None else SCENES
+    if resume_native:
+        scenes = tuple(
+            item
+            for item in scenes
+            if not _native_contract_valid(repository, item, "native_ftgspp")
+        )
     jobs = [
         (
             f"ftgspp_{item}",
@@ -1155,28 +1215,31 @@ def _native_jobs(
                 "bash",
                 str(repository / "scripts" / "prepare_ftgspp_cam38_baselines.sh"),
                 mode,
+                *(("--resume",) if resume_native and not preflight_only else ()),
                 "--scene",
                 item,
             ),
-            gpus[index],
+            gpus[SCENES.index(item)],
             log_root
             / f"native_{'preflight_' if preflight_only else ''}ftgspp_{item}.log",
         )
-        for index, item in enumerate(scenes)
+        for item in scenes
     ]
-    jobs.append(
-        (
-            "audiogs",
+    if not resume_native:
+        jobs.append(
             (
-                "bash",
-                str(repository / "scripts" / "train_audiogs_cam38_baselines.sh"),
-                mode,
-                *(("--scene", scene) if scene is not None else ()),
-            ),
-            gpus[2],
-            log_root / f"native_{'preflight_' if preflight_only else ''}audiogs.log",
+                "audiogs",
+                (
+                    "bash",
+                    str(repository / "scripts" / "train_audiogs_cam38_baselines.sh"),
+                    mode,
+                    *(("--scene", scene) if scene is not None else ()),
+                ),
+                gpus[2],
+                log_root
+                / f"native_{'preflight_' if preflight_only else ''}audiogs.log",
+            )
         )
-    )
     return jobs
 
 
@@ -1891,12 +1954,17 @@ def run_benchmark_suite(
     devices = parse_gpus(gpus)
     runner = runner or SubprocessRunner()
     native_complete = _native_contracts_valid(repository, SCENES)
-    if skip_native_training or resume:
+    if skip_native_training:
         if not native_complete:
             raise OrchestrationError(
                 "native baseline stage is incomplete; complete both immutable "
                 "native contracts before suite resume/reuse"
             )
+        for scene in SCENES:
+            _require_native_contracts(repository, scene)
+    elif resume and not native_complete:
+        _require_native_partial_resume_state(repository)
+    elif resume:
         for scene in SCENES:
             _require_native_contracts(repository, scene)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1932,11 +2000,23 @@ def run_benchmark_suite(
         if not skip_native_training and not native_complete:
             _run_parallel(
                 runner,
-                _native_jobs(repository, attempt_logs, devices, preflight_only=True),
+                _native_jobs(
+                    repository,
+                    attempt_logs,
+                    devices,
+                    preflight_only=True,
+                    resume_native=resume,
+                ),
             )
             _run_parallel(
                 runner,
-                _native_jobs(repository, attempt_logs, devices, preflight_only=False),
+                _native_jobs(
+                    repository,
+                    attempt_logs,
+                    devices,
+                    preflight_only=False,
+                    resume_native=resume,
+                ),
             )
         results = [
             _scene_runner(
