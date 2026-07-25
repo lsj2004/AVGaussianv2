@@ -8,6 +8,7 @@ import json
 import os
 
 import pytest
+import torch
 
 from avgaussianv2.cli.pilot_eval import (
     EvaluationSpec,
@@ -347,3 +348,58 @@ def test_partial_resume_refuses_unsafe_recognized_metric_entry(
         )
     assert target.read_text() == "keep"
     assert entry.exists() or entry.is_symlink()
+
+
+def test_evaluation_rejects_registered_buffer_mutation(tmp_path) -> None:
+    config, _ = _config(tmp_path)
+
+    class BufferedModel(torch.nn.Module):
+        checkpoint_format_version = "state-dict-v1"
+
+        def __init__(self):
+            super().__init__()
+            self.condition_enabled = True
+            self.register_buffer("carrier", torch.zeros(1))
+
+    model = BufferedModel()
+
+    class MutatingEvaluator(_Evaluator):
+        def evaluate(self, *args, **kwargs):
+            result = super().evaluate(*args, **kwargs)
+            self.model.carrier.add_(1)
+            return result
+
+    with pytest.raises(ValueError, match="registered state mutated"):
+        run_evaluation(
+            config,
+            tmp_path / "mutating-state",
+            ("baseline_imported:off",),
+            device="cpu",
+            runtime_factory=lambda *_: SimpleNamespace(
+                model=model,
+                train_samples=(object(),),
+                eval_samples=(object(),),
+                audio_loss_fn=lambda *_: {},
+            ),
+            evaluator_factory=MutatingEvaluator,
+        )
+
+
+def test_evaluation_rejects_hardlinked_lock(tmp_path) -> None:
+    config, _ = _config(tmp_path)
+    output = tmp_path / "evaluation"
+    output.mkdir()
+    target = tmp_path / "lock-target"
+    target.write_text("keep")
+    os.link(target, output / ".evaluation.lock")
+    with pytest.raises(ValueError, match="single-link regular"):
+        run_evaluation(
+            config,
+            output,
+            ("baseline_imported:off",),
+            device="cpu",
+            resume=True,
+            runtime_factory=lambda *_: pytest.fail("unsafe lock built runtime"),
+            evaluator_factory=_Evaluator,
+        )
+    assert target.read_text() == "keep"

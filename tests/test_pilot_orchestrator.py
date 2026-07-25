@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -88,12 +89,15 @@ def test_group_start_exception_terminates_and_reaps_prior_children(tmp_path) -> 
         def __init__(self):
             self.terminated = False
             self.waited = False
+            self.stopped = threading.Event()
 
         def terminate(self):
             self.terminated = True
+            self.stopped.set()
 
         def wait(self):
             self.waited = True
+            self.stopped.wait()
             return -15
 
     class Runner:
@@ -139,6 +143,52 @@ def test_group_start_exception_terminates_and_reaps_prior_children(tmp_path) -> 
         tmp_path / "job-1.log",
         tmp_path / "job-2.log",
     ]
+
+
+def test_fail_fast_supervision_kills_unresponsive_sibling(
+    tmp_path, monkeypatch
+) -> None:
+    import avgaussianv2.cli.pilot as pilot_module
+
+    monkeypatch.setattr(pilot_module, "PROCESS_TERMINATION_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(pilot_module, "PROCESS_REAP_GRACE_SECONDS", 0.1)
+
+    class Failed:
+        def wait(self):
+            return 5
+
+        def terminate(self):
+            pass
+
+    class Stuck:
+        def __init__(self):
+            self.done = threading.Event()
+            self.terminated = False
+            self.killed = False
+
+        def wait(self):
+            self.done.wait()
+            return -9
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.killed = True
+            self.done.set()
+
+    stuck = Stuck()
+    jobs = (
+        ("failed", Failed(), tmp_path / "failed.log"),
+        ("stuck", stuck, tmp_path / "stuck.log"),
+    )
+    with pytest.raises(PilotProcessError) as raised:
+        _wait_group(jobs)
+    assert stuck.terminated and stuck.killed
+    assert raised.value.outcomes == (
+        ("failed", 5, tmp_path / "failed.log"),
+        ("stuck", -9, tmp_path / "stuck.log"),
+    )
 
 
 def test_shared_sequences_are_deterministic_and_condition_off_has_no_warmup() -> None:
@@ -203,7 +253,7 @@ def test_verify_only_derives_trusted_run_identity_without_cli_permission(tmp_pat
         "trusted_upstream_artifacts": True,
     }
     (output / "experiment_manifest.json").write_text(json.dumps(experiment))
-    (output / ".pilot-parent.lock").write_text("")
+    (output / ".pilot-orchestrator.lock").write_text("")
 
     class Runner:
         assignments = []
@@ -287,6 +337,10 @@ def test_run_pilot_sequences_baseline_workers_and_evaluations(
                     event[:2] == ("wait", "avgaussianv2.cli.pilot_eval")
                     for event in events
                 ), "worker started before baseline completed"
+            if "--resume" in command or "--overwrite" in command:
+                status = json.loads((output / "status.json").read_text())
+                assert status["ready"] is False
+                assert "mutating" in status["stages"].values()
             assignments.append((command, dict(env), log_path))
             events.append(("start", module, command))
             return Handle(command)
@@ -415,6 +469,22 @@ def test_run_pilot_sequences_baseline_workers_and_evaluations(
     assert tree_after == tree_before
     assert resumed.ready is True
 
+    (output / "status.json").unlink()
+    starts_before = len(assignments)
+    repaired = run_pilot(
+        config,
+        output,
+        resume=True,
+        runner=Runner(),
+        gpu_validator=lambda ids: None,
+        trust_upstream_artifacts=True,
+    )
+    repaired_status = json.loads((output / "status.json").read_text())
+    assert len(assignments) == starts_before
+    assert repaired.ready is True
+    assert repaired_status["stages"]["report"] == "complete"
+    assert repaired_status["ready"] is True
+
     monkeypatch.setattr(
         pilot_module,
         "verify_worker_resume_state",
@@ -538,3 +608,34 @@ def test_status_ready_requires_exact_boolean(ready) -> None:
     }
     with pytest.raises(TypeError, match="boolean"):
         _validate_complete_status(status)
+
+
+def test_resume_rejects_symlinked_run_root_without_touching_target(tmp_path) -> None:
+    config = _verify_config(tmp_path)
+    output = tmp_path / "run"
+    output.mkdir()
+    (output / ".pilot-orchestrator.lock").write_text("")
+    target = tmp_path / "logs-target"
+    target.mkdir()
+    marker = target / "keep"
+    marker.write_text("safe")
+    (output / "logs").symlink_to(target, target_is_directory=True)
+    (output / "workers").mkdir()
+    (output / "evaluations").mkdir()
+
+    class Runner:
+        assignments = []
+
+        def start(self, *args, **kwargs):
+            pytest.fail("unsafe root launched a process")
+
+    with pytest.raises((OSError, ValueError), match="directory|root"):
+        run_pilot(
+            config,
+            output,
+            resume=True,
+            runner=Runner(),
+            gpu_validator=lambda ids: None,
+            trust_upstream_artifacts=True,
+        )
+    assert marker.read_text() == "safe"

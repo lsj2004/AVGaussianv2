@@ -712,6 +712,31 @@ def _finite_tree(value: object) -> bool:
     return False
 
 
+def _registered_state_identity(model: object) -> tuple[tuple[object, ...], ...]:
+    records: list[tuple[object, ...]] = []
+    for kind, iterator_name in (
+        ("parameter", "named_parameters"),
+        ("buffer", "named_buffers"),
+    ):
+        iterator = getattr(model, iterator_name, None)
+        if not callable(iterator):
+            continue
+        for name, tensor in iterator():
+            records.append(
+                (
+                    kind,
+                    name,
+                    id(tensor),
+                    tensor.data_ptr(),
+                    tuple(tensor.shape),
+                    str(tensor.dtype),
+                    str(tensor.device),
+                    int(getattr(tensor, "_version", -1)),
+                )
+            )
+    return tuple(records)
+
+
 def _artifact_from_json(
     item: Mapping[str, object], output: Path
 ) -> EvaluationArtifactProvenance:
@@ -867,6 +892,7 @@ def run_evaluation(
 
     config_source = Path(config_path)
     config_snapshot = _snapshot(config_source)
+    config_source = config_snapshot.path
     config_bytes = _read_regular(config_snapshot.path)
     config = load_project_config_bytes(config_bytes, base_dir=config_source.parent)
     checkpoint_state = None
@@ -938,10 +964,21 @@ def run_evaluation(
     _preflight_output(output, resume=resume, overwrite=overwrite)
     lock_fd = os.open(
         output / ".evaluation.lock",
-        os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+        os.O_CREAT
+        | os.O_RDWR
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0),
         0o600,
     )
     try:
+        lock_metadata = os.fstat(lock_fd)
+        if (
+            not stat.S_ISREG(lock_metadata.st_mode)
+            or lock_metadata.st_nlink != 1
+        ):
+            raise ValueError(
+                "evaluation lock must be a single-link regular file"
+            )
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
@@ -1031,7 +1068,10 @@ def run_evaluation(
         system_records: list[dict[str, object]] = []
         evaluations: list[EvaluationResult] = []
         artifacts: list[EvaluationArtifactProvenance] = []
+        checkpoint_state_identity = _registered_state_identity(bundle.model)
         for spec in specs:
+            if _registered_state_identity(bundle.model) != checkpoint_state_identity:
+                raise ValueError("model registered state changed between conditions")
             system_dir = output / spec.system_name
             if system_dir.exists():
                 raise FileExistsError(f"system output already exists: {system_dir}")
@@ -1042,6 +1082,10 @@ def run_evaluation(
                 spec.condition_enabled,
                 system_dir,
             )
+            if _registered_state_identity(bundle.model) != checkpoint_state_identity:
+                raise ValueError(
+                    f"model registered state mutated during {spec.system_name}"
+                )
             for snapshot in source_snapshots:
                 _verify_snapshot(snapshot)
             if result.count != len(indices) or not _finite_tree(asdict(result)):

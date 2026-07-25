@@ -12,10 +12,14 @@ import hashlib
 import json
 import os
 import random
+import queue
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -72,11 +76,19 @@ _EXPERIMENT_FIELDS = {
     "baseline_manifest_path", "baseline_manifest_sha256", "source_hashes",
     "trusted_upstream_artifacts",
 }
+PROCESS_TERMINATION_GRACE_SECONDS = 10.0
+PROCESS_REAP_GRACE_SECONDS = 2.0
 
 
 class PilotProcessError(RuntimeError):
-    def __init__(self, failures: Sequence[tuple[str, int, Path]]) -> None:
+    def __init__(
+        self,
+        failures: Sequence[tuple[str, int, Path]],
+        *,
+        outcomes: Sequence[tuple[str, int, Path]] | None = None,
+    ) -> None:
         self.failures = tuple(failures)
+        self.outcomes = tuple(failures if outcomes is None else outcomes)
         super().__init__(
             "pilot subprocess failures: "
             + "; ".join(
@@ -103,15 +115,33 @@ class _PopenHandle:
         self._process = process
         self._stream = stream
 
-    def wait(self) -> int:
-        try:
-            return self._process.wait()
-        finally:
+        self._closed = False
+
+    def _close_stream(self) -> None:
+        if not self._closed:
+            self._closed = True
             self._stream.close()
+
+    def wait(self, timeout: float | None = None) -> int:
+        try:
+            return self._process.wait(timeout=timeout)
+        finally:
+            if self._process.poll() is not None:
+                self._close_stream()
+
+    def poll(self) -> int | None:
+        code = self._process.poll()
+        if code is not None:
+            self._close_stream()
+        return code
 
     def terminate(self) -> None:
         if self._process.poll() is None:
-            self._process.terminate()
+            os.killpg(self._process.pid, signal.SIGTERM)
+
+    def kill(self) -> None:
+        if self._process.poll() is None:
+            os.killpg(self._process.pid, signal.SIGKILL)
 
 
 class SubprocessRunner:
@@ -140,6 +170,7 @@ class SubprocessRunner:
                 stderr=subprocess.STDOUT,
                 env=dict(env),
                 shell=False,
+                start_new_session=True,
             )
         except BaseException:
             stream.close()
@@ -340,6 +371,49 @@ def _verify_output_ancestors(path: Path) -> None:
             raise ValueError(f"pilot output parent is unsafe: {current}")
 
 
+def _open_secure_child_directory(
+    output_fd: int,
+    output: Path,
+    name: str,
+    *,
+    create: bool,
+) -> tuple[int, Path, tuple[int, int]]:
+    if create:
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=output_fd)
+        except FileExistsError:
+            pass
+    before = os.stat(name, dir_fd=output_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(before.st_mode):
+        raise ValueError(f"pilot run root is not a directory: {name}")
+    descriptor = os.open(
+        name,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=output_fd,
+    )
+    opened = os.fstat(descriptor)
+    identity = (before.st_dev, before.st_ino)
+    if (opened.st_dev, opened.st_ino) != identity:
+        os.close(descriptor)
+        raise ValueError(f"pilot run root changed while opening: {name}")
+    return descriptor, output / name, identity
+
+
+def _verify_directory_identity(
+    descriptor: int, path: Path, identity: tuple[int, int]
+) -> None:
+    opened = os.fstat(descriptor)
+    current = path.lstat()
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or (opened.st_dev, opened.st_ino) != identity
+        or (current.st_dev, current.st_ino) != identity
+    ):
+        raise ValueError(f"pilot run root identity changed: {path}")
+
+
 def _atomic_json(path: Path, value: object) -> None:
     data = (
         json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False, allow_nan=False)
@@ -438,25 +512,90 @@ def _shared_indices(seed: int, train_length: int, pilot: PilotConfig) -> SharedI
 
 
 def _wait_group(
-    jobs: Sequence[tuple[str, ProcessHandle, Path]]
+    jobs: Sequence[tuple[str, ProcessHandle, Path]],
+    *,
+    stop_immediately: bool = False,
 ) -> None:
-    failures: list[tuple[str, int, Path]] = []
-    try:
-        for name, handle, log in jobs:
+    if not jobs:
+        return
+    completed: queue.Queue[tuple[int, int]] = queue.Queue()
+    running = set(range(len(jobs)))
+    outcomes: dict[int, int] = {}
+
+    def waiter(position: int, handle: ProcessHandle) -> None:
+        try:
             code = handle.wait()
-            if code:
-                failures.append((name, code, log))
-    except BaseException:
-        for _, handle, _ in jobs:
-            handle.terminate()
-        for _, handle, _ in jobs:
+        except BaseException:
+            code = -1
+        completed.put((position, code))
+
+    for position, (_, handle, _) in enumerate(jobs):
+        threading.Thread(
+            target=waiter,
+            args=(position, handle),
+            name=f"pilot-wait-{position}",
+            daemon=True,
+        ).start()
+
+    def drain_until(deadline: float) -> None:
+        while running and time.monotonic() < deadline:
+            timeout = max(0.0, min(0.05, deadline - time.monotonic()))
             try:
-                handle.wait()
+                position, code = completed.get(timeout=timeout)
+            except queue.Empty:
+                continue
+            if position in running:
+                running.remove(position)
+                outcomes[position] = code
+
+    def stop_all() -> None:
+        for position in tuple(running):
+            try:
+                jobs[position][1].terminate()
             except BaseException:
                 pass
+        drain_until(time.monotonic() + PROCESS_TERMINATION_GRACE_SECONDS)
+        for position in tuple(running):
+            handle = jobs[position][1]
+            try:
+                kill = getattr(handle, "kill", None)
+                if callable(kill):
+                    kill()
+                else:
+                    handle.terminate()
+            except BaseException:
+                pass
+        drain_until(time.monotonic() + PROCESS_REAP_GRACE_SECONDS)
+        for position in tuple(running):
+            running.remove(position)
+            outcomes[position] = -9
+
+    try:
+        first_failure = False
+        if stop_immediately:
+            stop_all()
+        else:
+            while running:
+                position, code = completed.get()
+                if position not in running:
+                    continue
+                running.remove(position)
+                outcomes[position] = code
+                if code != 0:
+                    first_failure = True
+                    break
+            if first_failure:
+                stop_all()
+    except (KeyboardInterrupt, SystemExit):
+        stop_all()
         raise
+    all_outcomes = [
+        (name, outcomes.get(position, -9), log)
+        for position, (name, _, log) in enumerate(jobs)
+    ]
+    failures = [item for item in all_outcomes if item[1] != 0]
     if failures:
-        raise PilotProcessError(failures)
+        raise PilotProcessError(failures, outcomes=all_outcomes)
 
 
 def _launch_group(
@@ -473,28 +612,43 @@ def _launch_group(
             jobs.append((spec.name, handle, spec.log_path))
     except (KeyboardInterrupt, SystemExit):
         for _, handle, _ in jobs:
-            handle.terminate()
-        for _, handle, _ in jobs:
             try:
-                handle.wait()
+                handle.terminate()
             except BaseException:
                 pass
+        try:
+            _wait_group(jobs, stop_immediately=True)
+        except PilotProcessError:
+            pass
         raise
     except BaseException:
-        failures: list[tuple[str, int, Path]] = []
-        for _, handle, _ in jobs:
-            handle.terminate()
-        for name, handle, log in jobs:
-            try:
-                code = handle.wait()
-            except BaseException:
-                code = -1
-            if code:
-                failures.append((name, code, log))
         failed_spec = specs[len(jobs)]
-        failures.append((failed_spec.name, -1, failed_spec.log_path))
-        raise PilotProcessError(failures)
+        try:
+            _wait_group(
+                [
+                    *jobs,
+                    (
+                        failed_spec.name,
+                        _FailedStartHandle(),
+                        failed_spec.log_path,
+                    ),
+                ],
+                stop_immediately=True,
+            )
+        except PilotProcessError as error:
+            raise error
     _wait_group(jobs)
+
+
+class _FailedStartHandle:
+    def wait(self) -> int:
+        return -1
+
+    def terminate(self) -> None:
+        return None
+
+    def kill(self) -> None:
+        return None
 
 
 def _command_env(gpu: int) -> dict[str, str]:
@@ -666,8 +820,9 @@ def run_pilot(
         raise PermissionError(
             "production pilot requires --trust-upstream-artifacts"
         )
-    config_source = Path(config_path)
-    config_bytes = _read_regular(config_source)
+    requested_config = Path(config_path)
+    config_bytes = _read_regular(requested_config)
+    config_source = requested_config.resolve(strict=True)
     config = load_project_config_bytes(config_bytes, base_dir=config_source.parent)
     if config.scene.scene_id != "scene1_opera":
         raise ValueError("three-GPU pilot requires exact scene_id scene1_opera")
@@ -677,7 +832,11 @@ def run_pilot(
         metadata = output.lstat()
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
             raise ValueError("pilot output must be a non-symlink directory")
-        entries = [item for item in output.iterdir() if item.name != ".pilot-parent.lock"]
+        entries = [
+            item
+            for item in output.iterdir()
+            if item.name != ".pilot-orchestrator.lock"
+        ]
         if entries and not (resume or verify_only):
             raise FileExistsError("fresh pilot refuses nonempty output")
     else:
@@ -703,33 +862,58 @@ def run_pilot(
     if not verify_only:
         gpu_validator(gpus)
 
-    lock_fd = os.open(
-        output / ".pilot-parent.lock",
-        os.O_RDWR
-        | (0 if verify_only else os.O_CREAT)
+    output_fd = os.open(
+        output,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
         | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
     )
     try:
+        lock_fd = os.open(
+            ".pilot-orchestrator.lock",
+            os.O_RDWR
+            | (0 if verify_only else os.O_CREAT)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            0o600,
+            dir_fd=output_fd,
+        )
+    except BaseException:
+        os.close(output_fd)
+        raise
+    child_directory_fds: list[tuple[int, Path, tuple[int, int]]] = []
+    try:
+        lock_metadata = os.fstat(lock_fd)
+        if (
+            not stat.S_ISREG(lock_metadata.st_mode)
+            or lock_metadata.st_nlink != 1
+        ):
+            raise ValueError(
+                "pilot orchestrator lock must be a single-link regular file"
+            )
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise RuntimeError("pilot output already has an active parent") from error
         experiment_path = output / "experiment_manifest.json"
         shared_path = output / "shared_manifest.json"
-        logs = output / "logs"
-        workers_root = output / "workers"
-        eval_root = output / "evaluations"
-        if verify_only:
-            for required in (logs, workers_root, eval_root):
-                if not required.is_dir() or required.is_symlink():
-                    raise FileNotFoundError(
-                        f"verify-only requires existing directory: {required}"
+        for name in ("logs", "workers", "evaluations"):
+            try:
+                child_directory_fds.append(
+                    _open_secure_child_directory(
+                        output_fd,
+                        output,
+                        name,
+                        create=not verify_only,
                     )
-        else:
-            logs.mkdir(exist_ok=True)
-            workers_root.mkdir(exist_ok=True)
-            eval_root.mkdir(exist_ok=True)
+                )
+            except FileNotFoundError:
+                raise FileNotFoundError(
+                    f"verify-only requires existing directory: {output / name}"
+                ) from None
+        logs = child_directory_fds[0][1]
+        workers_root = child_directory_fds[1][1]
+        eval_root = child_directory_fds[2][1]
 
         baseline_specs = (EvaluationSpec("baseline_imported", False),)
         baseline_dir = output / "baseline"
@@ -749,8 +933,18 @@ def run_pilot(
                 command.append("--trust-upstream-artifacts")
             if resume and baseline_dir.exists():
                 command.append("--resume")
+                _stage_status(
+                    output,
+                    baseline="mutating",
+                    workers="mutating",
+                    evaluations="mutating",
+                    report="mutating",
+                    ready=False,
+                )
             _run_one(runner, "baseline", command, gpus[0], logs / "baseline.log")
             baseline_launched = True
+            for descriptor, path, identity in child_directory_fds:
+                _verify_directory_identity(descriptor, path, identity)
         baseline_job = _verify_existing(
             baseline_dir,
             baseline_specs,
@@ -896,7 +1090,18 @@ def run_pilot(
                 LaunchSpec(variant.value, tuple(command), gpu, log)
             )
         if worker_specs:
+            if resume:
+                _stage_status(
+                    output,
+                    baseline="complete",
+                    workers="mutating",
+                    evaluations="mutating",
+                    report="mutating",
+                    ready=False,
+                )
             _launch_group(runner, worker_specs)
+            for descriptor, path, identity in child_directory_fds:
+                _verify_directory_identity(descriptor, path, identity)
         for variant in VARIANT_GPU_ORDER:
             verified_workers[variant] = verify_worker_output(
                 config_source,
@@ -959,7 +1164,18 @@ def run_pilot(
                 LaunchSpec(variant.value, tuple(command), gpu, log)
             )
         if pending:
+            if resume:
+                _stage_status(
+                    output,
+                    baseline="complete",
+                    workers="complete",
+                    evaluations="mutating",
+                    report="mutating",
+                    ready=False,
+                )
             _launch_group(runner, pending)
+            for descriptor, path, identity in child_directory_fds:
+                _verify_directory_identity(descriptor, path, identity)
             for variant in VARIANT_GPU_ORDER:
                 eval_jobs[variant] = _verify_existing(
                     eval_root / variant.value,
@@ -985,6 +1201,8 @@ def run_pilot(
             shared_path, config_path=config_source, config=config
         ).sha256 != loaded.sha256:
             raise ValueError("shared manifest changed during orchestration")
+        for descriptor, path, identity in child_directory_fds:
+            _verify_directory_identity(descriptor, path, identity)
 
         report_inputs = _report_inputs(
             output, baseline_job, eval_jobs, verified_workers
@@ -1016,22 +1234,35 @@ def run_pilot(
             and not baseline_launched
             and not worker_specs
             and not pending
-            and (output / "status.json").is_file()
             and (output / "report" / "current").is_symlink()
         ):
             comparison = verify_current_comparison(
                 report_inputs, output / "report"
             )
-            status = _validate_complete_status(
-                json.loads(_read_regular(output / "status.json").decode())
-            )
-            if (
-                status["report_digest"] != comparison.content_digest
-                or status["ready"] is not comparison.decision.ready
-                or status["durability_warnings"]
-                != list(comparison.durability_warnings)
-            ):
-                raise ValueError("completed resume status/report mismatch")
+            status_valid = False
+            try:
+                status = _validate_complete_status(
+                    json.loads(_read_regular(output / "status.json").decode())
+                )
+                status_valid = (
+                    status["report_digest"] == comparison.content_digest
+                    and status["ready"] is comparison.decision.ready
+                    and status["durability_warnings"]
+                    == list(comparison.durability_warnings)
+                )
+            except (FileNotFoundError, TypeError, ValueError, json.JSONDecodeError):
+                status_valid = False
+            if not status_valid:
+                _stage_status(
+                    output,
+                    baseline="complete",
+                    workers="complete",
+                    evaluations="complete",
+                    report="complete",
+                    report_digest=comparison.content_digest,
+                    ready=comparison.decision.ready,
+                    durability_warnings=comparison.durability_warnings,
+                )
             return PilotOrchestrationResult(
                 experiment_path.resolve(),
                 comparison.generation_path,
@@ -1060,6 +1291,9 @@ def run_pilot(
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
+        for descriptor, _, _ in child_directory_fds:
+            os.close(descriptor)
+        os.close(output_fd)
 
 
 def build_parser() -> argparse.ArgumentParser:
