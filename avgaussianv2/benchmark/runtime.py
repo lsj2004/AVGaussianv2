@@ -82,6 +82,41 @@ def _state_sha256(model: nn.Module, prefix: str | None = None) -> str:
     return digest.hexdigest()
 
 
+def state_sha256(model: nn.Module, prefix: str | None = None) -> str:
+    return _state_sha256(model, prefix)
+
+
+def upstream_source_inventory(config: ProjectConfig) -> dict[str, str]:
+    """Hash every upstream source file imported by the production adapters."""
+    roots = {
+        "audiogs": config.paths.audio_upstream_root,
+        "ftgspp": config.paths.visual_upstream_root,
+    }
+    relative = {
+        "audiogs": (
+            Path("configs/audio_3dgs_replaynvas_viewpoint.yaml"),
+            Path("tools/train_audio_3dgs_viewpoint.py"),
+            *(
+                path.relative_to(roots["audiogs"])
+                for path in sorted(roots["audiogs"].joinpath("libs").rglob("*.py"))
+            ),
+        ),
+        "ftgspp": tuple(
+            path.relative_to(roots["ftgspp"])
+            for path in sorted(roots["ftgspp"].joinpath("ftgspp").rglob("*.py"))
+        ),
+    }
+    inventory: dict[str, str] = {}
+    for kind, names in relative.items():
+        for relative_path in names:
+            name = relative_path.as_posix()
+            path = (roots[kind] / name).resolve()
+            if not path.is_file() or path.is_symlink():
+                raise ValueError(f"unsafe or missing {kind} upstream source: {path}")
+            inventory[f"{kind}:{name}"] = _file_sha256(path)
+    return inventory
+
+
 def _dataset_identity(
     samples: Sequence[AlignedAVSample], config: ProjectConfig
 ) -> tuple[tuple[str, ...], str]:
@@ -240,6 +275,7 @@ def build_production_runtime(
         "dataset_manifest_sha256": _file_sha256(config.paths.manifest),
         "visual_checkpoint_sha256": _file_sha256(config.paths.visual_checkpoint),
         "model_initialization_sha256": model_initialization_sha256,
+        "upstream_source_inventory": upstream_source_inventory(config),
     }
     return BenchmarkRuntime(
         model=bundle.model,
@@ -260,4 +296,6 @@ __all__ = [
     "BenchmarkRuntime",
     "build_production_runtime",
     "load_audited_benchmark_config",
+    "state_sha256",
+    "upstream_source_inventory",
 ]

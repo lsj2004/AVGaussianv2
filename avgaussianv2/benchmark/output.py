@@ -13,16 +13,61 @@ class BenchmarkOutputError(RuntimeError):
     """Raised when the benchmark output boundary is unsafe or changes."""
 
 
-def _is_proc_fd(path: Path) -> bool:
+def _proc_fd_parts(path: Path) -> tuple[Path, tuple[str, ...]] | None:
     parts = path.parts
-    return (
-        len(parts) == 5
+    if (
+        len(parts) >= 5
         and parts[0] == "/"
         and parts[1] == "proc"
         and parts[3] == "fd"
-        and parts[2] in {"self", str(os.getpid())}
+        and (parts[2] == "self" or parts[2].isdigit())
         and parts[4].isdigit()
-    )
+        and all(part not in {"", ".", ".."} for part in parts[5:])
+    ):
+        return Path(*parts[:5]), tuple(parts[5:])
+    return None
+
+
+def _is_proc_fd(path: Path) -> bool:
+    return _proc_fd_parts(path) is not None
+
+
+def _open_proc_fd_directory(path: Path, *, create: bool) -> int:
+    parsed = _proc_fd_parts(path)
+    if parsed is None:
+        raise BenchmarkOutputError("invalid retained-fd output path")
+    base, descendants = parsed
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(base, flags)
+    try:
+        for part in descendants:
+            try:
+                child = os.open(
+                    part,
+                    flags | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                child = os.open(
+                    part,
+                    flags | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=descriptor,
+                )
+            metadata = os.fstat(child)
+            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+                os.close(child)
+                raise BenchmarkOutputError(
+                    "retained-fd descendant must be an owned directory"
+                )
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _reject_symlink_components(path: Path) -> None:
@@ -50,7 +95,8 @@ class BenchmarkOutputLock:
         self.identity: tuple[int, int] | None = None
 
     def __enter__(self) -> Path:
-        if not _is_proc_fd(self.original):
+        proc_fd = _is_proc_fd(self.original)
+        if not proc_fd:
             _reject_symlink_components(self.original.parent)
             try:
                 self.original.mkdir(mode=0o700)
@@ -60,9 +106,13 @@ class BenchmarkOutputLock:
         flags = (
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
         )
-        if not _is_proc_fd(self.original):
+        if not proc_fd:
             flags |= getattr(os, "O_NOFOLLOW", 0)
-        self.directory_fd = os.open(self.original, flags)
+        self.directory_fd = (
+            _open_proc_fd_directory(self.original, create=True)
+            if proc_fd
+            else os.open(self.original, flags)
+        )
         metadata = os.fstat(self.directory_fd)
         if not stat.S_ISDIR(metadata.st_mode):
             self.close()
@@ -171,17 +221,20 @@ class BenchmarkOutputReadLock:
         self.identity: tuple[int, int] | None = None
 
     def __enter__(self) -> Path:
-        if not _is_proc_fd(self.original):
+        proc_fd = _is_proc_fd(self.original)
+        if not proc_fd:
             _reject_symlink_components(self.original)
         flags = (
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_CLOEXEC", 0)
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
         )
-        if not _is_proc_fd(self.original):
+        if not proc_fd:
             flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
-            self.directory_fd = os.open(self.original, flags)
+            self.directory_fd = (
+                _open_proc_fd_directory(self.original, create=False)
+                if proc_fd
+                else os.open(self.original, flags)
+            )
         except OSError as error:
             raise BenchmarkOutputError(
                 "benchmark output does not exist or is unsafe"
@@ -232,10 +285,14 @@ class BenchmarkOutputReadLock:
                 raise BenchmarkOutputError(
                     "benchmark output directory disappeared while read-locked"
                 ) from error
-            if stat.S_ISLNK(current.st_mode) or (
-                current.st_dev,
-                current.st_ino,
-            ) != self.identity:
+            if (
+                stat.S_ISLNK(current.st_mode)
+                or (
+                    current.st_dev,
+                    current.st_ino,
+                )
+                != self.identity
+            ):
                 raise BenchmarkOutputError(
                     "benchmark output directory changed while locked"
                 )

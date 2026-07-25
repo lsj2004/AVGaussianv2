@@ -229,6 +229,15 @@ RGB only in the common evaluator. Per-scene reports are written below
 `runs/cam38_benchmark/<scene>/report`, and macro/micro aggregation is written
 to `runs/cam38_benchmark/report`.
 
+Before native training, both scene configurations complete dependency, disk,
+GPU, and source-hash preflight. With `--gpus A,B,C`, FreeTimeGS++ scene 1 runs
+on physical GPU `A`, FreeTimeGS++ Scene7 on `B`, and the two AudioGS scenes run
+serially on `C`; each isolated child addresses its assigned card as `cuda:0`.
+Preflight, status, protocol, and attempt-log records use immutable,
+hash-chained generations. A partial resume validates these records and every
+committed worker contract before writing anything; only workers with a durable
+checkpoint receive `--resume`.
+
 Use `--resume` after interruption. To reuse native training, pass
 `--skip-native-training`; this succeeds only when both strict immutable native
 contracts already exist and verify. It never treats an arbitrary checkpoint

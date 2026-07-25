@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import pytest
 
 import avgaussianv2.benchmark.orchestration as orchestration
+from avgaussianv2.benchmark.output import BenchmarkOutputError
 from avgaussianv2.benchmark.orchestration import (
     OrchestrationError,
     SceneBenchmarkResult,
@@ -16,6 +18,8 @@ from avgaussianv2.benchmark.orchestration import (
 
 
 def _module(command: Sequence[str]) -> str:
+    if "-m" not in command:
+        return Path(command[1]).stem
     return command[command.index("-m") + 1]
 
 
@@ -149,6 +153,12 @@ def test_scene_assigns_three_workers_and_evaluations_to_three_gpus(
         "audio_only.json",
         "visual_only.json",
     ]
+    assert all(
+        item[0][item[0].index("--output-dir") + 1].startswith(
+            f"/proc/{os.getpid()}/fd/"
+        )
+        for item in workers + evaluations
+    )
     first_evaluation = runner.events.index(("start", "avgaussianv2.cli.benchmark_eval"))
     worker_completions = [
         index
@@ -253,13 +263,102 @@ def test_skip_native_training_requires_strict_native_contract_before_launch(
     assert runner.assignments == []
 
 
-def test_suite_runs_scenes_in_declared_order_then_builds_and_verifies_report(
+def test_partial_resume_rejects_symlink_before_preflight_or_mutation(
     tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    config = _config(repository)
+    output = tmp_path / "result"
+    with orchestration.BenchmarkOutputLock(output):
+        pass
+    target = tmp_path / "target"
+    target.write_text("unchanged")
+    (output / "unexpected").symlink_to(target)
+    before = _tree_digest(output)
+
+    with pytest.raises(OrchestrationError, match="unexpected or unsafe"):
+        run_scene_benchmark(
+            config_path=config,
+            output_dir=output,
+            resume=True,
+            runner=_Runner(),
+            _verifier=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                ValueError("incomplete")
+            ),
+            _preflight_fn=lambda *_args: pytest.fail("entered preflight"),
+        )
+
+    assert _tree_digest(output) == before
+
+
+def test_partial_resume_refuses_concurrent_writer_without_launch(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    config = _config(repository)
+    output = tmp_path / "result"
+    runner = _Runner()
+    with orchestration.BenchmarkOutputLock(output):
+        with pytest.raises(BenchmarkOutputError, match="locked by another process"):
+            run_scene_benchmark(
+                config_path=config,
+                output_dir=output,
+                resume=True,
+                runner=runner,
+                _verifier=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    ValueError("incomplete")
+                ),
+                _preflight_fn=lambda *_args: pytest.fail("entered preflight"),
+            )
+    assert runner.assignments == []
+
+
+def test_partial_snapshot_is_rechecked_before_attempt_log_mutation(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "result"
+    with orchestration.BenchmarkOutputLock(output) as pinned:
+        snapshot = orchestration._tree_snapshot_sha256(pinned)
+    (output / "changed").write_text("after shared inspection")
+
+    with orchestration.BenchmarkOutputLock(output) as pinned:
+        with pytest.raises(OrchestrationError, match="changed before exclusive"):
+            with orchestration._AttemptLogs(
+                pinned, "scene1_opera", expected_snapshot=snapshot
+            ):
+                pass
+
+    assert not (output / "logs").exists()
+
+
+def test_worker_resume_flag_is_only_emitted_for_committed_modes(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    config = _config(repository)
+    _, workers, _ = orchestration._scene_commands(
+        repository=repository,
+        output=tmp_path / "result",
+        log_root=tmp_path / "logs",
+        config=config,
+        python="python",
+        gpus=(0, 1, 2),
+        resume_modes=frozenset({"audio_only"}),
+    )
+    by_mode = {mode: command for mode, command, _, _ in workers}
+
+    assert "--resume" not in by_mode["joint_conditioned"]
+    assert "--resume" in by_mode["audio_only"]
+    assert "--resume" not in by_mode["visual_only"]
+
+
+def test_suite_runs_scenes_in_declared_order_then_builds_and_verifies_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repository = tmp_path / "repo"
     output = tmp_path / "suite"
     events: list[tuple[object, ...]] = []
     runner = _Runner(events=events)
+    monkeypatch.setattr(orchestration, "_native_contracts_valid", lambda *_: True)
+    monkeypatch.setattr(orchestration, "_require_native_contracts", lambda *_: None)
 
     def scene_runner(**kwargs) -> SceneBenchmarkResult:
         scene = Path(kwargs["config_path"]).stem
@@ -267,6 +366,7 @@ def test_suite_runs_scenes_in_declared_order_then_builds_and_verifies_report(
         assert kwargs["skip_native_training"] is True
         assert kwargs["runner"] is runner
         root = Path(kwargs["output_dir"])
+        assert str(root).startswith(f"/proc/{os.getpid()}/fd/")
         return SceneBenchmarkResult(scene, root, root / "report", True)
 
     def suite_verifier(path: Path) -> Mapping[str, object]:
@@ -280,6 +380,7 @@ def test_suite_runs_scenes_in_declared_order_then_builds_and_verifies_report(
         runner=runner,
         _scene_runner=scene_runner,
         _suite_verifier=suite_verifier,
+        _preflight_fn=_preflight,
     )
 
     assert result["content_sha256"] == "a" * 64
@@ -300,17 +401,13 @@ def test_suite_opens_the_explicit_native_execute_gate(
 ) -> None:
     repository = tmp_path / "repo"
     output = tmp_path / "suite"
-    commands: list[tuple[str, ...]] = []
-
-    def run_one(_runner, command, **_kwargs) -> None:
-        commands.append(tuple(command))
-
-    monkeypatch.setattr(orchestration, "_run_one", run_one)
+    runner = _Runner()
+    monkeypatch.setattr(orchestration, "_native_contracts_valid", lambda *_: False)
     run_benchmark_suite(
         repository=repository,
         output_dir=output,
         skip_native_training=False,
-        runner=_Runner(),
+        runner=runner,
         _scene_runner=lambda **kwargs: SceneBenchmarkResult(
             Path(kwargs["config_path"]).stem,
             Path(kwargs["output_dir"]),
@@ -318,10 +415,37 @@ def test_suite_opens_the_explicit_native_execute_gate(
             True,
         ),
         _suite_verifier=lambda _path: {"content_sha256": "a" * 64},
+        _preflight_fn=_preflight,
     )
 
-    assert commands[0][-1] == "--execute"
-    assert commands[1][-1] == "--execute"
+    native = [command for command, _, _ in runner.assignments if command[0] == "bash"]
+    assert len(native) == 6
+    assert all("--preflight-only" in command for command in native[:3])
+    assert all("--execute" in command for command in native[3:])
+
+
+def test_suite_partial_resume_rejects_extra_before_preflight_or_mutation(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    output = tmp_path / "suite"
+    with orchestration.BenchmarkOutputLock(output):
+        pass
+    target = tmp_path / "target"
+    target.write_text("unchanged")
+    (output / "unexpected").symlink_to(target)
+    before = _tree_digest(output)
+
+    with pytest.raises(OrchestrationError, match="unexpected or unsafe"):
+        run_benchmark_suite(
+            repository=repository,
+            output_dir=output,
+            resume=True,
+            runner=_Runner(),
+            _preflight_fn=lambda *_args: pytest.fail("entered preflight"),
+        )
+
+    assert _tree_digest(output) == before
 
 
 def test_suite_verify_only_checks_both_scenes_in_order_without_mutation(
@@ -329,8 +453,11 @@ def test_suite_verify_only_checks_both_scenes_in_order_without_mutation(
 ) -> None:
     repository = tmp_path / "repo"
     output = tmp_path / "suite"
-    output.mkdir()
-    (output / "immutable.json").write_text('{"complete":true}\n')
+    with orchestration.BenchmarkOutputLock(output) as pinned:
+        with orchestration._AttemptLogs(pinned, "suite"):
+            pass
+    for name in (*orchestration.SCENES, "report"):
+        (output / name).mkdir()
     runner = _Runner()
     events: list[tuple[object, ...]] = []
 
@@ -352,6 +479,7 @@ def test_suite_verify_only_checks_both_scenes_in_order_without_mutation(
         verify_only=True,
         runner=runner,
         _suite_verifier=suite_verifier,
+        _preflight_fn=_preflight,
     )
 
     assert result["content_sha256"] == "b" * 64

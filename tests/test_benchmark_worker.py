@@ -131,6 +131,10 @@ def test_production_runtime_is_train_only_and_hashes_real_inputs(
         )
 
     monkeypatch.setattr("avgaussianv2.benchmark.runtime.build_runtime", fake_build)
+    monkeypatch.setattr(
+        "avgaussianv2.benchmark.runtime.upstream_source_inventory",
+        lambda _: {"fixture": "f" * 64},
+    )
     first = build_production_runtime(
         config_path=config_path,
         device=torch.device("cpu"),
@@ -273,9 +277,12 @@ def test_worker_seeds_before_internal_builder_and_checks_identity(
     assert runtime_contract["include_eval"] is False
     assert runtime_contract["train_cameras"] == list(TRAIN_CAMERAS)
     assert runtime_contract["test_camera"] == "cam38"
-    assert result["runtime_contract_sha256"] == hashlib.sha256(
-        (tmp_path / "output" / "runtime_contract.json").read_bytes()
-    ).hexdigest()
+    assert (
+        result["runtime_contract_sha256"]
+        == hashlib.sha256(
+            (tmp_path / "output" / "runtime_contract.json").read_bytes()
+        ).hexdigest()
+    )
 
 
 def test_cli_does_not_expose_external_runtime_factory(monkeypatch, capsys) -> None:

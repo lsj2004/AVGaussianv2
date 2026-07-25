@@ -78,9 +78,7 @@ def _read_fd(fd: int, label: str) -> bytes:
         or before.st_uid != os.getuid()
         or before.st_nlink != 1
     ):
-        raise NativeContractError(
-            f"{label} must be an owned single-link regular file"
-        )
+        raise NativeContractError(f"{label} must be an owned single-link regular file")
     os.lseek(fd, 0, os.SEEK_SET)
     chunks = []
     while True:
@@ -89,6 +87,7 @@ def _read_fd(fd: int, label: str) -> bytes:
             break
         chunks.append(chunk)
     after = os.fstat(fd)
+
     def identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
         return (
             value.st_dev,
@@ -97,6 +96,7 @@ def _read_fd(fd: int, label: str) -> bytes:
             value.st_mtime_ns,
             value.st_ctime_ns,
         )
+
     if identity(before) != identity(after):
         raise NativeContractError(f"{label} changed while being snapshotted")
     return b"".join(chunks)
@@ -109,9 +109,7 @@ def _hash_fd(fd: int, label: str) -> str:
         or before.st_uid != os.getuid()
         or before.st_nlink != 1
     ):
-        raise NativeContractError(
-            f"{label} must be an owned single-link regular file"
-        )
+        raise NativeContractError(f"{label} must be an owned single-link regular file")
     digest = hashlib.sha256()
     os.lseek(fd, 0, os.SEEK_SET)
     while True:
@@ -159,9 +157,7 @@ def _open_absolute_regular(path: Path, label: str) -> int:
             directory = child
         return os.open(
             absolute.name,
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=directory,
         )
     except OSError as error:
@@ -186,9 +182,9 @@ def _verify_retained_path(path: Path, fd: int, label: str) -> None:
         current = os.stat(path, follow_symlinks=False)
     except OSError as error:
         raise NativeContractError(f"{label} disappeared while pinned") from error
-    if (
-        not stat.S_ISREG(current.st_mode)
-        or (current.st_dev, current.st_ino) != (retained.st_dev, retained.st_ino)
+    if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (
+        retained.st_dev,
+        retained.st_ino,
     ):
         raise NativeContractError(f"{label} path identity changed while pinned")
 
@@ -216,9 +212,7 @@ def _safe_regular(path: Path, label: str) -> None:
         or metadata.st_uid != os.getuid()
         or metadata.st_nlink != 1
     ):
-        raise NativeContractError(
-            f"{label} must be an owned single-link regular file"
-        )
+        raise NativeContractError(f"{label} must be an owned single-link regular file")
 
 
 def _exact(value: object, fields: set[str], label: str) -> Mapping[str, Any]:
@@ -242,16 +236,16 @@ def _torch_pickle_ops_fd(fd: int) -> tuple[dict[str, int], set[str]]:
     """Inspect Torch's pickle opcode stream without executing pickle globals."""
     try:
         with os.fdopen(os.dup(fd), "rb") as stream, zipfile.ZipFile(stream) as archive:
-            names = [
-                name for name in archive.namelist() if name.endswith("/data.pkl")
-            ]
+            names = [name for name in archive.namelist() if name.endswith("/data.pkl")]
             if len(names) != 1:
                 raise NativeContractError(
                     "native checkpoint must contain exactly one Torch data.pkl"
                 )
             info = archive.getinfo(names[0])
             if info.file_size > 256 * 1024 * 1024:
-                raise NativeContractError("native checkpoint pickle is unreasonably large")
+                raise NativeContractError(
+                    "native checkpoint pickle is unreasonably large"
+                )
             data = archive.read(names[0])
     except (OSError, zipfile.BadZipFile, KeyError) as error:
         raise NativeContractError(
@@ -322,7 +316,9 @@ def _checkpoint_metadata(
                 "AudioGS checkpoint epoch/update/viewpoint metadata mismatch"
             )
         if "audio_3dgs_mono_diff_gs_only" not in strings:
-            raise NativeContractError("AudioGS checkpoint model class metadata mismatch")
+            raise NativeContractError(
+                "AudioGS checkpoint model class metadata mismatch"
+            )
         model_class = "Audio3DGSMonoDiffGSOnly"
         completion = {
             "epoch_zero_based": 60,
@@ -346,7 +342,9 @@ def _checkpoint_metadata(
                 "marginal_gates",
             }.issubset(strings)
         ):
-            raise NativeContractError("FreeTimeGS++ Gaussians checkpoint schema mismatch")
+            raise NativeContractError(
+                "FreeTimeGS++ Gaussians checkpoint schema mismatch"
+            )
         model_class = "ftgspp.models.gaussians.Gaussians"
         completion = {"iterations": 30_000}
     else:
@@ -402,22 +400,15 @@ def _git_identity(root: Path) -> dict[str, str]:
 
 
 def _source_files(kind: str, root: Path) -> tuple[Path, ...]:
-    relative = (
+    paths = (
         (
-            "configs/audio_3dgs_replaynvas_viewpoint.yaml",
-            "tools/train_audio_3dgs_viewpoint.py",
-            "libs/trainers/Audio3DGSTrainer.py",
-            "libs/models/audio_3dgs_mono_diff_gs_only.py",
+            root / "configs" / "audio_3dgs_replaynvas_viewpoint.yaml",
+            root / "tools" / "train_audio_3dgs_viewpoint.py",
+            *sorted(root.joinpath("libs").rglob("*.py")),
         )
         if kind == "audiogs"
-        else (
-            "ftgspp/train/__init__.py",
-            "ftgspp/train/train.py",
-            "ftgspp/models/gaussians.py",
-            "ftgspp/data/flow.py",
-        )
+        else tuple(sorted(root.joinpath("ftgspp").rglob("*.py")))
     )
-    paths = tuple(root / item for item in relative)
     for path in paths:
         _safe_regular(path, "upstream source audit")
     return paths
@@ -434,8 +425,7 @@ def _record_set_sha256(records: Sequence[Mapping[str, str]]) -> str:
 def _atomic_json(path: Path, value: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     data = (
-        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        + "\n"
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
     ).encode()
     descriptor, name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
@@ -565,11 +555,12 @@ def finalize_native_contract(
             "audio_upstream_root" if model_kind == "audiogs" else "visual_upstream_root"
         ]
     )
-    if (
-        Path(os.path.abspath(checkpoint)) != configured_checkpoint
-        or Path(os.path.abspath(upstream)) != Path(os.path.abspath(configured_root))
-    ):
-        raise NativeContractError("native checkpoint/upstream path differs from protocol")
+    if Path(os.path.abspath(checkpoint)) != configured_checkpoint or Path(
+        os.path.abspath(upstream)
+    ) != Path(os.path.abspath(configured_root)):
+        raise NativeContractError(
+            "native checkpoint/upstream path differs from protocol"
+        )
     checkpoint_fd = _open_absolute_regular(checkpoint, "native checkpoint")
     try:
         checkpoint_sha256 = _hash_fd(checkpoint_fd, "native checkpoint")
@@ -598,9 +589,7 @@ def finalize_native_contract(
             provenance, "provenance.snapshot", files, "provenance"
         ),
         "seed_records": [
-            _snapshot_record(
-                path, f"seed_{index:02d}.snapshot", files, "seed record"
-            )
+            _snapshot_record(path, f"seed_{index:02d}.snapshot", files, "seed record")
             for index, path in enumerate(seed_records)
         ],
         "source_audits": source_audits,
@@ -659,13 +648,18 @@ def finalize_native_contract(
             for path in seed_records
         ]
         stages = {
-            tuple(audit["argv"][audit["argv"].index(option) + 1] for option in ("--from", "--to"))
+            tuple(
+                audit["argv"][audit["argv"].index(option) + 1]
+                for option in ("--from", "--to")
+            )
             if "--from" in audit["argv"]
             else ("flow", "flow")
             for audit in seed_audits
         }
         if stages != {("extract", "prep"), ("points", "train"), ("flow", "flow")}:
-            raise NativeContractError("FTGS++ seed records do not cover prep/flow/train")
+            raise NativeContractError(
+                "FTGS++ seed records do not cover prep/flow/train"
+            )
         flow_root = Path(config_audit["namespaces"][-1])
         flow_audit = audit_ftgspp_flow_cache(
             flow_root,
@@ -737,9 +731,7 @@ def finalize_native_contract(
                 {
                     "model_kind": model_kind,
                     "model_class": checkpoint_metadata["model_class"],
-                    "state_schema_sha256": checkpoint_metadata[
-                        "state_schema_sha256"
-                    ],
+                    "state_schema_sha256": checkpoint_metadata["state_schema_sha256"],
                     "checkpoint_sha256": checkpoint_sha256,
                     "source_sha256": contract["upstream"]["source_sha256"],
                 }
@@ -785,9 +777,7 @@ def _readat_regular(parent_fd: int, name: str, label: str) -> bytes:
     try:
         descriptor = os.open(
             name,
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=parent_fd,
         )
     except OSError as error:
@@ -796,10 +786,9 @@ def _readat_regular(parent_fd: int, name: str, label: str) -> bytes:
         data = _read_fd(descriptor, label)
         retained = os.fstat(descriptor)
         current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if (
-            not stat.S_ISREG(current.st_mode)
-            or (current.st_dev, current.st_ino)
-            != (retained.st_dev, retained.st_ino)
+        if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (
+            retained.st_dev,
+            retained.st_ino,
         ):
             raise NativeContractError(f"{label} identity changed while pinned")
         return data
@@ -823,12 +812,13 @@ def _load_native_generation(
             raise NativeContractError(
                 "native contract output contains unexpected entries"
             )
-        pointer_data = _readat_regular(root_fd, "current.json", "native current pointer")
+        pointer_data = _readat_regular(
+            root_fd, "current.json", "native current pointer"
+        )
         pointer = json.loads(pointer_data)
         if (
             not isinstance(pointer, Mapping)
-            or set(pointer)
-            != {"schema", "version", "generation", "manifest_sha256"}
+            or set(pointer) != {"schema", "version", "generation", "manifest_sha256"}
             or pointer["schema"] != f"{SCHEMA}.current"
             or pointer["version"] != 1
         ):
@@ -836,8 +826,7 @@ def _load_native_generation(
         relative = pointer["generation"]
         if (
             not isinstance(relative, str)
-            or Path(relative).parts
-            != ("generations", Path(relative).name)
+            or Path(relative).parts != ("generations", Path(relative).name)
             or not Path(relative).name.startswith("generation-")
         ):
             raise NativeContractError("native generation pointer is unsafe")
@@ -847,9 +836,7 @@ def _load_native_generation(
             if not generation_names or any(
                 not name.startswith("generation-") for name in generation_names
             ):
-                raise NativeContractError(
-                    "native generations contain unsafe entries"
-                )
+                raise NativeContractError("native generations contain unsafe entries")
             generation_fd = _openat_directory(
                 generations_fd, Path(relative).name, "native generation"
             )
@@ -972,9 +959,7 @@ def _verify_native_snapshot(
     inputs = _exact(inputs, expected_inputs, "native contract inputs")
 
     def snapshot(record_value: object, label: str) -> tuple[Mapping[str, Any], bytes]:
-        record = _exact(
-            record_value, {"path", "sha256", "snapshot"}, label
-        )
+        record = _exact(record_value, {"path", "sha256", "snapshot"}, label)
         name = record["snapshot"]
         if not isinstance(name, str) or name not in files:
             raise NativeContractError(f"{label} snapshot is missing")
@@ -991,7 +976,9 @@ def _verify_native_snapshot(
         raw = yaml.safe_load(config_bytes)
         provenance_value = json.loads(provenance_bytes)
     except (UnicodeDecodeError, ValueError, yaml.YAMLError) as error:
-        raise NativeContractError(f"native protocol snapshot parse failed: {error}") from error
+        raise NativeContractError(
+            f"native protocol snapshot parse failed: {error}"
+        ) from error
     if (
         not isinstance(raw, Mapping)
         or raw.get("scene", {}).get("id") != contract["scene_id"]
@@ -1047,6 +1034,13 @@ def _verify_native_snapshot(
             raise NativeContractError(f"native {collection} must be a list")
         for record in inputs[collection]:
             snapshot(record, f"native {collection}")
+    expected_source_paths = tuple(
+        str(path) for path in _source_files(contract["model_kind"], configured_upstream)
+    )
+    if tuple(record["path"] for record in inputs["source_audits"]) != (
+        expected_source_paths
+    ):
+        raise NativeContractError("native source audit path set mismatch")
     checkpoint = _exact(
         contract["checkpoint"],
         {"path", "sha256", "model_class", "metadata", "state_schema_sha256"},
@@ -1102,10 +1096,10 @@ def _verify_native_snapshot(
         )
         _, conversion_bytes = snapshot(record, "AudioGS conversion manifest")
         if len(inputs["seed_records"]) != 1:
-            raise NativeContractError("AudioGS native contract seed record count mismatch")
-        _, seed_bytes = snapshot(
-            inputs["seed_records"][0], "AudioGS seed record"
-        )
+            raise NativeContractError(
+                "AudioGS native contract seed record count mismatch"
+            )
+        _, seed_bytes = snapshot(inputs["seed_records"][0], "AudioGS seed record")
         seed_value = json.loads(seed_bytes)
         seed_audit = _audit_audiogs_seed_mapping(
             seed_value, expected_scene=contract["scene_id"]
@@ -1169,8 +1163,7 @@ def _verify_native_snapshot(
             }
             or data_config.get("eval_cameras") != [37]
             or data_config.get("train_cameras") != {"start": 0, "stop": 38}
-            or init_config.get("temporal_flow_cameras")
-            != {"start": 0, "stop": 38}
+            or init_config.get("temporal_flow_cameras") != {"start": 0, "stop": 38}
             or init_config.get("keyframe_stride") != 10
             or init_config.get("temporal_motion_adapted") is not True
             or train_config.get("iterations") != 30_000
