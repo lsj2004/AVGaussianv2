@@ -1,0 +1,18 @@
+{
+  "scene_id": "scene1_opera",
+  "test_camera": "cam38",
+  "assets": [
+    {
+      "kind": "rgb",
+      "camera": "cam00-cam37",
+      "usage": "image_driven_initialization",
+      "path": "/mnt/sda/lisujing/Dataset/Sampled_data/v5_0630_dynerf/scene1_opera/cam00.mp4..cam37.mp4"
+    },
+    {
+      "kind": "camera_pose",
+      "camera": "cam38",
+      "usage": "geometry",
+      "path": "/mnt/sda/lisujing/Dataset/Sampled_data/v5_0630_dynerf/scene1_opera/poses_bounds.npy"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+extends = "@FTGSPP_ROOT@/configs/dynerf/ftgs/coffee_martini.toml"
+
+[data]
+video_path = "@ROOT@/runs/cam38_strict/scene1_opera/ftgspp/train_only_source"
+extracted_path = "@FTGSPP_ROOT@/_extracted/cam38_strict/scene1_opera"
+memmap_path = "@FTGSPP_ROOT@/_memmap/cam38_strict/scene1_opera"
+colmap_path = "@FTGSPP_ROOT@/_colmap/cam38_strict/scene1_opera"
+fps = 30
+scale = 0.5
+frames = { "start" = 0, "stop" = 130 }
+eval_cameras = [38]
+train_cameras = { "start" = 0, "stop" = 38 }
+
+[init]
+points_path = "@FTGSPP_ROOT@/_points/cam38_strict/scene1_opera"
+temporal_motion_adapted = true
+temporal_flow_path = "@FTGSPP_ROOT@/_flow/cam38_strict/scene1_opera"
+temporal_flow_cameras = { "start" = 0, "stop" = 38 }
+temporal_covis_thresh = 0.3
+
+[train]
+iterations = 30000
+batch_size = 1
+color_correction = true
+color_correction_start = 3000
+color_corrector_weight = 1e-3

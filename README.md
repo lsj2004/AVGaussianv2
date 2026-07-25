@@ -161,6 +161,42 @@ The pilot never starts a long training run automatically. `READY` is only a reco
 review the metrics, logs, I/O cost, and durability warnings before separately authorizing a
 long run.
 
+## Dual-dataset cam38 benchmark
+
+The production comparison uses the same strict camera split for `scene1_opera`
+and `Scene7playing`: `cam00`–`cam37` train and `cam38` test. The immutable
+project configs are
+[`configs/benchmark_cam38/scene1_opera.yaml`](configs/benchmark_cam38/scene1_opera.yaml)
+and
+[`configs/benchmark_cam38/Scene7playing.yaml`](configs/benchmark_cam38/Scene7playing.yaml).
+They use seed 42 and independent `cam38_strict` output, extraction, memmap,
+COLMAP, point, and temporal-flow namespaces; historical cam10 artifacts are
+not valid initialization.
+
+The native AudioGS budget is batch size 1 for 61 epochs. This resolves to
+2,318 updates for scene1 (38 training examples) and 6,954 updates for Scene7
+(114 training examples). Scene7 is deliberately a single shared viewpoint-39 model
+over all three clips: `A3DGS_FRAME_ID` is unset. The native FreeTimeGS++ budget
+is batch size 1 for 30,000 updates. Optimizer updates, epochs, dataset length,
+batch size, and sample exposures are all recorded so later comparisons do not
+silently equate unlike epoch definitions.
+
+The upstream preparation entrypoints are:
+
+```bash
+scripts/train_audiogs_cam38_baselines.sh
+scripts/prepare_ftgspp_cam38_baselines.sh
+```
+
+Each command audits the strict split and initialization provenance, prints its
+fully resolved upstream commands, and does not launch training unless `--execute` is supplied.
+In particular, the FTGS++ train-only source links only cam00
+through cam37; the committed provenance permits cam38 pose/intrinsics but
+fails closed if cam38 RGB/depth is declared as an image-driven initialization,
+point, SfM/COLMAP, or temporal-flow input. These scripts prepare native assets
+only; the fixed 30,000-update fusion/audio-only/visual-only continuations and
+final common cam38 evaluator are separate benchmark stages.
+
 ## Outputs
 
 Every run writes `resolved_config.json`, `loss_history.json`, `gradient_norms.json`,
