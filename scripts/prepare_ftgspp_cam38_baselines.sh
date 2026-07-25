@@ -6,17 +6,35 @@ FTGSPP_ROOT="/mnt/sda/lisujing/Dataset/FreeTimeGSPlusPlus"
 SAMPLED_ROOT="/mnt/sda/lisujing/Dataset/Sampled_data/v5_0630_dynerf"
 PYTHON="${AVGAUSSIANV2_PYTHON:-${ROOT}/.venv/bin/python}"
 EXECUTE=0
+PREFLIGHT_ONLY=0
 SCENE_FILTER=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --execute) EXECUTE=1; shift ;;
+    --preflight-only) PREFLIGHT_ONLY=1; shift ;;
     --scene) SCENE_FILTER="${2:-}"; shift 2 ;;
-    *) echo "usage: $0 [--execute] [--scene scene1_opera|Scene7playing]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--execute] [--preflight-only] [--scene scene1_opera|Scene7playing]" >&2; exit 2 ;;
   esac
 done
+if [[ "${EXECUTE}" -eq 1 && "${PREFLIGHT_ONLY}" -eq 1 ]]; then
+  echo "--execute and --preflight-only are mutually exclusive" >&2
+  exit 2
+fi
 if [[ -n "${SCENE_FILTER}" && "${SCENE_FILTER}" != "scene1_opera" && "${SCENE_FILTER}" != "Scene7playing" ]]; then
   echo "unsupported scene: ${SCENE_FILTER}" >&2
   exit 2
+fi
+PHYSICAL_GPU="${CUDA_VISIBLE_DEVICES:-0}"
+if [[ ! "${PHYSICAL_GPU}" =~ ^[0-9]+$ ]]; then
+  echo "CUDA_VISIBLE_DEVICES must name exactly one nonnegative GPU ID" >&2
+  exit 2
+fi
+export CUDA_VISIBLE_DEVICES="${PHYSICAL_GPU}"
+LOCAL_DEVICE="cuda:0"
+if [[ -n "${SCENE_FILTER}" ]]; then
+  SCENES=("${SCENE_FILTER}")
+else
+  SCENES=("scene1_opera" "Scene7playing")
 fi
 
 # Frozen upstream TOML contract:
@@ -34,6 +52,34 @@ run_command() {
   fi
 }
 
+preflight_scene() {
+  local scene="$1"
+  local config="${ROOT}/configs/benchmark_cam38/${scene}.yaml"
+  local provenance="${ROOT}/configs/benchmark_cam38/provenance/${scene}.json"
+  local template="${ROOT}/configs/upstream/ftgspp_cam38/${scene}.toml.in"
+  local source="${SAMPLED_ROOT}/${scene}"
+
+  [[ -x "${FTGSPP_ROOT}/.venv/bin/python" ]] || {
+    echo "missing FreeTimeGS++ Python: ${FTGSPP_ROOT}/.venv/bin/python" >&2
+    exit 1
+  }
+  [[ -f "${FTGSPP_ROOT}/run" ]] || {
+    echo "missing FreeTimeGS++ entrypoint: ${FTGSPP_ROOT}/run" >&2
+    exit 1
+  }
+  [[ -f "${template}" ]] || {
+    echo "missing FreeTimeGS++ template: ${template}" >&2
+    exit 1
+  }
+  [[ -f "${source}/poses_bounds.npy" ]] || {
+    echo "missing scene calibration: ${source}/poses_bounds.npy" >&2
+    exit 1
+  }
+  "${PYTHON}" -m avgaussianv2.cli.audit_cam38_assets \
+    --config "${config}" --provenance "${provenance}"
+  echo "Preflight complete: ${scene} (physical GPU ${PHYSICAL_GPU} -> ${LOCAL_DEVICE})"
+}
+
 prepare_scene() {
   local scene="$1"
   local config="${ROOT}/configs/benchmark_cam38/${scene}.yaml"
@@ -47,9 +93,6 @@ prepare_scene() {
   local marker_root="${ROOT}/runs/cam38_strict/${scene}/protocol/namespace_markers"
   local seed_root="${ROOT}/runs/cam38_strict/${scene}/protocol/seed_records"
   local seeded_wrapper="${ROOT}/avgaussianv2/cli/run_seeded_ftgspp.py"
-
-  "${PYTHON}" -m avgaussianv2.cli.audit_cam38_assets \
-    --config "${config}" --provenance "${provenance}"
 
   echo "Train-only source for ${scene}: cam00..cam37; cam38 RGB is not linked."
   if [[ "${EXECUTE}" -eq 1 ]]; then
@@ -84,18 +127,20 @@ prepare_scene() {
 
   (
     cd "${FTGSPP_ROOT}"
-    run_command env PYTHONHASHSEED=42 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+    run_command env CUDA_VISIBLE_DEVICES="${PHYSICAL_GPU}" \
+      PYTHONHASHSEED=42 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
       .venv/bin/python "${seeded_wrapper}" \
       --seed 42 --record "${seed_root}/prep.json" \
       --script "${FTGSPP_ROOT}/run" -- dynerf \
       "${generated_config_dir}" \
       "${run_root}" \
       --scenes "${scene}" --from extract --to prep
-    run_command env PYTHONHASHSEED=42 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+    run_command env CUDA_VISIBLE_DEVICES="${PHYSICAL_GPU}" \
+      PYTHONHASHSEED=42 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
       .venv/bin/python "${seeded_wrapper}" \
       --seed 42 --record "${seed_root}/flow.json" \
       --module ftgspp.data.flow -- \
-      "${generated_config}" --cameras 0-37
+      "${generated_config}" --cameras 0-37 --device "${LOCAL_DEVICE}"
   )
 
   if [[ "${EXECUTE}" -eq 1 ]]; then
@@ -114,7 +159,8 @@ prepare_scene() {
 
   (
     cd "${FTGSPP_ROOT}"
-    run_command env PYTHONHASHSEED=42 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+    run_command env CUDA_VISIBLE_DEVICES="${PHYSICAL_GPU}" \
+      PYTHONHASHSEED=42 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
       .venv/bin/python "${seeded_wrapper}" \
       --seed 42 --record "${seed_root}/train.json" \
       --script "${FTGSPP_ROOT}/run" -- dynerf \
@@ -144,11 +190,14 @@ prepare_scene() {
   fi
 }
 
-echo "Mode: $([[ ${EXECUTE} -eq 1 ]] && echo execute || echo dry-run)"
+echo "Mode: $([[ ${EXECUTE} -eq 1 ]] && echo execute || ([[ ${PREFLIGHT_ONLY} -eq 1 ]] && echo preflight-only || echo dry-run))"
 echo "FreeTimeGS++ seed 42 is bound by the deterministic wrapper for every executed stage; batch_size=1, iterations=30000."
-if [[ -z "${SCENE_FILTER}" || "${SCENE_FILTER}" == "scene1_opera" ]]; then
-  prepare_scene scene1_opera
+for scene in "${SCENES[@]}"; do
+  preflight_scene "${scene}"
+done
+if [[ "${PREFLIGHT_ONLY}" -eq 1 ]]; then
+  exit 0
 fi
-if [[ -z "${SCENE_FILTER}" || "${SCENE_FILTER}" == "Scene7playing" ]]; then
-  prepare_scene Scene7playing
-fi
+for scene in "${SCENES[@]}"; do
+  prepare_scene "${scene}"
+done
