@@ -423,6 +423,64 @@ def test_pinned_input_rejects_symlinked_ancestor(tmp_path):
             pass
 
 
+@pytest.mark.parametrize("process_component", ["self", str(os.getpid())])
+def test_pinned_input_accepts_owned_retained_fd_descendant(
+    tmp_path, process_component
+):
+    root = tmp_path / "retained"
+    child = root / "protocol"
+    child.mkdir(parents=True)
+    source = child / "resolved_project.yaml"
+    source.write_bytes(b"trusted")
+    root_fd = os.open(
+        root,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        retained = (
+            Path(f"/proc/{process_component}/fd/{root_fd}")
+            / "protocol"
+            / "resolved_project.yaml"
+        )
+        with _PinnedInput(retained, hashlib.sha256(b"trusted").hexdigest()) as pin:
+            assert pin.data == b"trusted"
+            assert pin.proc_path.read_bytes() == b"trusted"
+    finally:
+        os.close(root_fd)
+
+
+def test_pinned_input_retained_fd_descendant_still_rejects_symlink(tmp_path):
+    root = tmp_path / "retained"
+    root.mkdir()
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "source.py").write_bytes(b"trusted")
+    (root / "alias").symlink_to(real, target_is_directory=True)
+    root_fd = os.open(
+        root,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        with pytest.raises(OSError):
+            with _PinnedInput(
+                Path(f"/proc/self/fd/{root_fd}") / "alias" / "source.py", None
+            ):
+                pass
+    finally:
+        os.close(root_fd)
+
+
+def test_pinned_input_accepts_exact_retained_regular_fd(tmp_path):
+    source = tmp_path / "source.py"
+    source.write_bytes(b"trusted")
+    source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        with _PinnedInput(Path(f"/proc/self/fd/{source_fd}"), None) as pin:
+            assert pin.data == b"trusted"
+    finally:
+        os.close(source_fd)
+
+
 def test_pinned_input_detects_ancestor_swap_and_keeps_snapshot_bytes(tmp_path):
     ancestor = tmp_path / "source"
     ancestor.mkdir()

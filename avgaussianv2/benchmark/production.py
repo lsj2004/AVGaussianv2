@@ -33,6 +33,7 @@ from avgaussianv2.benchmark.evaluation import (
     TrainingEvidence,
 )
 from avgaussianv2.benchmark.native import verify_native_contract
+from avgaussianv2.benchmark.output import _proc_fd_parts
 from avgaussianv2.benchmark.runtime import (
     BenchmarkRuntime,
     ProductionRuntimeSnapshot,
@@ -81,10 +82,35 @@ class _PinnedInput:
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_NOFOLLOW", 0)
         )
-        directory_fd = os.open("/", directory_flags)
-        trusted_directory_owners = {os.getuid(), os.fstat(directory_fd).st_uid}
+        parsed_proc_fd = _proc_fd_parts(self.path)
+        if parsed_proc_fd is not None and not parsed_proc_fd[1]:
+            self.fd = os.open(
+                parsed_proc_fd[0],
+                file_flags & ~getattr(os, "O_NOFOLLOW", 0),
+            )
+            directory_fd = None
+            descendants: tuple[str, ...] = ()
+        elif parsed_proc_fd is not None:
+            directory_fd = os.open(
+                parsed_proc_fd[0],
+                directory_flags & ~getattr(os, "O_NOFOLLOW", 0),
+            )
+            descendants = parsed_proc_fd[1]
+        else:
+            directory_fd = os.open("/", directory_flags)
+            descendants = self.path.parts[1:]
+        trusted_directory_owners = {os.getuid(), os.stat("/").st_uid}
         try:
-            for component in self.path.parts[1:-1]:
+            if directory_fd is not None:
+                retained_directory = os.fstat(directory_fd)
+                if (
+                    not stat.S_ISDIR(retained_directory.st_mode)
+                    or retained_directory.st_uid not in trusted_directory_owners
+                ):
+                    raise ValueError(
+                        f"evaluation input ancestor is unsafe: {self.path}"
+                    )
+            for component in descendants[:-1]:
                 next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
                 metadata = os.fstat(next_fd)
                 if (
@@ -97,13 +123,15 @@ class _PinnedInput:
                     )
                 os.close(directory_fd)
                 directory_fd = next_fd
-            self.fd = os.open(
-                self.path.name,
-                file_flags,
-                dir_fd=directory_fd,
-            )
+            if directory_fd is not None:
+                self.fd = os.open(
+                    descendants[-1],
+                    file_flags,
+                    dir_fd=directory_fd,
+                )
         finally:
-            os.close(directory_fd)
+            if directory_fd is not None:
+                os.close(directory_fd)
         metadata = os.fstat(self.fd)
         if (
             not stat.S_ISREG(metadata.st_mode)
@@ -151,7 +179,12 @@ class _PinnedInput:
             raise RuntimeError("evaluation input is not pinned")
         retained = os.fstat(self.fd)
         try:
-            current = self.path.lstat()
+            parsed_proc_fd = _proc_fd_parts(self.path)
+            current = (
+                self.path.stat()
+                if parsed_proc_fd is not None and not parsed_proc_fd[1]
+                else self.path.lstat()
+            )
         except OSError as error:
             raise RuntimeError(
                 f"evaluation input identity changed: {self.path}"
@@ -162,7 +195,10 @@ class _PinnedInput:
         if (
             (retained.st_dev, retained.st_ino) != self.identity
             or (current.st_dev, current.st_ino) != self.identity
-            or stat.S_ISLNK(current.st_mode)
+            or (
+                (parsed_proc_fd is None or parsed_proc_fd[1])
+                and stat.S_ISLNK(current.st_mode)
+            )
             or hashlib.sha256(retained_data).hexdigest() != self.expected_sha256
         ):
             raise RuntimeError(f"evaluation input identity changed: {self.path}")
