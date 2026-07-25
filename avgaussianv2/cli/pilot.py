@@ -1237,7 +1237,9 @@ def run_pilot(
         resumed_variants: set[Variant] = set()
         for variant, gpu in zip(VARIANT_GPU_ORDER, gpus, strict=True):
             worker_dir, worker_child_dir = worker_dirs[variant]
-            has_entries = worker_dir.is_dir() and any(worker_dir.iterdir())
+            has_entries = worker_dir.is_dir() and any(
+                entry.name != ".pilot.lock" for entry in worker_dir.iterdir()
+            )
             if has_entries:
                 try:
                     verified_workers[variant] = verify_worker_output(

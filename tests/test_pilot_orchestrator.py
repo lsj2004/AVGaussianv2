@@ -464,6 +464,27 @@ def test_run_pilot_sequences_baseline_workers_and_evaluations(
     assert json.loads((output / "status.json").read_text())["ready"] is True
 
     starts_before = len(assignments)
+    for variant in Variant:
+        worker_dir = output / "workers" / variant.value
+        (worker_dir / "complete.marker").unlink()
+        (worker_dir / ".pilot.lock").write_text("retained failed attempt")
+    run_pilot(
+        config,
+        output,
+        resume=True,
+        runner=Runner(),
+        gpu_validator=lambda ids: None,
+        trust_upstream_artifacts=True,
+    )
+    relaunched = [
+        item
+        for item in assignments[starts_before:]
+        if item[0][2] == "avgaussianv2.cli.pilot_worker"
+    ]
+    assert len(relaunched) == 3
+    assert all("--resume" not in item[0] for item in relaunched)
+
+    starts_before = len(assignments)
     tree_before = {
         path.relative_to(output): (path.lstat().st_ino, path.lstat().st_mtime_ns)
         for path in output.rglob("*")
