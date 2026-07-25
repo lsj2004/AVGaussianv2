@@ -936,9 +936,6 @@ class PilotTrainer:
                 on_best_candidate(event)
             return should_stop
 
-        last_validation_step = (
-            None if not validation_history else validation_history[-1]["step"]
-        )
         pending_validation = checkpoint_pending_validation
         stop_requested = checkpoint_stop_requested
         if pending_validation:

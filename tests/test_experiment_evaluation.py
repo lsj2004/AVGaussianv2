@@ -4,7 +4,6 @@ import fcntl
 import json
 import os
 from dataclasses import replace
-from pathlib import Path
 
 import pytest
 import torch

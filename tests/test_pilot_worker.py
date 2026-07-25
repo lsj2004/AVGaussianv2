@@ -761,7 +761,6 @@ def test_resume_rejects_corrupt_checkpoint_before_runtime_factory(tmp_path) -> N
 
 def test_resume_uses_canonical_manifest_semantics_not_whitespace(tmp_path) -> None:
     from avgaussianv2.cli.pilot_worker import run_worker
-    from avgaussianv2.experiment.checkpoint import PilotResumeError
 
     config, manifest, baseline, _ = _manifest_files(tmp_path)
     output = tmp_path / "run"

@@ -512,7 +512,7 @@ def _verify_existing(
         if not isinstance(item["condition_enabled"], bool):
             raise TypeError("evaluation condition_enabled must be boolean")
         system_name = _json_text_value(item["system_name"], "system_name")
-        condition_enabled = _json_bool(
+        _json_bool(
             item["condition_enabled"], f"{system_name}.condition_enabled"
         )
         count = _json_int(item["count"], f"{system_name}.count", minimum=1)

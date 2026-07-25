@@ -11,7 +11,21 @@ import torch
 from torch import nn
 
 import avgaussianv2.experiment.report as report_module
-from avgaussianv2.experiment.contracts import EvaluationResult
+from avgaussianv2.config import TrainConfig
+from avgaussianv2.experiment import PilotDecision as ExportedPilotDecision
+from avgaussianv2.experiment.checkpoint import (
+    PilotCompatibility,
+    PilotResumeError,
+    build_pilot_payload,
+    build_run_fingerprint,
+    hash_index_manifest,
+    sha256_file,
+)
+from avgaussianv2.experiment.contracts import (
+    EvaluationResult,
+    PilotConfig,
+    VariantIndices,
+)
 from avgaussianv2.experiment.evaluation import METRIC_NAMES
 from avgaussianv2.experiment.metrics import aggregate_metrics
 from avgaussianv2.experiment.report import (
@@ -27,22 +41,11 @@ from avgaussianv2.experiment.report import (
     paired_audio_deltas,
     resolve_current_report,
 )
+from avgaussianv2.experiment.selection import BestSelector, EarlyStopper
 
 
 def test_worker_artifact_provenance_contract_is_exported():
     assert hasattr(report_module, "WorkerArtifactProvenance")
-from avgaussianv2.config import TrainConfig
-from avgaussianv2.experiment.checkpoint import (
-    PilotCompatibility,
-    PilotResumeError,
-    build_pilot_payload,
-    build_run_fingerprint,
-    hash_index_manifest,
-    sha256_file,
-)
-from avgaussianv2.experiment.contracts import PilotConfig, VariantIndices
-from avgaussianv2.experiment.selection import BestSelector, EarlyStopper
-from avgaussianv2.experiment import PilotDecision as ExportedPilotDecision
 
 
 def _row(index: int, audio: float, *, psnr: float = 30.0, ssim: float = 0.95):
@@ -192,7 +195,6 @@ def _system(
         "frozen_visual_on": "frozen_visual",
         "condition_off": "condition_off",
     }
-    condition = name.endswith("_on") if name != "baseline_imported" else False
     return SystemReportInput(
         name=name,
         evaluation=_evaluation(name, tuple(audio), psnr=psnr, ssim=ssim),
