@@ -216,7 +216,7 @@ def test_native_production_adapter_exposes_only_its_modality(
     monkeypatch.setattr("avgaussianv2.benchmark.production.build_runtime", build)
     monkeypatch.setattr(
         "avgaussianv2.benchmark.production.load_audited_benchmark_config",
-        lambda _path: (config, source_sha256),
+        lambda _path, **_kwargs: (config, source_sha256),
     )
     monkeypatch.setattr(
         "avgaussianv2.benchmark.production.verify_native_contract",
@@ -270,7 +270,7 @@ def test_native_adapter_rejects_changed_upstream_source_before_runtime(
     source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
     monkeypatch.setattr(
         "avgaussianv2.benchmark.production.load_audited_benchmark_config",
-        lambda _path: (config, source_sha256),
+        lambda _path, **_kwargs: (config, source_sha256),
     )
     monkeypatch.setattr(
         "avgaussianv2.benchmark.production.verify_native_contract",
@@ -345,8 +345,13 @@ def test_continuation_adapter_reseeds_both_random_runtime_constructions(
         runtime_contract_sha256=DIGEST,
     )
     config = load_project_config(resolved)
+    consumed_configs = []
 
     def training_runtime(**_kwargs):
+        original_config = resolved.read_bytes()
+        resolved.write_bytes(b"temporarily replaced")
+        consumed_configs.append(Path(_kwargs["config_path"]).read_bytes())
+        resolved.write_bytes(original_config)
         model = random_model()
         return BenchmarkRuntime(
             model=model,
@@ -371,7 +376,7 @@ def test_continuation_adapter_reseeds_both_random_runtime_constructions(
 
     monkeypatch.setattr(
         "avgaussianv2.benchmark.production.load_audited_benchmark_config",
-        lambda _path: (config, config_sha256),
+        lambda _path, **_kwargs: (config, config_sha256),
     )
     monkeypatch.setattr(
         "avgaussianv2.benchmark.production.build_production_runtime",
@@ -392,3 +397,4 @@ def test_continuation_adapter_reseeds_both_random_runtime_constructions(
     )
 
     runtime_factory()
+    assert consumed_configs == [resolved.read_bytes()]

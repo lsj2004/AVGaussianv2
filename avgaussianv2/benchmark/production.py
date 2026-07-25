@@ -60,7 +60,7 @@ SCENE_COUNTS = {"scene1_opera": 130, "Scene7playing": 293}
 class _PinnedInput:
     """Retain and snapshot one audited input while runtime code consumes it."""
 
-    def __init__(self, path: Path, expected_sha256: str) -> None:
+    def __init__(self, path: Path, expected_sha256: str | None) -> None:
         self.path = path
         self.expected_sha256 = expected_sha256
         self.fd: int | None = None
@@ -84,9 +84,11 @@ class _PinnedInput:
         self.identity = (metadata.st_dev, metadata.st_ino)
         with os.fdopen(os.dup(self.fd), "rb") as stream:
             self.data = stream.read()
-        if hashlib.sha256(self.data).hexdigest() != self.expected_sha256:
+        digest = hashlib.sha256(self.data).hexdigest()
+        if self.expected_sha256 is not None and digest != self.expected_sha256:
             self.close()
             raise ValueError(f"evaluation input hash mismatch: {self.path}")
+        self.expected_sha256 = digest
         descriptor, snapshot_name = tempfile.mkstemp(
             prefix="avgaussianv2-evaluation-input-"
         )
@@ -529,70 +531,86 @@ def build_evaluation_adapters(
     holder: dict[str, object] = {}
 
     def runtime_factory() -> BenchmarkEvaluationRuntime:
-        resolved_sha256 = sha256_file(resolved_config)
-        config, source_config_sha256 = load_audited_benchmark_config(resolved_config)
-        if config.scene.scene_id != evidence.scene_id:
-            raise ValueError("evaluation config/evidence scene mismatch")
-        relevant_checkpoint: Path | None = None
-        native_source_records: tuple[tuple[Path, str], ...] = ()
-        training_runtime: BenchmarkRuntime | None = None
-        if evidence.role == "continuation":
-            if evidence.config_sha256 != resolved_sha256:
-                raise ValueError("continuation config/evidence hash mismatch")
-            checkpoint_bytes = Path(evidence.checkpoint_path).read_bytes()
-            if (
-                hashlib.sha256(checkpoint_bytes).hexdigest()
-                != evidence.checkpoint_sha256
-            ):
-                raise ValueError("continuation checkpoint/evidence hash mismatch")
-            holder["checkpoint_bytes"] = checkpoint_bytes
-        elif evidence.system_name == "native_audiogs":
-            relevant_checkpoint = config.paths.audio_checkpoint.resolve()
-        elif evidence.system_name == "native_ftgspp":
-            relevant_checkpoint = config.paths.visual_checkpoint.resolve()
-        else:
-            raise ValueError("unsupported production evaluation evidence")
-        if relevant_checkpoint is not None and (
-            relevant_checkpoint != Path(evidence.checkpoint_path).resolve()
-            or source_config_sha256 != evidence.config_sha256
-            or sha256_file(relevant_checkpoint) != evidence.checkpoint_sha256
-        ):
-            raise ValueError("native config/checkpoint evidence mismatch")
-        if evidence.role == "native_reference":
-            contract = verify_native_contract(
-                Path(evidence.native_contract_path),
-                expected_scene=evidence.scene_id,
-                expected_model_kind=(
-                    "audiogs" if evidence.system_name == "native_audiogs" else "ftgspp"
-                ),
-            )
-            native_source_records = tuple(
-                (Path(record["path"]), record["sha256"])
-                for record in contract["inputs"]["source_audits"]
-            )
-            if any(
-                not path.is_file() or path.is_symlink() or sha256_file(path) != digest
-                for path, digest in native_source_records
-            ):
-                raise ValueError(
-                    "native upstream execution source changed after training"
-                )
-        upstream_roots = (
-            config.paths.audio_upstream_root.resolve(),
-            config.paths.visual_upstream_root.resolve(),
-        )
-        roots_by_kind = {
-            "audiogs": upstream_roots[0],
-            "ftgspp": upstream_roots[1],
-        }
-        all_source_records = tuple(
-            (
-                roots_by_kind[key.split(":", 1)[0]] / key.split(":", 1)[1],
-                digest,
-            )
-            for key, digest in sorted(upstream_source_inventory(config).items())
-        )
         with ExitStack() as pinned_inputs:
+            config_pin = pinned_inputs.enter_context(
+                _PinnedInput(Path(resolved_config), None)
+            )
+            origin_pin = pinned_inputs.enter_context(
+                _PinnedInput(
+                    Path(resolved_config).with_name("resolved_project.origin.json"),
+                    None,
+                )
+            )
+            pinned_config = config_pin.proc_path
+            pinned_origin = origin_pin.proc_path
+            resolved_sha256 = str(config_pin.expected_sha256)
+            config, source_config_sha256 = load_audited_benchmark_config(
+                pinned_config, origin_path=pinned_origin
+            )
+            if config.scene.scene_id != evidence.scene_id:
+                raise ValueError("evaluation config/evidence scene mismatch")
+            relevant_checkpoint: Path | None = None
+            native_source_records: tuple[tuple[Path, str], ...] = ()
+            training_runtime: BenchmarkRuntime | None = None
+            if evidence.role == "continuation":
+                if evidence.config_sha256 != resolved_sha256:
+                    raise ValueError("continuation config/evidence hash mismatch")
+                continuation_pin = pinned_inputs.enter_context(
+                    _PinnedInput(
+                        Path(evidence.checkpoint_path), evidence.checkpoint_sha256
+                    )
+                )
+                holder["checkpoint_bytes"] = continuation_pin.data
+            elif evidence.system_name == "native_audiogs":
+                relevant_checkpoint = config.paths.audio_checkpoint.resolve()
+            elif evidence.system_name == "native_ftgspp":
+                relevant_checkpoint = config.paths.visual_checkpoint.resolve()
+            else:
+                raise ValueError("unsupported production evaluation evidence")
+            if relevant_checkpoint is not None and (
+                relevant_checkpoint != Path(evidence.checkpoint_path).resolve()
+                or source_config_sha256 != evidence.config_sha256
+                or sha256_file(relevant_checkpoint) != evidence.checkpoint_sha256
+            ):
+                raise ValueError("native config/checkpoint evidence mismatch")
+            if evidence.role == "native_reference":
+                contract = verify_native_contract(
+                    Path(evidence.native_contract_path),
+                    expected_scene=evidence.scene_id,
+                    expected_model_kind=(
+                        "audiogs"
+                        if evidence.system_name == "native_audiogs"
+                        else "ftgspp"
+                    ),
+                )
+                native_source_records = tuple(
+                    (Path(record["path"]), record["sha256"])
+                    for record in contract["inputs"]["source_audits"]
+                )
+                if any(
+                    not path.is_file()
+                    or path.is_symlink()
+                    or sha256_file(path) != digest
+                    for path, digest in native_source_records
+                ):
+                    raise ValueError(
+                        "native upstream execution source changed after training"
+                    )
+            upstream_roots = (
+                config.paths.audio_upstream_root.resolve(),
+                config.paths.visual_upstream_root.resolve(),
+            )
+            roots_by_kind = {
+                "audiogs": upstream_roots[0],
+                "ftgspp": upstream_roots[1],
+            }
+            all_source_records = tuple(
+                (
+                    roots_by_kind[key.split(":", 1)[0]] / key.split(":", 1)[1],
+                    digest,
+                )
+                for key, digest in sorted(upstream_source_inventory(config).items())
+            )
             if relevant_checkpoint is not None:
                 checkpoint_pin = pinned_inputs.enter_context(
                     _PinnedInput(relevant_checkpoint, evidence.checkpoint_sha256)
@@ -616,9 +634,10 @@ def build_evaluation_adapters(
                 if evidence.role == "continuation":
                     _seed_evaluation_runtime(evidence.seed)
                     training_runtime = build_production_runtime(
-                        config_path=resolved_config,
+                        config_path=pinned_config,
                         device=torch.device(device),
                         trusted_upstream_artifacts=trusted_upstream_artifacts,
+                        config_origin_path=pinned_origin,
                     )
                     for name in (
                         "config_sha256",
@@ -640,21 +659,10 @@ def build_evaluation_adapters(
                 )
             for pinned in source_pins:
                 pinned.verify()
-        if (
-            sha256_file(resolved_config) != resolved_sha256
-            or (
-                relevant_checkpoint is not None
-                and sha256_file(relevant_checkpoint) != evidence.checkpoint_sha256
-            )
-            or (
-                evidence.role == "continuation"
-                and sha256_file(Path(evidence.checkpoint_path))
-                != evidence.checkpoint_sha256
-            )
+        if relevant_checkpoint is not None and (
+            sha256_file(relevant_checkpoint) != evidence.checkpoint_sha256
         ):
-            raise RuntimeError(
-                "evaluation config/checkpoint changed during construction"
-            )
+            raise RuntimeError("evaluation checkpoint changed during construction")
         if any(sha256_file(path) != digest for path, digest in native_source_records):
             raise RuntimeError("native upstream source changed during construction")
         if training_runtime is not None and state_sha256(bundle.model) != state_sha256(

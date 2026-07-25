@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import multiprocessing
 import os
+import signal
+import shutil
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
@@ -109,6 +113,13 @@ def _verified(output: Path, *, repository: Path, scene: str) -> SceneBenchmarkRe
 
 def _preflight(*_args, **_kwargs) -> dict[str, object]:
     return {"verified": True}
+
+
+def _crash_attempt(output: str) -> None:
+    with orchestration.BenchmarkOutputLock(output) as pinned:
+        attempt = orchestration._AttemptLogs(pinned, "scene1_opera").__enter__()
+        (attempt / "worker_audio_only.log").write_text("checkpoint committed\n")
+        os.kill(os.getpid(), signal.SIGKILL)
 
 
 def test_scene_assigns_three_workers_and_evaluations_to_three_gpus(
@@ -330,6 +341,59 @@ def test_partial_snapshot_is_rechecked_before_attempt_log_mutation(
                 pass
 
     assert not (output / "logs").exists()
+
+
+def test_dead_tail_attempt_is_sealed_before_new_resume_attempt(tmp_path: Path) -> None:
+    output = tmp_path / "result"
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(target=_crash_attempt, args=(str(output),))
+    process.start()
+    process.join(10)
+    assert process.exitcode == -signal.SIGKILL
+
+    orchestration._verify_logs(output, "scene1_opera", allow_interrupted_tail=True)
+    with orchestration.BenchmarkOutputLock(output) as pinned:
+        snapshot = orchestration._tree_snapshot_sha256(pinned)
+        with orchestration._AttemptLogs(
+            pinned, "scene1_opera", expected_snapshot=snapshot
+        ) as attempt:
+            assert attempt.name == "attempt-000001"
+            interrupted = json.loads(
+                (pinned / "logs" / "attempt-000000" / "manifest.json").read_text()
+            )
+            assert interrupted["state"] == "interrupted"
+            assert (attempt / "in_progress.json").is_file()
+
+    orchestration._verify_logs(output, "scene1_opera")
+
+
+def test_live_tail_attempt_is_rejected(tmp_path: Path) -> None:
+    output = tmp_path / "result"
+    with orchestration.BenchmarkOutputLock(output) as pinned:
+        orchestration._AttemptLogs(pinned, "scene1_opera").__enter__()
+        with pytest.raises(OrchestrationError, match="owner is still alive"):
+            orchestration._verify_logs(
+                pinned, "scene1_opera", allow_interrupted_tail=True
+            )
+
+
+def test_multiple_or_tampered_tail_attempts_fail_closed(tmp_path: Path) -> None:
+    output = tmp_path / "result"
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(target=_crash_attempt, args=(str(output),))
+    process.start()
+    process.join(10)
+    first = output / "logs" / "attempt-000000"
+    second = output / "logs" / "attempt-000001"
+    shutil.copytree(first, second)
+    with pytest.raises(OrchestrationError, match="uncommitted"):
+        orchestration._verify_logs(output, "scene1_opera", allow_interrupted_tail=True)
+    shutil.rmtree(second)
+    tampered = first / "worker_audio_only.log"
+    tampered.unlink()
+    tampered.symlink_to(tmp_path / "outside")
+    with pytest.raises(OrchestrationError, match="inventory is unsafe"):
+        orchestration._verify_logs(output, "scene1_opera", allow_interrupted_tail=True)
 
 
 def test_worker_resume_flag_is_only_emitted_for_committed_modes(tmp_path: Path) -> None:

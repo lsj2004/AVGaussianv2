@@ -321,14 +321,16 @@ class _AttemptLogs:
         self.attempt: Path | None = None
 
     def __enter__(self) -> Path:
+        source_snapshot = _tree_snapshot_sha256(self.root)
         if (
             self.expected_snapshot is not None
-            and _tree_snapshot_sha256(self.root) != self.expected_snapshot
+            and source_snapshot != self.expected_snapshot
         ):
             raise OrchestrationError(
                 "partial benchmark output changed before exclusive resume"
             )
         self.logs.mkdir(exist_ok=True)
+        _recover_interrupted_attempt(self.logs, self.identity)
         current = self.logs / "current.json"
         if current.is_file():
             value = json.loads(current.read_text())
@@ -336,6 +338,20 @@ class _AttemptLogs:
             self.previous = value["manifest_sha256"]
         self.attempt = self.logs / f"attempt-{self.sequence:06d}"
         self.attempt.mkdir()
+        _atomic_json(
+            self.attempt / "in_progress.json",
+            {
+                "schema": f"{SCHEMA}.logs.in-progress",
+                "version": 1,
+                "identity": self.identity,
+                "sequence": self.sequence,
+                "previous_manifest_sha256": self.previous,
+                "owner_pid": os.getpid(),
+                "owner_start_ticks": _process_start_ticks(os.getpid()),
+                "started_time_ns": time.time_ns(),
+                "source_snapshot_sha256": source_snapshot,
+            },
+        )
         return self.attempt
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
@@ -365,7 +381,7 @@ class _AttemptLogs:
             "identity": self.identity,
             "sequence": self.sequence,
             "previous_manifest_sha256": self.previous,
-            "outcome": "failed" if exc_type is not None else "complete",
+            "state": "failed" if exc_type is not None else "complete",
             "exception_type": None if exc_type is None else exc_type.__name__,
             "sha256": hashes,
         }
@@ -385,28 +401,196 @@ class _AttemptLogs:
         )
 
 
-def _verify_logs(root: Path, identity: str) -> None:
-    logs = root / "logs"
+def _process_start_ticks(pid: int) -> int:
+    try:
+        value = Path(f"/proc/{pid}/stat").read_text()
+        return int(value.rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError) as error:
+        raise OrchestrationError(f"cannot identify attempt owner pid {pid}") from error
+
+
+def _attempt_owner_live(contract: Mapping[str, object]) -> bool:
+    pid = contract.get("owner_pid")
+    start = contract.get("owner_start_ticks")
+    if not isinstance(pid, int) or isinstance(pid, bool) or not isinstance(start, int):
+        raise OrchestrationError("in-progress attempt owner contract is invalid")
+    try:
+        return _process_start_ticks(pid) == start
+    except OrchestrationError:
+        return False
+
+
+def _read_in_progress_attempt(
+    attempt: Path,
+    *,
+    identity: str,
+    sequence: int,
+    previous: str | None,
+) -> dict[str, object]:
+    _require_safe_inode(attempt, directory=True)
+    contract = _safe_json(attempt / "in_progress.json")
+    if (
+        not isinstance(contract, dict)
+        or set(contract)
+        != {
+            "schema",
+            "version",
+            "identity",
+            "sequence",
+            "previous_manifest_sha256",
+            "owner_pid",
+            "owner_start_ticks",
+            "started_time_ns",
+            "source_snapshot_sha256",
+        }
+        or contract.get("schema") != f"{SCHEMA}.logs.in-progress"
+        or contract.get("version") != 1
+        or contract.get("identity") != identity
+        or contract.get("sequence") != sequence
+        or contract.get("previous_manifest_sha256") != previous
+        or not isinstance(contract.get("started_time_ns"), int)
+        or not isinstance(contract.get("source_snapshot_sha256"), str)
+    ):
+        raise OrchestrationError("in-progress attempt contract mismatch")
+    for child in attempt.iterdir():
+        metadata = child.lstat()
+        if (
+            (child.name != "in_progress.json" and child.suffix != ".log")
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+        ):
+            raise OrchestrationError("in-progress attempt inventory is unsafe")
+    return contract
+
+
+def _seal_interrupted_attempt(
+    logs: Path,
+    attempt: Path,
+    *,
+    identity: str,
+    sequence: int,
+    previous: str | None,
+) -> None:
+    hashes = {
+        child.name: sha256_file(child)
+        for child in attempt.iterdir()
+        if child.name != "manifest.json"
+    }
+    manifest = {
+        "schema": f"{SCHEMA}.logs.attempt",
+        "version": 1,
+        "identity": identity,
+        "sequence": sequence,
+        "previous_manifest_sha256": previous,
+        "state": "interrupted",
+        "exception_type": "ProcessExit",
+        "sha256": hashes,
+    }
+    data = canonical_json(manifest)
+    _atomic_json(attempt / "manifest.json", manifest)
+    digest = hashlib.sha256(data).hexdigest()
+    _atomic_json(
+        logs / "current.json",
+        {
+            "schema": f"{SCHEMA}.logs.current",
+            "version": 1,
+            "identity": identity,
+            "sequence": sequence,
+            "attempt": attempt.name,
+            "manifest_sha256": digest,
+        },
+    )
+
+
+def _recover_interrupted_attempt(logs: Path, identity: str) -> None:
+    tail = _verify_logs_path(logs, identity, allow_interrupted_tail=True)
+    if tail is None:
+        return
+    current = logs / "current.json"
+    previous = None
+    sequence = 0
+    if current.is_file():
+        pointer = _safe_json(current)
+        assert isinstance(pointer, dict)
+        previous = str(pointer["manifest_sha256"])
+        sequence = int(pointer["sequence"]) + 1
+    _seal_interrupted_attempt(
+        logs,
+        tail,
+        identity=identity,
+        sequence=sequence,
+        previous=previous,
+    )
+
+
+def _verify_logs(
+    root: Path, identity: str, *, allow_interrupted_tail: bool = False
+) -> None:
+    tail = _verify_logs_path(
+        root / "logs", identity, allow_interrupted_tail=allow_interrupted_tail
+    )
+    if tail is not None and not allow_interrupted_tail:
+        raise OrchestrationError("attempt log has an uncommitted tail")
+
+
+def _verify_logs_path(
+    logs: Path, identity: str, *, allow_interrupted_tail: bool
+) -> Path | None:
     _require_safe_inode(logs, directory=True)
-    current = _safe_json(logs / "current.json")
-    if not isinstance(current, dict):
+    current_path = logs / "current.json"
+    current = _safe_json(current_path) if current_path.exists() else None
+    if current is not None and not isinstance(current, dict):
         raise OrchestrationError("attempt log current pointer is invalid")
     attempts = sorted(
         (path for path in logs.iterdir() if path.name != "current.json"),
         key=lambda path: int(path.name.removeprefix("attempt-")),
     )
     previous: str | None = None
+    committed = 0
+    tail: Path | None = None
     for sequence, attempt in enumerate(attempts):
         if attempt.name != f"attempt-{sequence:06d}":
             raise OrchestrationError("attempt log sequence is unsafe")
         _require_safe_inode(attempt, directory=True)
-        manifest_data = _safe_bytes(attempt / "manifest.json")
+        manifest_path = attempt / "manifest.json"
+        if not manifest_path.exists():
+            if (
+                not allow_interrupted_tail
+                or sequence != len(attempts) - 1
+                or tail is not None
+            ):
+                raise OrchestrationError("attempt log has an uncommitted entry")
+            contract = _read_in_progress_attempt(
+                attempt,
+                identity=identity,
+                sequence=sequence,
+                previous=previous,
+            )
+            if _attempt_owner_live(contract):
+                raise OrchestrationError("in-progress attempt owner is still alive")
+            tail = attempt
+            continue
+        manifest_data = _safe_bytes(manifest_path)
         manifest = json.loads(manifest_data)
         if (
-            manifest.get("schema") != f"{SCHEMA}.logs.attempt"
+            set(manifest)
+            != {
+                "schema",
+                "version",
+                "identity",
+                "sequence",
+                "previous_manifest_sha256",
+                "state",
+                "exception_type",
+                "sha256",
+            }
+            or manifest.get("schema") != f"{SCHEMA}.logs.attempt"
+            or manifest.get("version") != 1
             or manifest.get("identity") != identity
             or manifest.get("sequence") != sequence
             or manifest.get("previous_manifest_sha256") != previous
+            or manifest.get("state") not in {"complete", "failed", "interrupted"}
         ):
             raise OrchestrationError("attempt log manifest chain mismatch")
         expected = {*manifest["sha256"], "manifest.json"}
@@ -417,15 +601,27 @@ def _verify_logs(root: Path, identity: str) -> None:
             if sha256_file(attempt / name) != digest:
                 raise OrchestrationError("attempt log hash mismatch")
         previous = hashlib.sha256(manifest_data).hexdigest()
-    if not attempts or current != {
-        "schema": f"{SCHEMA}.logs.current",
-        "version": 1,
-        "identity": identity,
-        "sequence": len(attempts) - 1,
-        "attempt": attempts[-1].name,
-        "manifest_sha256": previous,
-    }:
+        committed += 1
+    expected_current = (
+        None
+        if committed == 0
+        else {
+            "schema": f"{SCHEMA}.logs.current",
+            "version": 1,
+            "identity": identity,
+            "sequence": committed - 1,
+            "attempt": attempts[committed - 1].name,
+            "manifest_sha256": previous,
+        }
+    )
+    if current != expected_current:
         raise OrchestrationError("attempt log current pointer mismatch")
+    expected_root = {attempt.name for attempt in attempts}
+    if current is not None:
+        expected_root.add("current.json")
+    if {path.name for path in logs.iterdir()} != expected_root:
+        raise OrchestrationError("attempt log root inventory mismatch")
+    return tail
 
 
 def _atomic_json(path: Path, value: Mapping[str, object]) -> None:
@@ -1063,7 +1259,7 @@ def _inspect_partial_resume(
         if (pinned / "preflight").exists():
             _verify_preflight_history(pinned, scene)
         if (pinned / "logs").exists():
-            _verify_logs(pinned, scene)
+            _verify_logs(pinned, scene, allow_interrupted_tail=True)
         protocol = pinned / "protocol"
         preparation = protocol / "preparation.json"
         if protocol.exists():
@@ -1159,7 +1355,7 @@ def _inspect_partial_suite(
                     f"unexpected or unsafe partial suite output: {child.name}"
                 )
         if (pinned / "logs").exists():
-            _verify_logs(pinned, "suite")
+            _verify_logs(pinned, "suite", allow_interrupted_tail=True)
         for scene in SCENES:
             scene_root = pinned / scene
             if not scene_root.exists():

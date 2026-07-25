@@ -163,7 +163,9 @@ def _dataset_identity(
     return value, _json_sha256(list(value))
 
 
-def load_audited_benchmark_config(config_path: Path) -> tuple[ProjectConfig, str]:
+def load_audited_benchmark_config(
+    config_path: Path, *, origin_path: Path | None = None
+) -> tuple[ProjectConfig, str]:
     """Load a canonical or orchestrator-resolved config and return source SHA."""
     config_path = Path(config_path)
     source_sha256 = _file_sha256(config_path)
@@ -173,9 +175,13 @@ def load_audited_benchmark_config(config_path: Path) -> tuple[ProjectConfig, str
         # Orchestration materializes an absolute-path copy outside configs/.
         # Bind it back to the audited immutable source instead of weakening the
         # canonical Task11 path checks.
-        if config_path.name != "resolved_project.yaml":
+        if config_path.name != "resolved_project.yaml" and origin_path is None:
             raise
-        origin_path = config_path.with_name("resolved_project.origin.json")
+        origin_path = (
+            config_path.with_name("resolved_project.origin.json")
+            if origin_path is None
+            else Path(origin_path)
+        )
         try:
             origin = json.loads(origin_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as error:
@@ -246,6 +252,7 @@ def build_production_runtime(
     config_path: Path,
     device: torch.device,
     trusted_upstream_artifacts: bool,
+    config_origin_path: Path | None = None,
 ) -> BenchmarkRuntime:
     """Build train-only state and bind it to canonical source evidence.
 
@@ -254,7 +261,9 @@ def build_production_runtime(
     camera-mapping, and ordered training-sample identity digests.
     """
     config_path = Path(config_path)
-    config, _ = load_audited_benchmark_config(config_path)
+    config, _ = load_audited_benchmark_config(
+        config_path, origin_path=config_origin_path
+    )
     bundle = build_runtime(
         config,
         device,
