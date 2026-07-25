@@ -149,12 +149,17 @@ class _PinnedInput:
 
 
 class _SnapshotSourceLoader(importlib.abc.Loader):
-    def __init__(self, data: bytes, origin: str) -> None:
+    def __init__(self, data: bytes, origin: str, *, is_package: bool) -> None:
         self.data = data
         self.origin = origin
+        self._is_package = is_package
 
     def create_module(self, spec):
         return None
+
+    def is_package(self, fullname: str) -> bool:
+        del fullname
+        return self._is_package
 
     def exec_module(self, module) -> None:
         module.__file__ = self.origin
@@ -162,7 +167,7 @@ class _SnapshotSourceLoader(importlib.abc.Loader):
 
 
 class _SnapshotSourceFinder(importlib.abc.MetaPathFinder):
-    def __init__(self, modules: Mapping[str, tuple[bytes, str]]) -> None:
+    def __init__(self, modules: Mapping[str, tuple[bytes, str, bool]]) -> None:
         self.modules = modules
 
     def find_spec(self, fullname, path=None, target=None):
@@ -170,10 +175,16 @@ class _SnapshotSourceFinder(importlib.abc.MetaPathFinder):
         record = self.modules.get(fullname)
         if record is None:
             return None
-        data, origin = record
-        return importlib.util.spec_from_loader(
-            fullname, _SnapshotSourceLoader(data, origin), origin=origin
+        data, origin, is_package = record
+        spec = importlib.util.spec_from_loader(
+            fullname,
+            _SnapshotSourceLoader(data, origin, is_package=is_package),
+            origin=origin,
+            is_package=is_package,
         )
+        if spec is not None and is_package:
+            spec.submodule_search_locations = [str(Path(origin).parent)]
+        return spec
 
 
 @contextmanager
@@ -190,10 +201,11 @@ def _snapshot_source_imports(
             if relative.suffix != ".py":
                 break
             parts = list(relative.with_suffix("").parts)
-            if parts[-1] == "__init__":
+            is_package = parts[-1] == "__init__"
+            if is_package:
                 parts.pop()
             if parts:
-                modules[".".join(parts)] = (pin.data, str(pin.path))
+                modules[".".join(parts)] = (pin.data, str(pin.path), is_package)
             break
     loaded = set(modules).intersection(sys.modules)
     if loaded:
@@ -206,6 +218,8 @@ def _snapshot_source_imports(
         yield
     finally:
         sys.meta_path.remove(finder)
+        for name in modules:
+            sys.modules.pop(name, None)
 
 
 def _seed_evaluation_runtime(seed: int) -> None:
@@ -226,6 +240,55 @@ def sha256_file(path: Path) -> str:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+class _PinnedEvaluationPredictor:
+    """Keep audited inputs/imports alive through every model forward."""
+
+    def __init__(self, predict, stack: ExitStack, pins: tuple[_PinnedInput, ...]) -> None:
+        self._predict = predict
+        self._stack = stack
+        self._pins = pins
+        self._closed = False
+
+    def __enter__(self):
+        return self
+
+    def __call__(self, sample):
+        if self._closed:
+            raise RuntimeError("evaluation predictor is closed")
+        try:
+            result = self._predict(sample)
+            for pin in self._pins:
+                pin.verify()
+            return result
+        except BaseException as error:
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                error.add_note(f"evaluation cleanup also failed: {cleanup_error}")
+            raise
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._stack.close()
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        self.close()
+        return False
+
+
+class _RetainedExitStack(ExitStack):
+    """Close failed construction immediately, but retain successful resources."""
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        if exc_type is not None:
+            return super().__exit__(exc_type, exc, traceback)
+        return False
+
+    def close(self) -> None:
+        super().__exit__(None, None, None)
 
 
 def write_resolved_project_config(source: Path, destination: Path) -> str:
@@ -531,7 +594,10 @@ def build_evaluation_adapters(
     holder: dict[str, object] = {}
 
     def runtime_factory() -> BenchmarkEvaluationRuntime:
-        with ExitStack() as pinned_inputs:
+        if holder.get("stack") is not None:
+            raise RuntimeError("evaluation runtime may only be constructed once")
+        stack = _RetainedExitStack()
+        with stack as pinned_inputs:
             config_pin = pinned_inputs.enter_context(
                 _PinnedInput(Path(resolved_config), None)
             )
@@ -550,6 +616,8 @@ def build_evaluation_adapters(
             if config.scene.scene_id != evidence.scene_id:
                 raise ValueError("evaluation config/evidence scene mismatch")
             relevant_checkpoint: Path | None = None
+            continuation_pin: _PinnedInput | None = None
+            checkpoint_pin: _PinnedInput | None = None
             native_source_records: tuple[tuple[Path, str], ...] = ()
             training_runtime: BenchmarkRuntime | None = None
             if evidence.role == "continuation":
@@ -630,50 +698,73 @@ def build_evaluation_adapters(
                 pinned_inputs.enter_context(_PinnedInput(path, digest))
                 for path, digest in all_source_records
             ]
-            with _snapshot_source_imports(source_pins, upstream_roots):
-                if evidence.role == "continuation":
-                    _seed_evaluation_runtime(evidence.seed)
-                    training_runtime = build_production_runtime(
-                        config_path=pinned_config,
-                        device=torch.device(device),
-                        trusted_upstream_artifacts=trusted_upstream_artifacts,
-                        config_origin_path=pinned_origin,
-                    )
-                    for name in (
-                        "config_sha256",
-                        "source_sha256",
-                        "visual_initialization_sha256",
-                        "audio_initialization_sha256",
-                        "model_initialization_sha256",
-                    ):
-                        if getattr(training_runtime, name) != getattr(evidence, name):
-                            raise ValueError(
-                                f"continuation runtime {name} evidence mismatch"
-                            )
+            pinned_inputs.enter_context(
+                _snapshot_source_imports(source_pins, upstream_roots)
+            )
+            if evidence.role == "continuation":
                 _seed_evaluation_runtime(evidence.seed)
-                bundle = build_runtime(
-                    config,
-                    torch.device(device),
+                training_runtime = build_production_runtime(
+                    config_path=pinned_config,
+                    device=torch.device(device),
                     trusted_upstream_artifacts=trusted_upstream_artifacts,
-                    include_eval=True,
+                    config_origin_path=pinned_origin,
                 )
+                for name in (
+                    "config_sha256",
+                    "source_sha256",
+                    "visual_initialization_sha256",
+                    "audio_initialization_sha256",
+                    "model_initialization_sha256",
+                ):
+                    if getattr(training_runtime, name) != getattr(evidence, name):
+                        raise ValueError(
+                            f"continuation runtime {name} evidence mismatch"
+                        )
+            _seed_evaluation_runtime(evidence.seed)
+            bundle = build_runtime(
+                config,
+                torch.device(device),
+                trusted_upstream_artifacts=trusted_upstream_artifacts,
+                include_eval=True,
+            )
             for pinned in source_pins:
                 pinned.verify()
-        if relevant_checkpoint is not None and (
-            sha256_file(relevant_checkpoint) != evidence.checkpoint_sha256
-        ):
-            raise RuntimeError("evaluation checkpoint changed during construction")
-        if any(sha256_file(path) != digest for path, digest in native_source_records):
-            raise RuntimeError("native upstream source changed during construction")
-        if training_runtime is not None and state_sha256(bundle.model) != state_sha256(
-            training_runtime.model
-        ):
-            raise RuntimeError(
-                "evaluation initialization differs from train-only runtime"
-            )
-        if bundle.eval_samples is None:
-            raise RuntimeError("production evaluation did not construct cam38")
+        try:
+            if relevant_checkpoint is not None and (
+                sha256_file(relevant_checkpoint) != evidence.checkpoint_sha256
+            ):
+                raise RuntimeError("evaluation checkpoint changed during construction")
+            if any(
+                sha256_file(path) != digest for path, digest in native_source_records
+            ):
+                raise RuntimeError("native upstream source changed during construction")
+            if training_runtime is not None and state_sha256(
+                bundle.model
+            ) != state_sha256(training_runtime.model):
+                raise RuntimeError(
+                    "evaluation initialization differs from train-only runtime"
+                )
+            if bundle.eval_samples is None:
+                raise RuntimeError("production evaluation did not construct cam38")
+        except BaseException as error:
+            try:
+                stack.close()
+            except BaseException as cleanup_error:
+                error.add_note(f"evaluation cleanup also failed: {cleanup_error}")
+            raise
         holder["bundle"] = bundle
+        holder["pins"] = tuple(
+            pin
+            for pin in (
+                config_pin,
+                origin_pin,
+                continuation_pin,
+                checkpoint_pin,
+                *source_pins,
+            )
+            if pin is not None
+        )
+        holder["stack"] = stack
         return BenchmarkEvaluationRuntime(bundle.eval_samples, bundle.audio_loss_fn)
 
     def predictor_factory(_runtime: BenchmarkEvaluationRuntime):
@@ -681,17 +772,27 @@ def build_evaluation_adapters(
         if bundle is None:
             raise RuntimeError("evaluation runtime must be constructed first")
         model = bundle.model
-        if evidence.role == "continuation":
-            raw = torch.load(
-                io.BytesIO(holder["checkpoint_bytes"]),
-                map_location="cpu",
-                weights_only=True,
-            )
-            model.load_state_dict(raw["model"], strict=True)
-            model.condition_enabled = evidence.system_name == "joint_conditioned"
-        else:
-            model.condition_enabled = False
-        model.eval()
+        try:
+            if evidence.role == "continuation":
+                raw = torch.load(
+                    io.BytesIO(holder["checkpoint_bytes"]),
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                model.load_state_dict(raw["model"], strict=True)
+                model.condition_enabled = evidence.system_name == "joint_conditioned"
+            else:
+                model.condition_enabled = False
+            model.eval()
+        except BaseException as error:
+            stack = holder.pop("stack", None)
+            holder.pop("pins", None)
+            if isinstance(stack, ExitStack):
+                try:
+                    stack.close()
+                except BaseException as cleanup_error:
+                    error.add_note(f"evaluation cleanup also failed: {cleanup_error}")
+            raise
 
         def predict(sample):
             if evidence.system_name == "native_ftgspp":
@@ -710,7 +811,11 @@ def build_evaluation_adapters(
                 rendered_rgb=output.rgbd.rgb,
             )
 
-        return predict
+        stack = holder.pop("stack", None)
+        pins = holder.pop("pins", None)
+        if not isinstance(stack, ExitStack) or not isinstance(pins, tuple):
+            raise RuntimeError("evaluation input lifetime is unavailable")
+        return _PinnedEvaluationPredictor(predict, stack, pins)
 
     return runtime_factory, predictor_factory
 

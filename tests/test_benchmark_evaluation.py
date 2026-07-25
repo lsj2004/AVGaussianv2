@@ -276,6 +276,46 @@ def test_evaluator_constructs_cam38_only_after_training_gate_and_publishes(tmp_p
     assert load_evaluation(tmp_path, identity=identity).rows == result.rows
 
 
+def test_evaluator_keeps_context_managed_predictor_open_through_forwards(tmp_path):
+    events = []
+
+    class Predictor:
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def __call__(self, sample):
+            events.append(f"predict-{sample.frame_index}")
+            return BenchmarkPrediction(
+                predicted_audio=sample.target_audio + 0.01,
+                rendered_rgb=sample.target_rgb + 0.01,
+            )
+
+        def __exit__(self, exc_type, exc, traceback):
+            events.append("exit")
+            return False
+
+    identity = EvaluationIdentity(
+        "scene1_opera",
+        "joint_conditioned",
+        30_000,
+        (
+            "scene1_opera/cam38/000000",
+            "scene1_opera/cam38/000001",
+        ),
+        2,
+    )
+    BenchmarkEvaluator("cpu", strict_protocol=False).evaluate(
+        identity=identity,
+        evidence=_evidence("joint_conditioned"),
+        runtime_factory=lambda: _runtime([_sample(0), _sample(1)]),
+        predictor_factory=lambda _: Predictor(),
+        output_dir=tmp_path,
+    )
+
+    assert events == ["enter", "predict-0", "predict-1", "exit"]
+
+
 def test_resume_does_not_construct_test_samples_and_tamper_fails(tmp_path):
     identity = EvaluationIdentity(
         "scene1_opera",

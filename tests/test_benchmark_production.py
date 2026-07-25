@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
+import os
+import sys
+from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +16,9 @@ from torch import nn
 
 from avgaussianv2.benchmark.evaluation import TrainingEvidence
 from avgaussianv2.benchmark.production import (
+    _PinnedInput,
+    _SnapshotSourceFinder,
+    _snapshot_source_imports,
     build_evaluation_adapters,
     prepare_worker_manifests,
     write_resolved_project_config,
@@ -241,18 +248,99 @@ def test_native_production_adapter_exposes_only_its_modality(
         intrinsic=torch.eye(3).unsqueeze(0),
         image_size=(2, 2),
     )
-    prediction = predictor(sample)
-
-    assert calls[0][2:] == (True, True)
     checkpoint_field = (
         "audio_checkpoint" if system == "native_audiogs" else "visual_checkpoint"
     )
+    pinned_checkpoint = Path(getattr(calls[0][0].paths, checkpoint_field))
+    pinned_target = os.readlink(pinned_checkpoint)
+    with predictor:
+        assert pinned_checkpoint.read_bytes() == b"native"
+        assert any(isinstance(finder, _SnapshotSourceFinder) for finder in sys.meta_path)
+        prediction = predictor(sample)
+        assert pinned_checkpoint.read_bytes() == b"native"
+    assert not pinned_checkpoint.exists() or os.readlink(pinned_checkpoint) != pinned_target
+    assert not any(
+        isinstance(finder, _SnapshotSourceFinder) for finder in sys.meta_path
+    )
+
+    assert calls[0][2:] == (True, True)
     assert str(getattr(calls[0][0].paths, checkpoint_field)).startswith(
         "/proc/self/fd/"
     )
     assert consumed_checkpoints == [b"native"]
     assert (prediction.predicted_audio is not None) is has_audio
     assert (prediction.rendered_rgb is not None) is has_rgb
+
+
+def test_snapshot_importer_preserves_nested_package_semantics(tmp_path):
+    audio_root = tmp_path / "audio"
+    visual_root = tmp_path / "visual"
+    sources = {
+        visual_root / "ftgspp/__init__.py": b"from .models import GAUSSIAN\n",
+        visual_root
+        / "ftgspp/models/__init__.py": b"from .gaussians import GAUSSIAN\n",
+        visual_root / "ftgspp/models/gaussians.py": b"GAUSSIAN = 'snapshot-ftgs'\n",
+        audio_root / "libs/__init__.py": b"from .models import AUDIO\n",
+        audio_root / "libs/models/__init__.py": b"from .networks import AUDIO\n",
+        audio_root / "libs/models/networks/__init__.py": b"AUDIO = 'snapshot-audio'\n",
+    }
+    for path, data in sources.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    with ExitStack() as stack:
+        pins = [
+            stack.enter_context(
+                _PinnedInput(path, hashlib.sha256(data).hexdigest())
+            )
+            for path, data in sources.items()
+        ]
+        with _snapshot_source_imports(pins, (audio_root, visual_root)):
+            ftgspp = importlib.import_module("ftgspp")
+            gaussians = importlib.import_module("ftgspp.models.gaussians")
+            libs_models = importlib.import_module("libs.models")
+            networks = importlib.import_module("libs.models.networks")
+
+            assert ftgspp.GAUSSIAN == gaussians.GAUSSIAN == "snapshot-ftgs"
+            assert libs_models.AUDIO == networks.AUDIO == "snapshot-audio"
+            assert ftgspp.__spec__.submodule_search_locations
+            assert libs_models.__spec__.submodule_search_locations
+            assert gaussians.__spec__.submodule_search_locations is None
+    assert not {
+        "ftgspp",
+        "ftgspp.models",
+        "ftgspp.models.gaussians",
+        "libs",
+        "libs.models",
+        "libs.models.networks",
+    }.intersection(sys.modules)
+
+
+def test_snapshot_import_failure_is_not_hidden_by_filesystem_fallback(tmp_path):
+    audio_root = tmp_path / "audio"
+    visual_root = tmp_path / "visual"
+    sources = {
+        visual_root / "ftgspp/__init__.py": b"",
+        visual_root / "ftgspp/models/__init__.py": b"",
+        visual_root / "ftgspp/models/gaussians.py": b"this is invalid python !\n",
+    }
+    for source, data in sources.items():
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(data)
+    with ExitStack() as stack:
+        pins = [
+            stack.enter_context(
+                _PinnedInput(source, hashlib.sha256(data).hexdigest())
+            )
+            for source, data in sources.items()
+        ]
+        fallback = tmp_path / "fallback/ftgspp/models/gaussians.py"
+        fallback.parent.mkdir(parents=True)
+        fallback.write_bytes(b"VALUE = 'filesystem fallback'\n")
+        stack.callback(sys.path.remove, str(fallback.parents[2]))
+        sys.path.append(str(fallback.parents[2]))
+        with _snapshot_source_imports(pins, (audio_root, visual_root)):
+            with pytest.raises(SyntaxError):
+                importlib.import_module("ftgspp.models.gaussians")
 
 
 def test_native_adapter_rejects_changed_upstream_source_before_runtime(

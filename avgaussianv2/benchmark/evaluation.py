@@ -9,6 +9,7 @@ import json
 import math
 import os
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from numbers import Real
 from pathlib import Path
@@ -912,18 +913,24 @@ class BenchmarkEvaluator:
         actual_ids = tuple(benchmark_sample_id(sample) for sample in samples)
         if actual_ids != identity.expected_sample_ids:
             raise BenchmarkEvaluationError("cam38 sample IDs/order mismatch")
-        with torch.no_grad():
-            rows = tuple(
-                self._evaluate_one(
-                    sample,
-                    predictor,
-                    audio_loss_fn=runtime.audio_loss_fn,
-                    extra_metric_fns=registry,
-                    extra_metric_modalities=modalities,
-                    lpips_fn=runtime.lpips_fn,
+        predictor_context = (
+            predictor
+            if hasattr(predictor, "__enter__") and hasattr(predictor, "__exit__")
+            else nullcontext(predictor)
+        )
+        with predictor_context as active_predictor:
+            with torch.no_grad():
+                rows = tuple(
+                    self._evaluate_one(
+                        sample,
+                        active_predictor,
+                        audio_loss_fn=runtime.audio_loss_fn,
+                        extra_metric_fns=registry,
+                        extra_metric_modalities=modalities,
+                        lpips_fn=runtime.lpips_fn,
+                    )
+                    for sample in samples
                 )
-                for sample in samples
-            )
         metadata = {"sample_id", "scene_id", "camera", "frame_index", "time_seconds"}
         metric_names = tuple(name for name in rows[0] if name not in metadata)
         if not metric_names:
