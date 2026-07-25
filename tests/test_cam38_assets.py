@@ -482,6 +482,7 @@ def test_ftgspp_dry_run_exposes_audited_stage_order_without_launching() -> None:
     assert text.index("--audit-ftgspp-flow") < text.index("--from points --to train")
     assert " --cameras 0-37 " in text
     assert "--from extract --to train" not in text
+    assert "deterministic wrapper for every executed stage" in text
 
 
 def test_readme_documents_cam38_native_budget_and_shared_scene7_model() -> None:

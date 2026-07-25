@@ -22,5 +22,10 @@ upstream = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.ruff.lint]
+# Pin Ruff's historical default checks so tool upgrades cannot silently widen
+# the repository gate to every preview/plugin rule.
+select = ["E4", "E7", "E9", "F"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["avgaussianv2"]

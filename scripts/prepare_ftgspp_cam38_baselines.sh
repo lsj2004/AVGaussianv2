@@ -126,6 +126,6 @@ prepare_scene() {
 }
 
 echo "Mode: $([[ ${EXECUTE} -eq 1 ]] && echo execute || echo dry-run)"
-echo "FreeTimeGS++ seed is bound by the upstream config; batch_size=1, iterations=30000."
+echo "FreeTimeGS++ seed 42 is bound by the deterministic wrapper for every executed stage; batch_size=1, iterations=30000."
 prepare_scene scene1_opera
 prepare_scene Scene7playing
