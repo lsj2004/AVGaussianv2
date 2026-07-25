@@ -6,12 +6,16 @@ FTGSPP_ROOT="/mnt/sda/lisujing/Dataset/FreeTimeGSPlusPlus"
 SAMPLED_ROOT="/mnt/sda/lisujing/Dataset/Sampled_data/v5_0630_dynerf"
 PYTHON="${AVGAUSSIANV2_PYTHON:-${ROOT}/.venv/bin/python}"
 EXECUTE=0
-if [[ "${1:-}" == "--execute" ]]; then
-  EXECUTE=1
-  shift
-fi
-if [[ $# -ne 0 ]]; then
-  echo "usage: $0 [--execute]" >&2
+SCENE_FILTER=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --execute) EXECUTE=1; shift ;;
+    --scene) SCENE_FILTER="${2:-}"; shift 2 ;;
+    *) echo "usage: $0 [--execute] [--scene scene1_opera|Scene7playing]" >&2; exit 2 ;;
+  esac
+done
+if [[ -n "${SCENE_FILTER}" && "${SCENE_FILTER}" != "scene1_opera" && "${SCENE_FILTER}" != "Scene7playing" ]]; then
+  echo "unsupported scene: ${SCENE_FILTER}" >&2
   exit 2
 fi
 
@@ -142,5 +146,9 @@ prepare_scene() {
 
 echo "Mode: $([[ ${EXECUTE} -eq 1 ]] && echo execute || echo dry-run)"
 echo "FreeTimeGS++ seed 42 is bound by the deterministic wrapper for every executed stage; batch_size=1, iterations=30000."
-prepare_scene scene1_opera
-prepare_scene Scene7playing
+if [[ -z "${SCENE_FILTER}" || "${SCENE_FILTER}" == "scene1_opera" ]]; then
+  prepare_scene scene1_opera
+fi
+if [[ -z "${SCENE_FILTER}" || "${SCENE_FILTER}" == "Scene7playing" ]]; then
+  prepare_scene Scene7playing
+fi

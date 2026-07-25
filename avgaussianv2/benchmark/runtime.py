@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from avgaussianv2.benchmark.assets import audit_protocol_config
+from avgaussianv2.benchmark.assets import AssetAuditError, audit_protocol_config
 from avgaussianv2.config import ProjectConfig, TrainConfig, load_project_config
 from avgaussianv2.contracts import AlignedAVSample
 from avgaussianv2.losses import AudioLoss
@@ -128,6 +128,84 @@ def _dataset_identity(
     return value, _json_sha256(list(value))
 
 
+def load_audited_benchmark_config(config_path: Path) -> tuple[ProjectConfig, str]:
+    """Load a canonical or orchestrator-resolved config and return source SHA."""
+    config_path = Path(config_path)
+    source_sha256 = _file_sha256(config_path)
+    try:
+        audit_protocol_config(config_path)
+    except AssetAuditError:
+        # Orchestration materializes an absolute-path copy outside configs/.
+        # Bind it back to the audited immutable source instead of weakening the
+        # canonical Task11 path checks.
+        if config_path.name != "resolved_project.yaml":
+            raise
+        origin_path = config_path.with_name("resolved_project.origin.json")
+        try:
+            origin = json.loads(origin_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise ValueError("resolved benchmark config origin is missing") from error
+        if (
+            not isinstance(origin, dict)
+            or set(origin)
+            != {
+                "schema",
+                "version",
+                "source_path",
+                "source_sha256",
+                "resolved_sha256",
+            }
+            or origin["schema"] != "avgaussianv2.cam38-resolved-config-origin"
+            or origin["version"] != 1
+            or origin["resolved_sha256"] != _file_sha256(config_path)
+        ):
+            raise ValueError("resolved benchmark config origin contract mismatch")
+        source = Path(origin["source_path"])
+        if not source.is_absolute() or _file_sha256(source) != origin["source_sha256"]:
+            raise ValueError("resolved benchmark source config hash mismatch")
+        audit_protocol_config(source)
+        source_sha256 = origin["source_sha256"]
+        source_config = load_project_config(source)
+        resolved_config = load_project_config(config_path)
+        path_names = (
+            "visual_upstream_root",
+            "audio_upstream_root",
+            "visual_checkpoint",
+            "audio_checkpoint",
+            "manifest",
+            "visual_memmap",
+        )
+        if (
+            source_config.scene != resolved_config.scene
+            or source_config.model != resolved_config.model
+            or source_config.train != resolved_config.train
+            or any(
+                (
+                    getattr(source_config.paths, name) is None
+                    or getattr(resolved_config.paths, name) is None
+                )
+                and getattr(source_config.paths, name)
+                != getattr(resolved_config.paths, name)
+                or (
+                    getattr(source_config.paths, name) is not None
+                    and getattr(resolved_config.paths, name) is not None
+                    and getattr(source_config.paths, name).resolve()
+                    != getattr(resolved_config.paths, name).resolve()
+                )
+                for name in path_names
+            )
+        ):
+            raise ValueError("resolved benchmark config changes protocol semantics")
+    config = load_project_config(config_path)
+    if config.scene.train_cameras != TRAIN_CAMERAS:
+        raise ValueError("benchmark config must train on exactly cam00 through cam37")
+    if config.scene.eval_cameras != (TEST_CAMERA,):
+        raise ValueError("benchmark config must reserve exactly cam38 for evaluation")
+    if config.scene.camera_mapping != {f"cam{index:02d}": index for index in range(39)}:
+        raise ValueError("benchmark config camera mapping must be exactly cam00..cam38")
+    return config, source_sha256
+
+
 def build_production_runtime(
     *,
     config_path: Path,
@@ -141,14 +219,7 @@ def build_production_runtime(
     camera-mapping, and ordered training-sample identity digests.
     """
     config_path = Path(config_path)
-    audit_protocol_config(config_path)
-    config = load_project_config(config_path)
-    if config.scene.train_cameras != TRAIN_CAMERAS:
-        raise ValueError("benchmark config must train on exactly cam00 through cam37")
-    if config.scene.eval_cameras != (TEST_CAMERA,):
-        raise ValueError("benchmark config must reserve exactly cam38 for evaluation")
-    if config.scene.camera_mapping != {f"cam{index:02d}": index for index in range(39)}:
-        raise ValueError("benchmark config camera mapping must be exactly cam00..cam38")
+    config, _ = load_audited_benchmark_config(config_path)
     bundle = build_runtime(
         config,
         device,
@@ -185,4 +256,8 @@ def build_production_runtime(
     )
 
 
-__all__ = ["BenchmarkRuntime", "build_production_runtime"]
+__all__ = [
+    "BenchmarkRuntime",
+    "build_production_runtime",
+    "load_audited_benchmark_config",
+]

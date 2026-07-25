@@ -209,6 +209,46 @@ point, SfM/COLMAP, or temporal-flow input. These scripts prepare native assets
 only; the fixed 30,000-update fusion/audio-only/visual-only continuations and
 final common cam38 evaluator are separate benchmark stages.
 
+### Three-GPU benchmark orchestration
+
+After reviewing and trusting the configured upstream Python/checkpoints, run
+the complete two-scene benchmark with:
+
+```bash
+AVGAUSSIANV2_PYTHON=/absolute/path/to/python \
+  scripts/run_cam38_benchmark_suite.sh --gpus 0,1,2
+```
+
+The suite invokes both native baseline scripts with their explicit
+`--execute` gate, then creates/validates the immutable AudioGS and FreeTimeGS++
+native contracts, then runs `joint_conditioned`, `audio_only`, and
+`visual_only` on GPUs 0/1/2. Evaluation is not started until all three
+30,000-update workers finish. Every continuation is evaluated at 5k, 10k, and
+30k on `cam38`; native AudioGS emits audio only and native FreeTimeGS++ emits
+RGB only in the common evaluator. Per-scene reports are written below
+`runs/cam38_benchmark/<scene>/report`, and macro/micro aggregation is written
+to `runs/cam38_benchmark/report`.
+
+Use `--resume` after interruption. To reuse native training, pass
+`--skip-native-training`; this succeeds only when both strict immutable native
+contracts already exist and verify. It never treats an arbitrary checkpoint
+as a native baseline. Checkpoint cadence is 500 updates with bounded rolling
+retention and immutable 5k/10k/30k milestones; preflight records free disk,
+GPU memory, dependency availability, source hashes, and this write policy.
+
+Independent verification constructs no model/dataset runtime, launches no
+process, and writes no files:
+
+```bash
+scripts/run_cam38_benchmark_suite.sh --verify-only
+```
+
+For one scene, use
+`scripts/run_cam38_benchmark_scene.sh scene1_opera --gpus 0,1,2` or replace the
+scene with `Scene7playing`. A failed worker terminates its live siblings while
+preserving checkpoints, atomic status events, and attempt logs for exact
+resume.
+
 ## Outputs
 
 Every run writes `resolved_config.json`, `loss_history.json`, `gradient_norms.json`,

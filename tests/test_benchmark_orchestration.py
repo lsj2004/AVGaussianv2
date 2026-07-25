@@ -295,6 +295,35 @@ def test_suite_runs_scenes_in_declared_order_then_builds_and_verifies_report(
     assert second_scene < report_start < suite_verify
 
 
+def test_suite_opens_the_explicit_native_execute_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repo"
+    output = tmp_path / "suite"
+    commands: list[tuple[str, ...]] = []
+
+    def run_one(_runner, command, **_kwargs) -> None:
+        commands.append(tuple(command))
+
+    monkeypatch.setattr(orchestration, "_run_one", run_one)
+    run_benchmark_suite(
+        repository=repository,
+        output_dir=output,
+        skip_native_training=False,
+        runner=_Runner(),
+        _scene_runner=lambda **kwargs: SceneBenchmarkResult(
+            Path(kwargs["config_path"]).stem,
+            Path(kwargs["output_dir"]),
+            Path(kwargs["output_dir"]) / "report",
+            True,
+        ),
+        _suite_verifier=lambda _path: {"content_sha256": "a" * 64},
+    )
+
+    assert commands[0][-1] == "--execute"
+    assert commands[1][-1] == "--execute"
+
+
 def test_suite_verify_only_checks_both_scenes_in_order_without_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

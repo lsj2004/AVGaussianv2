@@ -6,12 +6,16 @@ AUDIOGS_ROOT="/mnt/sda/lisujing/Dataset/audioGS-replay"
 SAMPLED_ROOT="/mnt/sda/lisujing/Dataset/Sampled_data"
 PYTHON="${AVGAUSSIANV2_PYTHON:-${ROOT}/.venv/bin/python}"
 EXECUTE=0
-if [[ "${1:-}" == "--execute" ]]; then
-  EXECUTE=1
-  shift
-fi
-if [[ $# -ne 0 ]]; then
-  echo "usage: $0 [--execute]" >&2
+SCENE_FILTER=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --execute) EXECUTE=1; shift ;;
+    --scene) SCENE_FILTER="${2:-}"; shift 2 ;;
+    *) echo "usage: $0 [--execute] [--scene scene1_opera|Scene7playing]" >&2; exit 2 ;;
+  esac
+done
+if [[ -n "${SCENE_FILTER}" && "${SCENE_FILTER}" != "scene1_opera" && "${SCENE_FILTER}" != "Scene7playing" ]]; then
+  echo "unsupported scene: ${SCENE_FILTER}" >&2
   exit 2
 fi
 
@@ -112,6 +116,10 @@ prepare_and_train() {
 
 echo "Mode: $([[ ${EXECUTE} -eq 1 ]] && echo execute || echo dry-run)"
 echo "AudioGS seed=42, batch_size=1, epochs=61; viewpoint 39 (cam38) held out."
-prepare_and_train scene1_opera scene1_opera SC-scene1-opera-cam38-shared 1
+if [[ -z "${SCENE_FILTER}" || "${SCENE_FILTER}" == "scene1_opera" ]]; then
+  prepare_and_train scene1_opera scene1_opera SC-scene1-opera-cam38-shared 1
+fi
 # No A3DGS_FRAME_ID is set: 3 clips x 38 training viewpoints x 61 = 6954 updates.
-prepare_and_train Scene7playing Scene7playing SC-scene7-playing-cam38-shared 3
+if [[ -z "${SCENE_FILTER}" || "${SCENE_FILTER}" == "Scene7playing" ]]; then
+  prepare_and_train Scene7playing Scene7playing SC-scene7-playing-cam38-shared 3
+fi
