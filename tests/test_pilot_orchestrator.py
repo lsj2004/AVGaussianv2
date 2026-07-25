@@ -14,6 +14,8 @@ from avgaussianv2.cli.pilot import (
     _evenly_spaced,
     _launch_group,
     _shared_indices,
+    _validate_complete_status,
+    _validate_experiment_types,
     _wait_group,
     parse_gpus,
     run_pilot,
@@ -181,9 +183,26 @@ def test_verify_only_derives_trusted_run_identity_without_cli_permission(tmp_pat
     config = _verify_config(tmp_path)
     output = tmp_path / "run"
     output.mkdir()
-    (output / "experiment_manifest.json").write_text(
-        json.dumps({"trusted_upstream_artifacts": True})
-    )
+    experiment = {
+        "schema": "avgaussianv2.scene1-three-gpu-pilot",
+        "version": 1,
+        "scene_id": "scene1_opera",
+        "gpus": [0, 1, 2],
+        "config_sha256": "a" * 64,
+        "shared_manifest_path": str(output / "shared_manifest.json"),
+        "shared_manifest_sha256": "b" * 64,
+        "baseline_manifest_path": str(output / "baseline_manifest.json"),
+        "baseline_manifest_sha256": "c" * 64,
+        "source_hashes": {
+            "project_config_sha256": "d" * 64,
+            "dataset_manifest_sha256": "e" * 64,
+            "visual_checkpoint_sha256": "f" * 64,
+            "audio_checkpoint_sha256": "0" * 64,
+            "camera_mapping_sha256": "1" * 64,
+        },
+        "trusted_upstream_artifacts": True,
+    }
+    (output / "experiment_manifest.json").write_text(json.dumps(experiment))
     (output / ".pilot-parent.lock").write_text("")
 
     class Runner:
@@ -203,9 +222,8 @@ def test_verify_only_derives_trusted_run_identity_without_cli_permission(tmp_pat
     assert set(output.iterdir()) == before
     assert Runner.assignments == []
 
-    (output / "experiment_manifest.json").write_text(
-        json.dumps({"trusted_upstream_artifacts": "true"})
-    )
+    experiment["trusted_upstream_artifacts"] = "true"
+    (output / "experiment_manifest.json").write_text(json.dumps(experiment))
     with pytest.raises(TypeError, match="must be boolean"):
         run_pilot(
             config,
@@ -293,15 +311,29 @@ def test_run_pilot_sequences_baseline_workers_and_evaluations(
         "load_worker_manifest",
         lambda *args, **kwargs: SimpleNamespace(sha256="a" * 64),
     )
-    monkeypatch.setattr(
-        pilot_module,
-        "_build_report",
-        lambda *args, **kwargs: SimpleNamespace(
+    comparison = SimpleNamespace(
             content_digest="b" * 64,
             generation_path=output / "report-generation",
             decision=SimpleNamespace(ready=True),
             durability_warnings=(),
-        ),
+        )
+
+    def build_report(*args, **kwargs):
+        report = output / "report"
+        generation = report / ".report-generations" / ("b" * 64)
+        generation.mkdir(parents=True, exist_ok=True)
+        current = report / "current"
+        if not current.exists():
+            current.symlink_to(f".report-generations/{'b' * 64}")
+        comparison.generation_path = generation
+        return comparison
+
+    monkeypatch.setattr(pilot_module, "_report_inputs", lambda *args: [])
+    monkeypatch.setattr(pilot_module, "_build_report", build_report)
+    monkeypatch.setattr(
+        pilot_module,
+        "verify_current_comparison",
+        lambda *args, **kwargs: comparison,
     )
 
     # The baseline manifest drives deterministic shared-manifest construction.
@@ -361,3 +393,148 @@ def test_run_pilot_sequences_baseline_workers_and_evaluations(
     assert shared["compatibility"]["condition_off"]["variant"] == "condition_off"
     assert result.ready
     assert json.loads((output / "status.json").read_text())["ready"] is True
+
+    starts_before = len(assignments)
+    tree_before = {
+        path.relative_to(output): (path.lstat().st_ino, path.lstat().st_mtime_ns)
+        for path in output.rglob("*")
+    }
+    resumed = run_pilot(
+        config,
+        output,
+        resume=True,
+        runner=Runner(),
+        gpu_validator=lambda ids: None,
+        trust_upstream_artifacts=True,
+    )
+    tree_after = {
+        path.relative_to(output): (path.lstat().st_ino, path.lstat().st_mtime_ns)
+        for path in output.rglob("*")
+    }
+    assert len(assignments) == starts_before
+    assert tree_after == tree_before
+    assert resumed.ready is True
+
+    monkeypatch.setattr(
+        pilot_module,
+        "verify_worker_resume_state",
+        lambda *args, **kwargs: SimpleNamespace(stage="joint"),
+    )
+    joint_worker = output / "workers" / "joint_conditioned"
+    (joint_worker / "complete.marker").unlink()
+    (joint_worker / "latest.pt").write_text("compatible-active")
+    starts_before = len(assignments)
+    run_pilot(
+        config,
+        output,
+        resume=True,
+        runner=Runner(),
+        gpu_validator=lambda ids: None,
+        trust_upstream_artifacts=True,
+    )
+    new = assignments[starts_before:]
+    assert len(new) == 2
+    assert new[0][0][2] == "avgaussianv2.cli.pilot_worker"
+    assert "--resume" in new[0][0]
+    assert new[1][0][2] == "avgaussianv2.cli.pilot_eval"
+    assert "--overwrite" in new[1][0]
+    assert "--system" in new[1][0]
+
+    frozen_eval = output / "evaluations" / "frozen_visual"
+    (frozen_eval / "evaluation_manifest.json").unlink()
+    frozen_system = frozen_eval / "frozen_visual_on"
+    frozen_system.mkdir(exist_ok=True)
+    (frozen_system / "metrics_summary.json").write_text("partial")
+    starts_before = len(assignments)
+    run_pilot(
+        config,
+        output,
+        resume=True,
+        runner=Runner(),
+        gpu_validator=lambda ids: None,
+        trust_upstream_artifacts=True,
+    )
+    new = assignments[starts_before:]
+    assert len(new) == 1
+    assert new[0][0][2] == "avgaussianv2.cli.pilot_eval"
+    assert "--variant" in new[0][0]
+    assert "frozen_visual" in new[0][0]
+    assert "--resume" in new[0][0]
+
+    starts_before = len(assignments)
+    tree_before = {
+        path.relative_to(output): (path.lstat().st_ino, path.lstat().st_mtime_ns)
+        for path in output.rglob("*")
+    }
+    verified = run_pilot(
+        config,
+        output,
+        verify_only=True,
+        runner=Runner(),
+    )
+    tree_after = {
+        path.relative_to(output): (path.lstat().st_ino, path.lstat().st_mtime_ns)
+        for path in output.rglob("*")
+    }
+    assert len(assignments) == starts_before
+    assert tree_after == tree_before
+    assert verified.ready is True
+
+
+@pytest.mark.parametrize("version", [True, 1.0, "1"])
+def test_experiment_and_status_versions_require_exact_integer(version) -> None:
+    experiment = {
+        "schema": "avgaussianv2.scene1-three-gpu-pilot",
+        "version": version,
+        "scene_id": "scene1_opera",
+        "gpus": [0, 1, 2],
+        "config_sha256": "a" * 64,
+        "shared_manifest_path": "/tmp/shared.json",
+        "shared_manifest_sha256": "b" * 64,
+        "baseline_manifest_path": "/tmp/baseline.json",
+        "baseline_manifest_sha256": "c" * 64,
+        "source_hashes": {
+            "project_config_sha256": "d" * 64,
+            "dataset_manifest_sha256": "e" * 64,
+            "visual_checkpoint_sha256": "f" * 64,
+            "audio_checkpoint_sha256": "0" * 64,
+            "camera_mapping_sha256": "1" * 64,
+        },
+        "trusted_upstream_artifacts": True,
+    }
+    with pytest.raises(ValueError, match="version"):
+        _validate_experiment_types(experiment)
+    status = {
+        "schema": "avgaussianv2.scene1-three-gpu-pilot",
+        "version": version,
+        "stages": {
+            "baseline": "complete",
+            "workers": "complete",
+            "evaluations": "complete",
+            "report": "complete",
+        },
+        "report_digest": "d" * 64,
+        "ready": True,
+        "durability_warnings": [],
+    }
+    with pytest.raises(ValueError, match="version"):
+        _validate_complete_status(status)
+
+
+@pytest.mark.parametrize("ready", [0, 1, "true"])
+def test_status_ready_requires_exact_boolean(ready) -> None:
+    status = {
+        "schema": "avgaussianv2.scene1-three-gpu-pilot",
+        "version": 1,
+        "stages": {
+            "baseline": "complete",
+            "workers": "complete",
+            "evaluations": "complete",
+            "report": "complete",
+        },
+        "report_digest": "d" * 64,
+        "ready": ready,
+        "durability_warnings": [],
+    }
+    with pytest.raises(TypeError, match="boolean"):
+        _validate_complete_status(status)

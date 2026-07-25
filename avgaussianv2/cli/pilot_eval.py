@@ -66,19 +66,19 @@ _CHECKPOINT_FIELDS = {
 
 
 def _json_text_value(value: object, name: str) -> str:
-    if not isinstance(value, str) or not value:
+    if type(value) is not str or not value:
         raise TypeError(f"{name} must be a nonempty string")
     return value
 
 
 def _json_bool(value: object, name: str) -> bool:
-    if not isinstance(value, bool):
+    if type(value) is not bool:
         raise TypeError(f"{name} must be boolean")
     return value
 
 
 def _json_int(value: object, name: str, *, minimum: int = 0) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
+    if type(value) is not int:
         raise TypeError(f"{name} must be an integer")
     if value < minimum:
         raise ValueError(f"{name} must be at least {minimum}")
@@ -99,6 +99,20 @@ def _json_absolute_path(value: object, name: str) -> Path:
     if Path(os.path.abspath(result)) != result:
         raise ValueError(f"{name} must be lexically normalized")
     return result
+
+
+def _strict_json_equal(left: object, right: object) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _strict_json_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _strict_json_equal(a, b) for a, b in zip(left, right, strict=True)
+        )
+    return left == right
 
 
 @dataclass(frozen=True)
@@ -289,12 +303,17 @@ def _verify_existing(
     raw = _strict_json(output / "evaluation_manifest.json")
     if set(raw) != _JOB_FIELDS:
         raise ValueError("evaluation manifest fields mismatch")
-    if raw.get("schema") != JOB_SCHEMA or raw.get("version") != JOB_VERSION:
+    if (
+        type(raw.get("schema")) is not str
+        or raw.get("schema") != JOB_SCHEMA
+        or type(raw.get("version")) is not int
+        or raw.get("version") != JOB_VERSION
+    ):
         raise ValueError("evaluation manifest schema/version mismatch")
     scene_id = _json_text_value(raw["scene_id"], "scene_id")
     config_sha256 = _json_digest(raw["config_sha256"], "config_sha256")
     if not isinstance(raw["camera"], list) or any(
-        not isinstance(camera, str) or not camera for camera in raw["camera"]
+        type(camera) is not str or not camera for camera in raw["camera"]
     ):
         raise TypeError("camera must be a list of nonempty strings")
     if not isinstance(raw["systems"], list):
@@ -326,10 +345,10 @@ def _verify_existing(
         raise ValueError("evaluation runtime identity is invalid")
     if (
         isinstance(raw["train_length"], bool)
-        or not isinstance(raw["train_length"], int)
+        or type(raw["train_length"]) is not int
         or train_length <= 0
         or isinstance(raw["eval_length"], bool)
-        or not isinstance(raw["eval_length"], int)
+        or type(raw["eval_length"]) is not int
         or eval_length <= 0
     ):
         raise ValueError("evaluation dataset lengths are invalid")
@@ -402,9 +421,20 @@ def _verify_existing(
     recorded = tuple(recorded_items)
     if recorded != tuple(expected_specs):
         raise ValueError("existing evaluation systems mismatch")
-    if raw["condition_specs"] != [
-        asdict(spec) for spec in expected_specs
-    ]:
+    expected_condition_specs = [asdict(spec) for spec in expected_specs]
+    for position, item in enumerate(raw["condition_specs"]):
+        if not isinstance(item, Mapping) or set(item) != {
+            "system_name", "condition_enabled"
+        }:
+            raise ValueError(f"condition_specs[{position}] fields mismatch")
+        _json_text_value(
+            item["system_name"], f"condition_specs[{position}].system_name"
+        )
+        _json_bool(
+            item["condition_enabled"],
+            f"condition_specs[{position}].condition_enabled",
+        )
+    if not _strict_json_equal(raw["condition_specs"], expected_condition_specs):
         raise ValueError("evaluation condition specs mismatch")
     artifacts: list[EvaluationArtifactProvenance] = []
     evaluations: list[EvaluationResult] = []
@@ -459,7 +489,7 @@ def _verify_existing(
         if count != len(rows) or count != eval_length:
             raise ValueError(f"{item['system_name']} is not a full-heldout evaluation")
         if not isinstance(item["evaluation_indices"], list) or any(
-            isinstance(index, bool) or not isinstance(index, int)
+            type(index) is not int
             for index in item["evaluation_indices"]
         ):
             raise TypeError(f"{system_name} evaluation_indices must be integers")
@@ -729,7 +759,7 @@ def _artifact_from_json(
             raise TypeError("checkpoint.variant_indices must be an exact object")
         for name in ("warmup", "joint"):
             if not isinstance(variant_indices[name], list) or any(
-                isinstance(index, bool) or not isinstance(index, int)
+                type(index) is not int
                 for index in variant_indices[name]
             ):
                 raise TypeError(f"checkpoint.variant_indices.{name} is invalid")

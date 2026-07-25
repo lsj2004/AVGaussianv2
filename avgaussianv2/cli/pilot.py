@@ -66,6 +66,12 @@ EVAL_SPECS = {
     Variant.FROZEN_VISUAL: (EvaluationSpec("frozen_visual_on", True),),
     Variant.CONDITION_OFF: (EvaluationSpec("condition_off", False),),
 }
+_EXPERIMENT_FIELDS = {
+    "schema", "version", "scene_id", "gpus", "config_sha256",
+    "shared_manifest_path", "shared_manifest_sha256",
+    "baseline_manifest_path", "baseline_manifest_sha256", "source_hashes",
+    "trusted_upstream_artifacts",
+}
 
 
 class PilotProcessError(RuntimeError):
@@ -165,6 +171,111 @@ def parse_gpus(value: str) -> tuple[int, int, int]:
     if len(set(result)) != 3:
         raise ValueError("--gpus IDs must be distinct")
     return result  # type: ignore[return-value]
+
+
+def _strict_json_equal(left: object, right: object) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _strict_json_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _strict_json_equal(a, b) for a, b in zip(left, right, strict=True)
+        )
+    return left == right
+
+
+def _validate_experiment_types(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping) or set(value) != _EXPERIMENT_FIELDS:
+        raise ValueError("experiment manifest fields mismatch")
+    if type(value["schema"]) is not str or value["schema"] != EXPERIMENT_SCHEMA:
+        raise ValueError("experiment schema mismatch")
+    if type(value["version"]) is not int or value["version"] != EXPERIMENT_VERSION:
+        raise ValueError("experiment version mismatch")
+    if type(value["scene_id"]) is not str or not value["scene_id"]:
+        raise TypeError("experiment scene_id must be a string")
+    if (
+        not isinstance(value["gpus"], list)
+        or len(value["gpus"]) != 3
+        or any(type(item) is not int or item < 0 for item in value["gpus"])
+        or len(set(value["gpus"])) != 3
+    ):
+        raise TypeError("experiment gpus must be three distinct nonnegative integers")
+    if type(value["trusted_upstream_artifacts"]) is not bool:
+        raise TypeError("experiment trusted_upstream_artifacts must be boolean")
+    for name in (
+        "config_sha256", "shared_manifest_sha256", "baseline_manifest_sha256"
+    ):
+        digest = value[name]
+        if (
+            type(digest) is not str
+            or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
+        ):
+            raise ValueError(f"experiment {name} must be a SHA-256 digest")
+    for name in ("shared_manifest_path", "baseline_manifest_path"):
+        raw_path = value[name]
+        if type(raw_path) is not str or not raw_path:
+            raise TypeError(f"experiment {name} must be a string")
+        path = Path(raw_path)
+        if not path.is_absolute() or Path(os.path.abspath(path)) != path:
+            raise ValueError(f"experiment {name} must be normalized absolute")
+    source_fields = {
+        "project_config_sha256", "dataset_manifest_sha256",
+        "visual_checkpoint_sha256", "audio_checkpoint_sha256",
+        "camera_mapping_sha256",
+    }
+    sources = value["source_hashes"]
+    if not isinstance(sources, Mapping) or set(sources) != source_fields:
+        raise ValueError("experiment source_hashes fields mismatch")
+    for name in source_fields:
+        digest = sources[name]
+        if (
+            type(digest) is not str
+            or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
+        ):
+            raise ValueError(f"experiment source_hashes.{name} is invalid")
+    return value
+
+
+def _validate_complete_status(value: object) -> Mapping[str, object]:
+    expected_fields = {
+        "schema", "version", "stages", "report_digest", "ready",
+        "durability_warnings",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected_fields:
+        raise ValueError("status fields mismatch")
+    if (
+        type(value["schema"]) is not str
+        or value["schema"] != EXPERIMENT_SCHEMA
+        or type(value["version"]) is not int
+        or value["version"] != EXPERIMENT_VERSION
+    ):
+        raise ValueError("status schema/version mismatch")
+    if value["stages"] != {
+        "baseline": "complete",
+        "workers": "complete",
+        "evaluations": "complete",
+        "report": "complete",
+    }:
+        raise ValueError("status stages are incomplete")
+    digest = value["report_digest"]
+    if (
+        type(digest) is not str
+        or len(digest) != 64
+        or any(char not in "0123456789abcdef" for char in digest)
+    ):
+        raise ValueError("status report_digest is invalid")
+    if type(value["ready"]) is not bool:
+        raise TypeError("status ready must be boolean")
+    if not isinstance(value["durability_warnings"], list) or any(
+        type(item) is not str for item in value["durability_warnings"]
+    ):
+        raise TypeError("status durability_warnings must be strings")
+    return value
 
 
 def _read_regular(path: Path, limit: int = 16 * 1024 * 1024) -> bytes:
@@ -576,14 +687,10 @@ def run_pilot(
     effective_trust = trust_upstream_artifacts
     existing_experiment_path = output / "experiment_manifest.json"
     if verify_only and existing_experiment_path.is_file():
-        existing_experiment = json.loads(
+        existing_experiment = _validate_experiment_types(json.loads(
             _read_regular(existing_experiment_path).decode()
-        )
-        recorded_trust = existing_experiment.get("trusted_upstream_artifacts")
-        if not isinstance(recorded_trust, bool):
-            raise TypeError(
-                "experiment trusted_upstream_artifacts must be boolean"
-            )
+        ))
+        recorded_trust = existing_experiment["trusted_upstream_artifacts"]
         effective_trust = recorded_trust
     if runner is None:
         runner = SubprocessRunner()
@@ -627,6 +734,7 @@ def run_pilot(
         baseline_specs = (EvaluationSpec("baseline_imported", False),)
         baseline_dir = output / "baseline"
         baseline_manifest = baseline_dir / "evaluation_manifest.json"
+        baseline_launched = False
         if not baseline_manifest.exists():
             if verify_only:
                 raise FileNotFoundError("baseline evaluation is incomplete")
@@ -642,12 +750,13 @@ def run_pilot(
             if resume and baseline_dir.exists():
                 command.append("--resume")
             _run_one(runner, "baseline", command, gpus[0], logs / "baseline.log")
+            baseline_launched = True
         baseline_job = _verify_existing(
             baseline_dir,
             baseline_specs,
             config_path=config_source,
         )
-        if not verify_only:
+        if not verify_only and not resume:
             _stage_status(
                 output,
                 baseline="complete",
@@ -668,25 +777,40 @@ def run_pilot(
             raise ValueError("visual baseline binding is corrupt")
 
         pilot = PilotConfig()
-        train_length = int(baseline_raw["train_length"])
-        eval_length = int(baseline_raw["eval_length"])
+        if (
+            type(baseline_raw.get("train_length")) is not int
+            or baseline_raw["train_length"] <= 0
+            or type(baseline_raw.get("eval_length")) is not int
+            or baseline_raw["eval_length"] <= 0
+        ):
+            raise TypeError("baseline dataset lengths must be positive integers")
+        train_length = baseline_raw["train_length"]
+        eval_length = baseline_raw["eval_length"]
         shared = _shared_indices(config.train.seed, train_length, pilot)
         heldout = _evenly_spaced(eval_length, pilot.quick_validation_samples)
-        desired_shared = _worker_manifest(
-            config=config,
-            config_bytes=config_bytes,
-            pilot=pilot,
-            shared=shared,
-            heldout=heldout,
-            baseline_path=visual_baseline,
-            baseline_summary=json.loads(_read_regular(visual_baseline).decode()),
-            baseline_job=baseline_raw,
-            train_length=train_length,
-            eval_length=eval_length,
+        desired_shared = json.loads(
+            json.dumps(
+                _worker_manifest(
+                    config=config,
+                    config_bytes=config_bytes,
+                    pilot=pilot,
+                    shared=shared,
+                    heldout=heldout,
+                    baseline_path=visual_baseline,
+                    baseline_summary=json.loads(
+                        _read_regular(visual_baseline).decode()
+                    ),
+                    baseline_job=baseline_raw,
+                    train_length=train_length,
+                    eval_length=eval_length,
+                ),
+                sort_keys=True,
+                allow_nan=False,
+            )
         )
         if shared_path.exists():
             existing = json.loads(_read_regular(shared_path).decode())
-            if existing != desired_shared:
+            if not _strict_json_equal(existing, desired_shared):
                 raise ValueError("shared manifest/config/source identity mismatch")
         elif verify_only:
             raise FileNotFoundError("shared worker manifest is missing")
@@ -711,7 +835,10 @@ def run_pilot(
             "trusted_upstream_artifacts": effective_trust,
         }
         if experiment_path.exists():
-            if json.loads(_read_regular(experiment_path).decode()) != experiment:
+            existing = _validate_experiment_types(
+                json.loads(_read_regular(experiment_path).decode())
+            )
+            if not _strict_json_equal(existing, experiment):
                 raise ValueError("experiment manifest identity mismatch")
         elif verify_only:
             raise FileNotFoundError("experiment manifest is missing")
@@ -720,6 +847,7 @@ def run_pilot(
 
         worker_specs: list[LaunchSpec] = []
         verified_workers: dict[Variant, object] = {}
+        resumed_variants: set[Variant] = set()
         for variant, gpu in zip(VARIANT_GPU_ORDER, gpus, strict=True):
             worker_dir = workers_root / variant.value
             has_entries = worker_dir.is_dir() and any(worker_dir.iterdir())
@@ -760,6 +888,7 @@ def run_pilot(
             ]
             if resume and has_entries:
                 command.append("--resume")
+                resumed_variants.add(variant)
             if trust_upstream_artifacts:
                 command.append("--trust-upstream-artifacts")
             log = logs / f"worker-{variant.value}.log"
@@ -777,7 +906,7 @@ def run_pilot(
                 variant,
                 trust_upstream_artifacts=effective_trust,
             )
-        if not verify_only:
+        if not verify_only and not resume:
             _stage_status(
                 output,
                 baseline="complete",
@@ -791,7 +920,11 @@ def run_pilot(
         for variant, gpu in zip(VARIANT_GPU_ORDER, gpus, strict=True):
             destination = eval_root / variant.value
             specs = EVAL_SPECS[variant]
-            if (destination / "evaluation_manifest.json").is_file():
+            replace_stale = variant in resumed_variants
+            if (
+                (destination / "evaluation_manifest.json").is_file()
+                and not replace_stale
+            ):
                 eval_jobs[variant] = _verify_existing(
                     destination,
                     specs,
@@ -817,7 +950,9 @@ def run_pilot(
                 )
             if trust_upstream_artifacts:
                 command.append("--trust-upstream-artifacts")
-            if resume and destination.exists():
+            if replace_stale:
+                command.append("--overwrite")
+            elif resume and destination.exists():
                 command.append("--resume")
             log = logs / f"eval-{variant.value}.log"
             pending.append(
@@ -833,7 +968,7 @@ def run_pilot(
                     shared_manifest=shared_path,
                     variant=variant,
                 )
-        if not verify_only:
+        if not verify_only and not resume:
             _stage_status(
                 output,
                 baseline="complete",
@@ -851,33 +986,22 @@ def run_pilot(
         ).sha256 != loaded.sha256:
             raise ValueError("shared manifest changed during orchestration")
 
+        report_inputs = _report_inputs(
+            output, baseline_job, eval_jobs, verified_workers
+        )
         if verify_only:
             comparison = verify_current_comparison(
-                _report_inputs(
-                    output, baseline_job, eval_jobs, verified_workers
-                ),
+                report_inputs,
                 output / "report",
             )
             status_path = output / "status.json"
-            status = json.loads(_read_regular(status_path).decode())
-            if set(status) != {
-                "schema", "version", "stages", "report_digest", "ready",
-                "durability_warnings",
-            }:
-                raise ValueError("status fields mismatch")
-            if status["schema"] != EXPERIMENT_SCHEMA or status["version"] != EXPERIMENT_VERSION:
-                raise ValueError("status schema/version mismatch")
-            if status["stages"] != {
-                "baseline": "complete",
-                "workers": "complete",
-                "evaluations": "complete",
-                "report": "complete",
-            }:
-                raise ValueError("status stages are incomplete")
+            status = _validate_complete_status(
+                json.loads(_read_regular(status_path).decode())
+            )
             if status.get("report_digest") != comparison.content_digest:
                 raise ValueError("status/report digest mismatch")
             ready = comparison.decision.ready
-            if status.get("ready") is not ready:
+            if status["ready"] is not ready:
                 raise ValueError("status/report decision mismatch")
             if status["durability_warnings"] != list(
                 comparison.durability_warnings
@@ -885,6 +1009,33 @@ def run_pilot(
                 raise ValueError("status/report durability warnings mismatch")
             return PilotOrchestrationResult(
                 experiment_path.resolve(), comparison.generation_path, ready,
+                comparison.durability_warnings,
+            )
+        if (
+            resume
+            and not baseline_launched
+            and not worker_specs
+            and not pending
+            and (output / "status.json").is_file()
+            and (output / "report" / "current").is_symlink()
+        ):
+            comparison = verify_current_comparison(
+                report_inputs, output / "report"
+            )
+            status = _validate_complete_status(
+                json.loads(_read_regular(output / "status.json").decode())
+            )
+            if (
+                status["report_digest"] != comparison.content_digest
+                or status["ready"] is not comparison.decision.ready
+                or status["durability_warnings"]
+                != list(comparison.durability_warnings)
+            ):
+                raise ValueError("completed resume status/report mismatch")
+            return PilotOrchestrationResult(
+                experiment_path.resolve(),
+                comparison.generation_path,
+                comparison.decision.ready,
                 comparison.durability_warnings,
             )
         comparison = _build_report(

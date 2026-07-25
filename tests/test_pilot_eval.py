@@ -247,6 +247,48 @@ def test_resume_rejects_json_type_coercion_before_runtime(
         )
 
 
+@pytest.mark.parametrize("version", [True, 1.0, "1"])
+def test_resume_rejects_non_integer_job_version(tmp_path, version) -> None:
+    config, _ = _config(tmp_path)
+    output = tmp_path / "evaluation"
+    run_evaluation(
+        config, output, ("baseline_imported:off",), device="cpu",
+        runtime_factory=_runtime, evaluator_factory=_Evaluator,
+    )
+    manifest = output / "evaluation_manifest.json"
+    value = json.loads(manifest.read_text())
+    value["version"] = version
+    manifest.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="schema/version"):
+        run_evaluation(
+            config, output, ("baseline_imported:off",), device="cpu",
+            resume=True,
+            runtime_factory=lambda *_: pytest.fail("built runtime"),
+            evaluator_factory=_Evaluator,
+        )
+
+
+@pytest.mark.parametrize("condition", [0, 1, "false"])
+def test_resume_rejects_non_boolean_condition(tmp_path, condition) -> None:
+    config, _ = _config(tmp_path)
+    output = tmp_path / "evaluation"
+    run_evaluation(
+        config, output, ("baseline_imported:off",), device="cpu",
+        runtime_factory=_runtime, evaluator_factory=_Evaluator,
+    )
+    manifest = output / "evaluation_manifest.json"
+    value = json.loads(manifest.read_text())
+    value["systems"][0]["condition_enabled"] = condition
+    manifest.write_text(json.dumps(value))
+    with pytest.raises(TypeError, match="boolean"):
+        run_evaluation(
+            config, output, ("baseline_imported:off",), device="cpu",
+            resume=True,
+            runtime_factory=lambda *_: pytest.fail("built runtime"),
+            evaluator_factory=_Evaluator,
+        )
+
+
 def test_resume_rejects_wrong_camera_even_when_rows_are_coherently_resigned(
     tmp_path,
 ) -> None:
