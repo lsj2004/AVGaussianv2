@@ -428,6 +428,7 @@ def test_stale_current_after_manifest_publish_is_repaired(tmp_path: Path) -> Non
         with orchestration._AttemptLogs(pinned, "scene1_opera"):
             pass
         (pinned / "logs" / "current.json").write_bytes(old_current)
+        (pinned / "logs" / ".current.json.crash").write_text("partial")
 
     with pytest.raises(OrchestrationError, match="pointer mismatch"):
         orchestration._verify_logs(output, "scene1_opera")
@@ -440,6 +441,72 @@ def test_stale_current_after_manifest_publish_is_repaired(tmp_path: Path) -> Non
             assert attempt.name == "attempt-000002"
 
     orchestration._verify_logs(output, "scene1_opera")
+
+
+def test_manifest_atomic_temp_is_removed_before_resealing_tail(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "result"
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(target=_crash_attempt, args=(str(output),))
+    process.start()
+    process.join(10)
+    tail = output / "logs" / "attempt-000000"
+    (tail / ".manifest.json.crash").write_text("partial")
+    orchestration._verify_logs(output, "scene1_opera", allow_interrupted_tail=True)
+
+    with orchestration.BenchmarkOutputLock(output) as pinned:
+        snapshot = orchestration._tree_snapshot_sha256(pinned)
+        with orchestration._AttemptLogs(
+            pinned, "scene1_opera", expected_snapshot=snapshot
+        ) as attempt:
+            assert attempt.name == "attempt-000001"
+            assert not (
+                pinned / "logs" / "attempt-000000" / ".manifest.json.crash"
+            ).exists()
+
+    orchestration._verify_logs(output, "scene1_opera")
+
+
+@pytest.mark.parametrize("target", ["manifest", "current"])
+@pytest.mark.parametrize("attack", ["symlink", "hardlink", "multiple"])
+def test_malicious_atomic_temp_files_fail_closed(
+    tmp_path: Path, target: str, attack: str
+) -> None:
+    output = tmp_path / "result"
+    if target == "manifest":
+        context = multiprocessing.get_context("spawn")
+        process = context.Process(target=_crash_attempt, args=(str(output),))
+        process.start()
+        process.join(10)
+        directory = output / "logs" / "attempt-000000"
+        prefix = ".manifest.json."
+    else:
+        with orchestration.BenchmarkOutputLock(output) as pinned:
+            with orchestration._AttemptLogs(pinned, "scene1_opera"):
+                pass
+            old_current = (pinned / "logs" / "current.json").read_bytes()
+            with orchestration._AttemptLogs(pinned, "scene1_opera"):
+                pass
+            (pinned / "logs" / "current.json").write_bytes(old_current)
+        directory = output / "logs"
+        prefix = ".current.json."
+    outside = tmp_path / "outside"
+    outside.write_text("outside")
+    temporary = directory / f"{prefix}one"
+    if attack == "symlink":
+        temporary.symlink_to(outside)
+        match = "unsafe"
+    elif attack == "hardlink":
+        os.link(outside, temporary)
+        match = "unsafe"
+    else:
+        temporary.write_text("one")
+        (directory / f"{prefix}two").write_text("two")
+        match = "multiple"
+
+    with pytest.raises(OrchestrationError, match=match):
+        orchestration._verify_logs(output, "scene1_opera", allow_interrupted_tail=True)
 
 
 def test_completed_resume_recovers_tail_before_strict_verify(

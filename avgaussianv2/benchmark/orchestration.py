@@ -452,16 +452,41 @@ def _read_in_progress_attempt(
         or not isinstance(contract.get("source_snapshot_sha256"), str)
     ):
         raise OrchestrationError("in-progress attempt contract mismatch")
+    manifest_temps = set(_atomic_temp_files(attempt, "manifest.json"))
     for child in attempt.iterdir():
         metadata = child.lstat()
         if (
-            (child.name != "in_progress.json" and child.suffix != ".log")
+            (
+                child.name != "in_progress.json"
+                and child.suffix != ".log"
+                and child not in manifest_temps
+            )
             or not stat.S_ISREG(metadata.st_mode)
             or metadata.st_uid != os.getuid()
             or metadata.st_nlink != 1
         ):
             raise OrchestrationError("in-progress attempt inventory is unsafe")
     return contract
+
+
+def _atomic_temp_files(directory: Path, target: str) -> tuple[Path, ...]:
+    prefix = f".{target}."
+    matches = tuple(
+        child
+        for child in directory.iterdir()
+        if child.name.startswith(prefix) and len(child.name) > len(prefix)
+    )
+    if len(matches) > 1:
+        raise OrchestrationError(f"multiple atomic temp files for {target}")
+    for child in matches:
+        metadata = child.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+        ):
+            raise OrchestrationError(f"unsafe atomic temp file for {target}")
+    return matches
 
 
 def _is_incomplete_attempt_creation(attempt: Path) -> bool:
@@ -520,15 +545,17 @@ def _seal_interrupted_attempt(
 
 
 def _recover_interrupted_attempt(logs: Path, identity: str) -> None:
-    tail, pointer_repair = _verify_logs_path(
+    tail, pointer_repair, current_temps = _verify_logs_path(
         logs, identity, allow_interrupted_tail=True
     )
+    for temporary in current_temps:
+        temporary.unlink()
     if pointer_repair is not None:
         _atomic_json(logs / "current.json", pointer_repair)
-        tail, second_repair = _verify_logs_path(
+        tail, second_repair, second_temps = _verify_logs_path(
             logs, identity, allow_interrupted_tail=True
         )
-        if second_repair is not None:
+        if second_repair is not None or second_temps:
             raise OrchestrationError("attempt log pointer repair did not converge")
     if tail is None:
         return
@@ -539,6 +566,8 @@ def _recover_interrupted_attempt(logs: Path, identity: str) -> None:
             child.unlink()
         tail.rmdir()
         return
+    for temporary in _atomic_temp_files(tail, "manifest.json"):
+        temporary.unlink()
     current = logs / "current.json"
     previous = None
     sequence = 0
@@ -559,7 +588,7 @@ def _recover_interrupted_attempt(logs: Path, identity: str) -> None:
 def _verify_logs(
     root: Path, identity: str, *, allow_interrupted_tail: bool = False
 ) -> None:
-    tail, _ = _verify_logs_path(
+    tail, _, _ = _verify_logs_path(
         root / "logs", identity, allow_interrupted_tail=allow_interrupted_tail
     )
     if tail is not None and not allow_interrupted_tail:
@@ -568,16 +597,30 @@ def _verify_logs(
 
 def _verify_logs_path(
     logs: Path, identity: str, *, allow_interrupted_tail: bool
-) -> tuple[Path | None, dict[str, object] | None]:
+) -> tuple[Path | None, dict[str, object] | None, tuple[Path, ...]]:
     _require_safe_inode(logs, directory=True)
     current_path = logs / "current.json"
     current = _safe_json(current_path) if current_path.exists() else None
     if current is not None and not isinstance(current, dict):
         raise OrchestrationError("attempt log current pointer is invalid")
-    attempts = sorted(
-        (path for path in logs.iterdir() if path.name != "current.json"),
-        key=lambda path: int(path.name.removeprefix("attempt-")),
+    current_temps = _atomic_temp_files(logs, "current.json")
+    children = tuple(logs.iterdir())
+    attempt_candidates = tuple(
+        path for path in children if path.name.startswith("attempt-")
     )
+    if {path.name for path in children} != {
+        *(path.name for path in attempt_candidates),
+        *(path.name for path in current_temps),
+        *(("current.json",) if current_path.exists() else ()),
+    }:
+        raise OrchestrationError("attempt log root inventory mismatch")
+    try:
+        attempts = sorted(
+            attempt_candidates,
+            key=lambda path: int(path.name.removeprefix("attempt-")),
+        )
+    except ValueError as error:
+        raise OrchestrationError("attempt log sequence is unsafe") from error
     previous: str | None = None
     committed = 0
     committed_pointers: list[dict[str, object]] = []
@@ -661,12 +704,11 @@ def _verify_logs_path(
             pointer_repair = expected_current
         else:
             raise OrchestrationError("attempt log current pointer mismatch")
-    expected_root = {attempt.name for attempt in attempts}
-    if current is not None:
-        expected_root.add("current.json")
-    if {path.name for path in logs.iterdir()} != expected_root:
-        raise OrchestrationError("attempt log root inventory mismatch")
-    return tail, pointer_repair
+    if current_temps and pointer_repair is None:
+        raise OrchestrationError(
+            "atomic current temp has no recoverable pointer transition"
+        )
+    return tail, pointer_repair, current_temps
 
 
 def _atomic_json(path: Path, value: Mapping[str, object]) -> None:
