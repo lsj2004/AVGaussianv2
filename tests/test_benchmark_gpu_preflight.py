@@ -62,6 +62,11 @@ def test_preflight_probes_every_gpu_in_each_production_environment(
         return _completed(_probe_payload(argv, gpu))
 
     monkeypatch.setattr(orchestration.subprocess, "run", run)
+    monkeypatch.setattr(
+        orchestration,
+        "_run_probe_command",
+        lambda command, *, environment, **_: run(list(command), env=environment),
+    )
     monkeypatch.setattr(orchestration.shutil, "which", lambda value: value)
     monkeypatch.setattr(orchestration, "MIN_FREE_BYTES", 0)
 
@@ -116,6 +121,11 @@ def test_preflight_fails_closed_on_environment_cuda_probe_error(
         return _completed(_probe_payload(command, "0"))
 
     monkeypatch.setattr(orchestration.subprocess, "run", run)
+    monkeypatch.setattr(
+        orchestration,
+        "_run_probe_command",
+        lambda command, *, environment, **_: run(list(command), env=environment),
+    )
     monkeypatch.setattr(orchestration.shutil, "which", lambda value: value)
     monkeypatch.setattr(orchestration, "MIN_FREE_BYTES", 0)
 
@@ -151,3 +161,43 @@ def test_suite_launches_no_native_process_when_real_preflight_fails(
 
     assert starts == []
     assert not (tmp_path / "output").exists()
+
+
+def test_probe_timeout_terminates_then_kills_the_whole_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signals: list[tuple[int, int]] = []
+
+    class HungProcess:
+        pid = 1234
+        returncode = None
+
+        def __init__(self, *_args: object, **kwargs: object) -> None:
+            assert kwargs["start_new_session"] is True
+
+        def communicate(
+            self, timeout: float | None = None
+        ) -> tuple[str, str]:
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(("probe",), timeout)
+            self.returncode = -9
+            return "", ""
+
+    monkeypatch.setattr(orchestration.subprocess, "Popen", HungProcess)
+    monkeypatch.setattr(
+        orchestration.os,
+        "killpg",
+        lambda pid, signum: signals.append((pid, signum)),
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        orchestration._run_probe_command(
+            ("python", "-c", "pass"),
+            environment={},
+            timeout_seconds=0.01,
+        )
+
+    assert signals == [
+        (1234, orchestration.signal.SIGTERM),
+        (1234, orchestration.signal.SIGKILL),
+    ]

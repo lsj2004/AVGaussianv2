@@ -327,7 +327,9 @@ def test_native_production_adapter_exposes_only_its_modality(
     assert (prediction.rendered_rgb is not None) is has_rgb
 
 
-def test_snapshot_importer_preserves_nested_package_semantics(tmp_path):
+def test_snapshot_importer_preserves_nested_package_semantics(
+    tmp_path, monkeypatch
+):
     audio_root = tmp_path / "audio"
     visual_root = tmp_path / "visual"
     sources = {
@@ -342,6 +344,14 @@ def test_snapshot_importer_preserves_nested_package_semantics(tmp_path):
     for path, data in sources.items():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
+    for name in tuple(sys.modules):
+        if (
+            name == "ftgspp"
+            or name.startswith("ftgspp.")
+            or name == "libs"
+            or name.startswith("libs.")
+        ):
+            monkeypatch.delitem(sys.modules, name)
     with ExitStack() as stack:
         pins = [
             stack.enter_context(

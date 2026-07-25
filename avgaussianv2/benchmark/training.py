@@ -13,6 +13,7 @@ import json
 import math
 import os
 import random
+import stat
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
@@ -603,6 +604,235 @@ def _checkpoint_is_committed(
         getattr(checkpoint_io, field.name) <= getattr(sidecar_io, field.name)
         for field in fields(CheckpointIO)
     )
+
+
+def verify_resume_artifacts(
+    output: Path,
+    *,
+    worker_manifest: Mapping[str, object],
+) -> None:
+    """Strictly verify durable resume state without mutating model or files."""
+    benchmark = BenchmarkConfig.from_mapping(worker_manifest.get("training"))
+    compatibility_value = worker_manifest.get("compatibility")
+    compatibility = BenchmarkCompatibility.from_mapping(compatibility_value)
+    expected_warmup = (
+        benchmark.conditioner_warmup_steps
+        if compatibility.mode == BenchmarkMode.JOINT_CONDITIONED.value
+        else 0
+    )
+    contract_path = output / "contract.json"
+    try:
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise BenchmarkResumeError(f"cannot read benchmark contract: {error}") from error
+    if (
+        not isinstance(contract, Mapping)
+        or set(contract)
+        != {
+            "schema",
+            "version",
+            "fingerprint",
+            "compatibility",
+            "shared_indices",
+            "selection",
+            "milestones",
+        }
+        or contract["schema"] != f"{SCHEMA}.contract"
+        or contract["version"] != SCHEMA_VERSION
+        or contract["compatibility"] != worker_manifest.get("compatibility")
+        or contract["shared_indices"] != worker_manifest.get("shared_indices")
+        or contract["selection"] != "final"
+        or contract["milestones"] != list(benchmark.milestones)
+    ):
+        raise BenchmarkResumeError("benchmark contract/fingerprint mismatch")
+    fingerprint = contract["fingerprint"]
+    if (
+        not isinstance(fingerprint, Mapping)
+        or set(fingerprint) != {"sha256", "inputs"}
+        or not isinstance(fingerprint["inputs"], Mapping)
+        or hashlib.sha256(
+            json.dumps(
+                fingerprint["inputs"],
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+        ).hexdigest()
+        != fingerprint["sha256"]
+    ):
+        raise BenchmarkResumeError("benchmark fingerprint mismatch")
+    fingerprint_sha256 = str(fingerprint["sha256"])
+    progress_path = output / "progress.json"
+    try:
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise BenchmarkResumeError(f"cannot read progress journal: {error}") from error
+    progress_fields = {
+        "schema",
+        "version",
+        "stage",
+        "observed_warmup_step",
+        "observed_main_step",
+        "exact_warmup_step",
+        "exact_main_step",
+        "maximum_replay_updates",
+        "fingerprint_sha256",
+    }
+    if (
+        not isinstance(progress, Mapping)
+        or set(progress) != progress_fields
+        or progress["schema"] != f"{SCHEMA}.progress"
+        or progress["version"] != SCHEMA_VERSION
+        or progress["stage"] not in {"warmup", "main"}
+        or progress["fingerprint_sha256"] != fingerprint_sha256
+        or progress["maximum_replay_updates"] != benchmark.checkpoint_every
+        or any(
+            not isinstance(progress[name], int)
+            or isinstance(progress[name], bool)
+            or progress[name] < 0
+            for name in (
+                "observed_warmup_step",
+                "observed_main_step",
+                "exact_warmup_step",
+                "exact_main_step",
+            )
+        )
+        or progress["exact_warmup_step"] > progress["observed_warmup_step"]
+        or progress["exact_main_step"] > progress["observed_main_step"]
+        or progress["observed_warmup_step"] > expected_warmup
+        or progress["observed_main_step"] > benchmark.main_updates
+        or (
+            progress["stage"] == "warmup"
+            and (
+                compatibility.mode != BenchmarkMode.JOINT_CONDITIONED.value
+                or progress["observed_main_step"] != 0
+                or progress["exact_main_step"] != 0
+            )
+        )
+        or (
+            progress["stage"] == "main"
+            and progress["observed_warmup_step"] != expected_warmup
+        )
+    ):
+        raise BenchmarkResumeError("progress journal metadata mismatch")
+    sidecar, committed = _load_io_sidecar(
+        output, fingerprint_sha256=fingerprint_sha256
+    )
+    del sidecar
+    checkpoints = output / "checkpoints"
+    actual_checkpoints = (
+        {path.name: path for path in checkpoints.iterdir()}
+        if checkpoints.exists()
+        else {}
+    )
+    if set(actual_checkpoints) != set(committed):
+        raise BenchmarkResumeError("committed rolling checkpoint inventory mismatch")
+    required_exact = (
+        None
+        if progress["exact_warmup_step"] == progress["exact_main_step"] == 0
+        else (
+            f"main_step_{progress['exact_main_step']:06d}.pt"
+            if progress["exact_main_step"] > 0
+            else f"warmup_step_{progress['exact_warmup_step']:06d}.pt"
+        )
+    )
+    if required_exact is not None and required_exact not in committed:
+        raise BenchmarkResumeError("progress has no committed exact checkpoint")
+    for name, path in actual_checkpoints.items():
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+        ):
+            raise BenchmarkResumeError(f"unsafe committed checkpoint: {name}")
+        if hashlib.sha256(path.read_bytes()).hexdigest() != committed[name]:
+            raise BenchmarkResumeError(f"committed checkpoint hash mismatch: {name}")
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+        except Exception as error:
+            raise BenchmarkResumeError(
+                f"cannot load exact checkpoint: {error}"
+            ) from error
+        if (
+            not isinstance(payload, Mapping)
+            or set(payload) != _CHECKPOINT_KEYS
+            or payload.get("schema") != SCHEMA
+            or payload.get("version") != SCHEMA_VERSION
+            or payload.get("fingerprint") != fingerprint
+            or payload.get("compatibility") != compatibility_value
+            or payload.get("stage") not in {"warmup", "main"}
+            or not isinstance(payload.get("warmup_step"), int)
+            or isinstance(payload.get("warmup_step"), bool)
+            or not isinstance(payload.get("main_step"), int)
+            or isinstance(payload.get("main_step"), bool)
+        ):
+            raise BenchmarkResumeError("checkpoint schema/fingerprint mismatch")
+        if (
+            payload["warmup_step"] < 0
+            or payload["main_step"] < 0
+            or (
+                payload["stage"] == "warmup"
+                and (
+                    compatibility.mode != BenchmarkMode.JOINT_CONDITIONED.value
+                    or payload["warmup_step"] > expected_warmup
+                    or payload["main_step"] != 0
+                )
+            )
+            or (
+                payload["stage"] == "main"
+                and (
+                    payload["warmup_step"] != expected_warmup
+                    or payload["main_step"] > benchmark.main_updates
+                )
+            )
+        ):
+            raise BenchmarkResumeError("checkpoint stage/step mismatch")
+        step = (
+            payload["warmup_step"]
+            if payload["stage"] == "warmup"
+            else payload["main_step"]
+        )
+        if name != f"{payload['stage']}_step_{step:06d}.pt":
+            raise BenchmarkResumeError("checkpoint filename/step mismatch")
+    journal_path = output / "artifact_journal.json"
+    if journal_path.exists():
+        try:
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise BenchmarkResumeError(
+                f"cannot read artifact transaction journal: {error}"
+            ) from error
+        if (
+            not isinstance(journal, Mapping)
+            or set(journal)
+            != {"schema", "version", "fingerprint_sha256", "sha256"}
+            or journal["schema"] != f"{SCHEMA}.artifact-journal"
+            or journal["version"] != SCHEMA_VERSION
+            or journal["fingerprint_sha256"] != fingerprint_sha256
+            or not isinstance(journal["sha256"], Mapping)
+        ):
+            raise BenchmarkResumeError("artifact transaction journal mismatch")
+        for relative, digest in journal["sha256"].items():
+            artifact = output / str(relative)
+            try:
+                metadata = artifact.lstat()
+            except OSError:
+                metadata = None
+            if (
+                not isinstance(relative, str)
+                or relative.startswith("/")
+                or ".." in Path(relative).parts
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+                or metadata is None
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+                or hashlib.sha256(artifact.read_bytes()).hexdigest() != digest
+            ):
+                raise BenchmarkResumeError("artifact transaction hash mismatch")
 
 
 def _progress_allows_fresh_resume(

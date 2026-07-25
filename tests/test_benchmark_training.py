@@ -23,6 +23,7 @@ from avgaussianv2.benchmark.training import (
     configure_benchmark_mode,
     hash_shared_indices,
     make_shared_indices,
+    verify_resume_artifacts,
 )
 from avgaussianv2.config import TrainConfig
 from avgaussianv2.contracts import AlignedAVSample, FusionOutput, RGBDRender
@@ -937,6 +938,151 @@ def test_checkpoint_io_snapshot_includes_its_own_final_write(tmp_path) -> None:
     assert final_payload["io"]["checkpoint_bytes"] >= (
         result.final_checkpoint.stat().st_size * 3
     )
+
+
+def _strict_resume_fixture(output, *, exact_main_step=0):
+    training = BenchmarkConfig()
+    compatibility = BenchmarkCompatibility(
+        scene_id="scene1_opera",
+        mode=BenchmarkMode.AUDIO_ONLY.value,
+        train_cameras=benchmark_training.TRAIN_CAMERAS,
+        test_camera=benchmark_training.TEST_CAMERA,
+        seed=42,
+        index_sha256="1" * 64,
+        visual_initialization_sha256="2" * 64,
+        audio_initialization_sha256="3" * 64,
+        model_initialization_sha256="4" * 64,
+        source_sha256="5" * 64,
+        config_sha256="6" * 64,
+    ).to_mapping()
+    fingerprint_inputs = {"strict": True}
+    fingerprint = {
+        "inputs": fingerprint_inputs,
+        "sha256": hashlib.sha256(
+            json.dumps(
+                fingerprint_inputs, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest(),
+    }
+    manifest = {
+        "training": {
+            **benchmark_training.asdict(training),
+            "milestones": list(training.milestones),
+        },
+        "compatibility": compatibility,
+        "shared_indices": [0],
+    }
+    output.mkdir(exist_ok=True)
+    (output / "contract.json").write_text(
+        json.dumps(
+            {
+                "schema": f"{benchmark_training.SCHEMA}.contract",
+                "version": benchmark_training.SCHEMA_VERSION,
+                "fingerprint": fingerprint,
+                "compatibility": compatibility,
+                "shared_indices": [0],
+                "selection": "final",
+                "milestones": list(training.milestones),
+            }
+        )
+    )
+    (output / "progress.json").write_text(
+        json.dumps(
+            {
+                "schema": f"{benchmark_training.SCHEMA}.progress",
+                "version": benchmark_training.SCHEMA_VERSION,
+                "stage": "main",
+                "observed_warmup_step": 0,
+                "observed_main_step": exact_main_step,
+                "exact_warmup_step": 0,
+                "exact_main_step": exact_main_step,
+                "maximum_replay_updates": training.checkpoint_every,
+                "fingerprint_sha256": fingerprint["sha256"],
+            }
+        )
+    )
+    committed = {}
+    if exact_main_step:
+        checkpoints = output / "checkpoints"
+        checkpoints.mkdir()
+        name = f"main_step_{exact_main_step:06d}.pt"
+        payload = {
+            key: {}
+            for key in benchmark_training._CHECKPOINT_KEYS
+        }
+        payload.update(
+            schema=benchmark_training.SCHEMA,
+            version=benchmark_training.SCHEMA_VERSION,
+            fingerprint=fingerprint,
+            compatibility=compatibility,
+            stage="main",
+            warmup_step=0,
+            main_step=exact_main_step,
+        )
+        torch.save(payload, checkpoints / name)
+        committed[name] = hashlib.sha256((checkpoints / name).read_bytes()).hexdigest()
+    (output / "checkpoint_io.json").write_text(
+        json.dumps(
+            {
+                "schema": f"{benchmark_training.SCHEMA}.checkpoint-io",
+                "version": benchmark_training.SCHEMA_VERSION,
+                "fingerprint_sha256": fingerprint["sha256"],
+                "io": benchmark_training.CheckpointIO().to_mapping(),
+                "committed_checkpoints": committed,
+            }
+        )
+    )
+    return manifest
+
+
+def test_strict_resume_verifier_rejects_progress_without_exact_checkpoint(
+    tmp_path,
+) -> None:
+    manifest = _strict_resume_fixture(tmp_path, exact_main_step=500)
+    (tmp_path / "checkpoints" / "main_step_000500.pt").unlink()
+    sidecar = json.loads((tmp_path / "checkpoint_io.json").read_text())
+    sidecar["committed_checkpoints"] = {}
+    (tmp_path / "checkpoint_io.json").write_text(json.dumps(sidecar))
+
+    with pytest.raises(BenchmarkResumeError, match="no committed exact checkpoint"):
+        verify_resume_artifacts(tmp_path, worker_manifest=manifest)
+
+
+def test_strict_resume_verifier_rejects_corrupt_io_sidecar(tmp_path) -> None:
+    manifest = _strict_resume_fixture(tmp_path)
+    sidecar = json.loads((tmp_path / "checkpoint_io.json").read_text())
+    sidecar["fingerprint_sha256"] = "f" * 64
+    (tmp_path / "checkpoint_io.json").write_text(json.dumps(sidecar))
+
+    with pytest.raises(BenchmarkResumeError, match="sidecar metadata"):
+        verify_resume_artifacts(tmp_path, worker_manifest=manifest)
+
+
+def test_strict_resume_verifier_rejects_corrupt_checkpoint_and_journal(
+    tmp_path,
+) -> None:
+    manifest = _strict_resume_fixture(tmp_path, exact_main_step=500)
+    checkpoint = tmp_path / "checkpoints" / "main_step_000500.pt"
+    checkpoint.write_bytes(checkpoint.read_bytes() + b"tamper")
+    with pytest.raises(BenchmarkResumeError, match="checkpoint hash"):
+        verify_resume_artifacts(tmp_path, worker_manifest=manifest)
+
+    manifest = _strict_resume_fixture(tmp_path / "journal")
+    (tmp_path / "journal" / "published.pt").write_bytes(b"payload")
+    (tmp_path / "journal" / "artifact_journal.json").write_text(
+        json.dumps(
+            {
+                "schema": f"{benchmark_training.SCHEMA}.artifact-journal",
+                "version": benchmark_training.SCHEMA_VERSION,
+                "fingerprint_sha256": json.loads(
+                    (tmp_path / "journal" / "contract.json").read_text()
+                )["fingerprint"]["sha256"],
+                "sha256": {"published.pt": "0" * 64},
+            }
+        )
+    )
+    with pytest.raises(BenchmarkResumeError, match="artifact transaction hash"):
+        verify_resume_artifacts(tmp_path / "journal", worker_manifest=manifest)
 
 
 def test_checkpoint_seconds_include_atomic_fsync_and_manifest_publication(

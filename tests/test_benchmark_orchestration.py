@@ -639,6 +639,64 @@ def test_suite_runs_scenes_in_declared_order_then_builds_and_verifies_report(
     assert second_scene < report_start < suite_verify
 
 
+def test_suite_runs_gpu_runtime_probe_once_and_reuses_nine_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repo"
+    output = tmp_path / "suite"
+    probe_calls = 0
+    scene_payloads: list[Mapping[str, object]] = []
+
+    def real_preflight_shape(
+        *_args: object,
+        _runtime_probes: Mapping[str, Mapping[str, object]] | None = None,
+    ) -> Mapping[str, object]:
+        nonlocal probe_calls
+        if _runtime_probes is None:
+            probe_calls += 1
+            probes: Mapping[str, Mapping[str, object]] = {
+                str(gpu): {
+                    runtime: {"verified": True}
+                    for runtime in ("avgaussianv2", "ftgspp", "audiogs")
+                }
+                for gpu in (0, 1, 2)
+            }
+        else:
+            probes = _runtime_probes
+        return {"gpu_runtime_probes": probes}
+
+    monkeypatch.setattr(orchestration, "_preflight", real_preflight_shape)
+    monkeypatch.setattr(orchestration, "_native_contracts_valid", lambda *_: True)
+    monkeypatch.setattr(orchestration, "_require_native_contracts", lambda *_: None)
+
+    def scene_runner(**kwargs: object) -> SceneBenchmarkResult:
+        scene_payloads.append(kwargs["_preflight_payload"])  # type: ignore[arg-type]
+        assert kwargs["_skip_preflight"] is True
+        root = Path(kwargs["output_dir"])  # type: ignore[arg-type]
+        return SceneBenchmarkResult(
+            Path(kwargs["config_path"]).stem,  # type: ignore[arg-type]
+            root,
+            root / "report",
+            True,
+        )
+
+    run_benchmark_suite(
+        repository=repository,
+        output_dir=output,
+        skip_native_training=True,
+        runner=_Runner(),
+        _scene_runner=scene_runner,
+        _suite_verifier=lambda _path: {"content_sha256": "a" * 64},
+        _preflight_fn=real_preflight_shape,
+    )
+
+    assert probe_calls == 1
+    assert len(scene_payloads) == 2
+    assert scene_payloads[0]["gpu_runtime_probes"] is scene_payloads[1][
+        "gpu_runtime_probes"
+    ]
+
+
 def test_suite_opens_the_explicit_native_execute_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -689,6 +747,34 @@ def test_suite_partial_resume_rejects_extra_before_preflight_or_mutation(
         )
 
     assert _tree_digest(output) == before
+
+
+@pytest.mark.parametrize(
+    ("system", "artifact"),
+    [
+        ("native_audiogs", "step_005000"),
+        ("joint_conditioned", "native"),
+        ("audio_only", "step_007500"),
+    ],
+)
+def test_partial_evaluation_matrix_rejects_cross_system_or_unreported_artifact(
+    tmp_path: Path, system: str, artifact: str
+) -> None:
+    system_dir = tmp_path / system
+    (system_dir / artifact).mkdir(parents=True)
+
+    with pytest.raises(OrchestrationError, match="artifact matrix"):
+        orchestration._partial_evaluation_artifacts(system_dir)
+
+
+def test_partial_evaluation_matrix_rejects_empty_system_directory(
+    tmp_path: Path,
+) -> None:
+    system_dir = tmp_path / "visual_only"
+    system_dir.mkdir()
+
+    with pytest.raises(OrchestrationError, match="artifact matrix"):
+        orchestration._partial_evaluation_artifacts(system_dir)
 
 
 def test_suite_verify_only_checks_both_scenes_in_order_without_mutation(

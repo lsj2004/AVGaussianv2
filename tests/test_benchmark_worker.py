@@ -311,6 +311,9 @@ def test_production_runtime_executes_only_pinned_inputs_during_live_replacement(
     monkeypatch.setattr(
         "avgaussianv2.benchmark.runtime.build_runtime", fake_build
     )
+    for name in tuple(sys.modules):
+        if name == "libs" or name.startswith("libs."):
+            monkeypatch.delitem(sys.modules, name)
     result = build_production_runtime(
         config_path=config_path,
         device=torch.device("cpu"),

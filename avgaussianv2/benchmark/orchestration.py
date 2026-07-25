@@ -40,6 +40,7 @@ from avgaussianv2.benchmark.report import verify_scene_report, verify_suite_repo
 from avgaussianv2.benchmark.training import (
     hash_shared_indices,
     make_shared_indices,
+    verify_resume_artifacts,
 )
 
 
@@ -48,6 +49,8 @@ GPU_ORDER = ("joint_conditioned", "audio_only", "visual_only")
 SCHEMA = "avgaussianv2.cam38-scene-orchestration"
 MIN_FREE_BYTES = 300 * 1024**3
 FTGSPP_PYTHON = Path("/mnt/sda/lisujing/Dataset/FreeTimeGSPlusPlus/.venv/bin/python")
+GPU_PROBE_TIMEOUT_SECONDS = 120.0
+GPU_PROBE_TERMINATE_SECONDS = 5.0
 
 
 def _cuda_probe_source(modules: Sequence[str]) -> str:
@@ -95,6 +98,52 @@ def _runtime_probe_commands(
     )
 
 
+def _run_probe_command(
+    command: Sequence[str],
+    *,
+    environment: Mapping[str, str],
+    timeout_seconds: float = GPU_PROBE_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    """Run one probe in a private process group and reap it fail-closed."""
+    process = subprocess.Popen(
+        list(command),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=dict(environment),
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as error:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.communicate(timeout=GPU_PROBE_TERMINATE_SECONDS)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+        raise subprocess.TimeoutExpired(
+            list(command), timeout_seconds, output=error.output, stderr=error.stderr
+        ) from error
+    completed = subprocess.CompletedProcess(
+        list(command), process.returncode, stdout=stdout, stderr=stderr
+    )
+    if completed.returncode:
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            list(command),
+            output=stdout,
+            stderr=stderr,
+        )
+    return completed
+
+
 def _probe_gpu_runtimes(
     gpus: Sequence[int], python_executable: str
 ) -> dict[str, dict[str, object]]:
@@ -111,12 +160,9 @@ def _probe_gpu_runtimes(
                 CUBLAS_WORKSPACE_CONFIG=":4096:8",
             )
             try:
-                completed = subprocess.run(
+                completed = _run_probe_command(
                     command,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    env=environment,
+                    environment=environment,
                 )
                 lines = [line for line in completed.stdout.splitlines() if line.strip()]
                 payload = json.loads(lines[-1])
@@ -131,6 +177,7 @@ def _probe_gpu_runtimes(
                 IndexError,
                 OSError,
                 subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
                 ValueError,
             ) as error:
                 detail = (
@@ -992,6 +1039,8 @@ def _preflight(
     output_parent: Path,
     gpus: tuple[int, int, int],
     python_executable: str,
+    *,
+    _runtime_probes: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     if not config.is_file():
         raise OrchestrationError(f"protocol config is missing: {config}")
@@ -1000,26 +1049,33 @@ def _preflight(
     if shutil.which("conda") is None:
         raise OrchestrationError("conda is unavailable for the AudioGS preflight")
     try:
-        query = subprocess.run(
+        query = _run_probe_command(
             [
                 "nvidia-smi",
                 "--query-gpu=index,memory.free",
                 "--format=csv,noheader,nounits",
             ],
-            check=True,
-            capture_output=True,
-            text=True,
+            environment=os.environ,
         ).stdout
         available = {
             int(line.split(",", 1)[0].strip()): int(line.split(",", 1)[1].strip())
             for line in query.splitlines()
             if line.strip()
         }
-    except (OSError, subprocess.CalledProcessError, ValueError) as error:
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        ValueError,
+    ) as error:
         raise OrchestrationError(f"cannot verify assigned GPUs: {error}") from error
     if any(gpu not in available or available[gpu] <= 0 for gpu in gpus):
         raise OrchestrationError("assigned GPU is unavailable or has no free memory")
-    runtime_probes = _probe_gpu_runtimes(gpus, python_executable)
+    runtime_probes = (
+        dict(_runtime_probes)
+        if _runtime_probes is not None
+        else _probe_gpu_runtimes(gpus, python_executable)
+    )
     free = shutil.disk_usage(output_parent).free
     if free < MIN_FREE_BYTES:
         raise OrchestrationError(
@@ -1341,6 +1397,32 @@ def _verify_preparation(path: Path, scene: str, source_config: Path) -> None:
             raise OrchestrationError("existing worker manifest is incompatible")
 
 
+def _partial_evaluation_artifacts(
+    system_dir: Path,
+) -> tuple[tuple[Path, int | None], ...]:
+    system = system_dir.name
+    if system not in {*NATIVE_SYSTEMS, *CONTINUATION_SYSTEMS}:
+        raise OrchestrationError("partial evaluation set has an extra system")
+    artifacts = tuple(system_dir.iterdir())
+    actual = {artifact.name for artifact in artifacts}
+    allowed = (
+        {"native"}
+        if system in NATIVE_SYSTEMS
+        else {f"step_{step:06d}" for step in REPORTING_STEPS}
+    )
+    if not actual or not actual.issubset(allowed):
+        raise OrchestrationError("partial evaluation artifact matrix mismatch")
+    return tuple(
+        (
+            artifact,
+            None
+            if system in NATIVE_SYSTEMS
+            else int(artifact.name.removeprefix("step_")),
+        )
+        for artifact in artifacts
+    )
+
+
 def _inspect_partial_resume(
     output: Path,
     *,
@@ -1414,29 +1496,18 @@ def _inspect_partial_resume(
                         raise OrchestrationError(
                             f"{mode} partial output is incompatible"
                         )
-                    progress = pinned_worker / "progress.json"
-                    if not progress.is_file() and "final.pt" not in entries:
-                        raise OrchestrationError(
-                            f"{mode} has no committed resume checkpoint"
-                        )
+                    verify_resume_artifacts(
+                        pinned_worker, worker_manifest=manifest
+                    )
                     resume_modes.add(mode)
         evaluations = pinned / "evaluations"
         if evaluations.exists():
             for system_dir in evaluations.iterdir():
-                if system_dir.name not in {*NATIVE_SYSTEMS, *CONTINUATION_SYSTEMS}:
-                    raise OrchestrationError(
-                        "partial evaluation set has an extra system"
-                    )
-                for artifact in system_dir.iterdir():
+                for artifact, step in _partial_evaluation_artifacts(system_dir):
                     if not (artifact / "current.json").is_file():
                         raise OrchestrationError(
                             "partial evaluation is not an immutable generation"
                         )
-                    step = (
-                        None
-                        if artifact.name == "native"
-                        else int(artifact.name.removeprefix("step_"))
-                    )
                     verify_evaluation(
                         artifact,
                         identity=expected_identity(scene, system_dir.name, step),
@@ -1596,6 +1667,8 @@ def run_scene_benchmark(
     runner: ProcessRunner | None = None,
     _verifier: Callable[..., SceneBenchmarkResult] = verify_scene_outputs,
     _preflight_fn: Callable[..., Mapping[str, object]] = _preflight,
+    _skip_preflight: bool = False,
+    _preflight_payload: Mapping[str, object] | None = None,
 ) -> SceneBenchmarkResult:
     config_path = Path(config_path).absolute()
     repository = config_path.parent.parent.parent
@@ -1643,13 +1716,18 @@ def run_scene_benchmark(
         ) as attempt_logs,
     ):
         child_output = _cross_process_path(pinned_output)
-        preflight = _preflight_fn(
-            repository,
-            config_path,
-            output.parent,
-            devices,
-            python_executable,
-        )
+        if _skip_preflight:
+            if _preflight_payload is None:
+                raise OrchestrationError("suite scene is missing shared preflight evidence")
+            preflight = _preflight_payload
+        else:
+            preflight = _preflight_fn(
+                repository,
+                config_path,
+                output.parent,
+                devices,
+                python_executable,
+            )
         _record_preflight(pinned_output, scene=scene, payload=dict(preflight))
         _record_status(pinned_output, scene=scene, phase="preflight", detail="complete")
         if not (skip_native_training or resume):
@@ -1824,14 +1902,24 @@ def run_benchmark_suite(
     output.parent.mkdir(parents=True, exist_ok=True)
     # Suite-wide Python/GPU/disk/source validation completes for both scenes
     # before any native trainer is allowed to start.
+    preflight_by_scene: dict[str, Mapping[str, object]] = {}
+    shared_runtime_probes: Mapping[str, Mapping[str, object]] | None = None
     for scene in SCENES:
-        _preflight_fn(
+        arguments = (
             repository,
             repository / "configs" / "benchmark_cam38" / f"{scene}.yaml",
             output.parent,
             devices,
             python_executable,
         )
+        if _preflight_fn is _preflight:
+            payload = _preflight_fn(
+                *arguments, _runtime_probes=shared_runtime_probes
+            )
+            shared_runtime_probes = payload["gpu_runtime_probes"]  # type: ignore[assignment]
+        else:
+            payload = _preflight_fn(*arguments)
+        preflight_by_scene[scene] = payload
     with (
         BenchmarkOutputLock(output) as pinned_output,
         _AttemptLogs(
@@ -1863,6 +1951,8 @@ def run_benchmark_suite(
                 verify_only=False,
                 skip_native_training=True,
                 runner=runner,
+                _skip_preflight=True,
+                _preflight_payload=preflight_by_scene[scene],
             )
             for scene in SCENES
         ]

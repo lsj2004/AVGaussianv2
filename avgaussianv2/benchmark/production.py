@@ -62,7 +62,7 @@ class _PinnedInput:
     """Retain and snapshot one audited input while runtime code consumes it."""
 
     def __init__(self, path: Path, expected_sha256: str | None) -> None:
-        self.path = path
+        self.path = Path(os.path.abspath(path))
         self.expected_sha256 = expected_sha256
         self.fd: int | None = None
         self.snapshot_fd: int | None = None
@@ -70,10 +70,40 @@ class _PinnedInput:
         self.data = b""
 
     def __enter__(self) -> _PinnedInput:
-        self.fd = os.open(
-            self.path,
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_DIRECTORY", 0)
         )
+        file_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        directory_fd = os.open("/", directory_flags)
+        trusted_directory_owners = {os.getuid(), os.fstat(directory_fd).st_uid}
+        try:
+            for component in self.path.parts[1:-1]:
+                next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+                metadata = os.fstat(next_fd)
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or metadata.st_uid not in trusted_directory_owners
+                ):
+                    os.close(next_fd)
+                    raise ValueError(
+                        f"evaluation input ancestor is unsafe: {self.path}"
+                    )
+                os.close(directory_fd)
+                directory_fd = next_fd
+            self.fd = os.open(
+                self.path.name,
+                file_flags,
+                dir_fd=directory_fd,
+            )
+        finally:
+            os.close(directory_fd)
         metadata = os.fstat(self.fd)
         if (
             not stat.S_ISREG(metadata.st_mode)
@@ -120,7 +150,12 @@ class _PinnedInput:
         if self.fd is None or self.identity is None:
             raise RuntimeError("evaluation input is not pinned")
         retained = os.fstat(self.fd)
-        current = self.path.lstat()
+        try:
+            current = self.path.lstat()
+        except OSError as error:
+            raise RuntimeError(
+                f"evaluation input identity changed: {self.path}"
+            ) from error
         os.lseek(self.fd, 0, os.SEEK_SET)
         with os.fdopen(os.dup(self.fd), "rb") as stream:
             retained_data = stream.read()
@@ -193,10 +228,11 @@ def _snapshot_source_imports(
     pins: list[_PinnedInput], upstream_roots: tuple[Path, Path]
 ):
     modules = {}
+    lexical_roots = tuple(Path(os.path.abspath(root)) for root in upstream_roots)
     for pin in pins:
-        for root in upstream_roots:
+        for root in lexical_roots:
             try:
-                relative = pin.path.resolve().relative_to(root.resolve())
+                relative = pin.path.relative_to(root)
             except ValueError:
                 continue
             if relative.suffix != ".py":
