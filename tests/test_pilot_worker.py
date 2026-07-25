@@ -1341,6 +1341,36 @@ def test_public_runtime_factory_loads_configured_backends_and_both_splits(
     assert [call[-1] for call in calls if call[0] == "dataset"] == ["train", "eval"]
 
 
+def test_worker_training_sequence_moves_every_sample_tensor_to_device() -> None:
+    from avgaussianv2.cli.pilot_worker import _DeviceSampleSequence
+    from avgaussianv2.contracts import AlignedAVSample
+
+    sample = AlignedAVSample(
+        scene_id="scene1_opera",
+        camera="cam00",
+        frame_index=1,
+        time_seconds=0.1,
+        visual_time=torch.zeros(1, 1),
+        w2c=torch.eye(4).unsqueeze(0),
+        intrinsic=torch.eye(3).unsqueeze(0),
+        audio_cam_pose=torch.zeros(1, 12),
+        source_audio=torch.zeros(1, 2, 8),
+        target_audio=torch.zeros(1, 2, 8),
+        target_rgb=torch.zeros(1, 2, 3, 3),
+        image_size=(2, 3),
+    )
+
+    moved = _DeviceSampleSequence((sample,), torch.device("meta"))[0]
+
+    assert all(
+        value.device.type == "meta"
+        for value in vars(moved).values()
+        if isinstance(value, torch.Tensor)
+    )
+    assert moved.scene_id == sample.scene_id
+    assert moved.camera == sample.camera
+
+
 def test_runtime_refuses_untrusted_upstream_before_any_loader(
     tmp_path, monkeypatch
 ) -> None:

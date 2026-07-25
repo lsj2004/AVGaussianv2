@@ -22,6 +22,7 @@ import torch
 from torch import nn
 
 from avgaussianv2.config import ProjectConfig, load_project_config_bytes
+from avgaussianv2.contracts import AlignedAVSample
 from avgaussianv2.experiment.checkpoint import (
     PilotCheckpointStore,
     PilotCompatibility,
@@ -35,7 +36,7 @@ from avgaussianv2.experiment.contracts import (
     SharedIndices,
     Variant,
 )
-from avgaussianv2.experiment.evaluation import METRIC_NAMES, Evaluator
+from avgaussianv2.experiment.evaluation import METRIC_NAMES, Evaluator, move_sample
 from avgaussianv2.experiment.training import PilotTrainer, PilotTrainingResult
 from avgaussianv2.train import (
     build_joint_optimizer,
@@ -85,6 +86,28 @@ _NONNEGATIVE_BASELINE_METRICS = set(METRIC_NAMES) - {"rgb_ssim"}
 MAX_SMALL_INPUT_BYTES = 16 * 1024 * 1024
 MAX_SUMMARY_BYTES = 8 * 1024 * 1024
 MAX_CURVE_BYTES = 64 * 1024 * 1024
+
+
+class _DeviceSampleSequence(Sequence[AlignedAVSample]):
+    """Lazily transfer training samples to the worker's selected device."""
+
+    def __init__(
+        self,
+        samples: Sequence[AlignedAVSample],
+        device: torch.device,
+    ) -> None:
+        self.samples = samples
+        self.device = device
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int | slice):
+        if isinstance(index, slice):
+            return [
+                move_sample(sample, self.device) for sample in self.samples[index]
+            ]
+        return move_sample(self.samples[index], self.device)
 
 
 @dataclass(frozen=True)
@@ -1208,7 +1231,7 @@ def _run_worker_locked(
     )
     result = trainer.run(
         model=bundle.model,
-        train_samples=bundle.train_samples,
+        train_samples=_DeviceSampleSequence(bundle.train_samples, device),
         heldout_samples=bundle.eval_samples,
         indices=indices,
         heldout_indices=manifest.quick_heldout_indices,
