@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import multiprocessing
+from pathlib import Path
 
 import pytest
 import torch
 
+import avgaussianv2.benchmark.evaluation as evaluation_module
 from avgaussianv2.benchmark.evaluation import (
     BenchmarkEvaluationError,
     BenchmarkEvaluationRuntime,
@@ -97,6 +99,7 @@ def _task12_evidence(tmp_path, *, step=5_000):
     output = tmp_path / "worker"
     milestones = output / "milestones"
     milestones.mkdir(parents=True)
+    (output / ".benchmark.lock").write_bytes(b"")
     indices = [0] * 30_000
     compatibility = BenchmarkCompatibility(
         scene_id="scene1_opera",
@@ -437,6 +440,89 @@ def test_strict_task12_contract_adapter_accepts_real_checkpoint_layout(tmp_path)
         130,
     )
     audit_training_evidence(evidence, identity)
+
+
+def test_strict_task12_audit_rejects_concurrent_writer_before_runtime(tmp_path):
+    evidence = _task12_evidence(tmp_path)
+    identity = EvaluationIdentity(
+        "scene1_opera",
+        "joint_conditioned",
+        5_000,
+        tuple(f"scene1_opera/cam38/{index:06d}" for index in range(130)),
+        130,
+    )
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    process = context.Process(
+        target=_hold_artifact_lock,
+        args=(evidence.training_output_dir, ready, release),
+    )
+    process.start()
+    assert ready.wait(10)
+    try:
+        with pytest.raises(BenchmarkEvaluationError, match="locked"):
+            audit_training_evidence(evidence, identity)
+    finally:
+        release.set()
+        process.join(10)
+    assert process.exitcode == 0
+
+
+def test_strict_task12_audit_detects_rename_after_pinned_reads(
+    tmp_path, monkeypatch
+):
+    evidence = _task12_evidence(tmp_path)
+    identity = EvaluationIdentity(
+        "scene1_opera",
+        "joint_conditioned",
+        5_000,
+        tuple(f"scene1_opera/cam38/{index:06d}" for index in range(130)),
+        130,
+    )
+    output = Path(evidence.training_output_dir)
+    moved = tmp_path / "moved-worker"
+    original = evaluation_module._load_exact_json
+    renamed = False
+
+    def rename_after_contract(path, fields, name):
+        nonlocal renamed
+        value = original(path, fields, name)
+        if name == "Task12 contract" and not renamed:
+            output.rename(moved)
+            renamed = True
+        return value
+
+    monkeypatch.setattr(
+        evaluation_module, "_load_exact_json", rename_after_contract
+    )
+    with pytest.raises(BenchmarkEvaluationError, match="changed|disappeared"):
+        audit_training_evidence(evidence, identity)
+    assert renamed
+
+
+def test_strict_task12_audit_rejects_symlinked_output_component(tmp_path):
+    evidence = _task12_evidence(tmp_path)
+    identity = EvaluationIdentity(
+        "scene1_opera",
+        "joint_conditioned",
+        5_000,
+        tuple(f"scene1_opera/cam38/{index:06d}" for index in range(130)),
+        130,
+    )
+    link = tmp_path / "worker-link"
+    link.symlink_to(Path(evidence.training_output_dir), target_is_directory=True)
+    checkpoint = link / "milestones" / "step_005000.pt"
+    linked = TrainingEvidence(
+        **{
+            **evidence.__dict__,
+            "training_output_dir": str(link),
+            "runtime_contract_path": str(link / "runtime_contract.json"),
+            "checkpoint_path": str(checkpoint),
+        }
+    )
+    with pytest.raises(BenchmarkEvaluationError, match="symlink"):
+        audit_training_evidence(linked, identity)
 
 
 def test_strict_evidence_failure_constructs_no_runtime_predictor_or_loss(tmp_path):

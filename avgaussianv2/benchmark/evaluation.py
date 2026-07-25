@@ -22,6 +22,12 @@ from avgaussianv2.benchmark.artifacts import (
     load_generation,
     publish_generation,
 )
+from avgaussianv2.benchmark.native import verify_native_contract
+from avgaussianv2.benchmark.output import (
+    BenchmarkOutputError,
+    BenchmarkOutputReadLock,
+    validate_output_children,
+)
 from avgaussianv2.benchmark.training import (
     ALGORITHM as TRAINING_ALGORITHM,
     SCHEMA as TRAINING_SCHEMA,
@@ -130,6 +136,8 @@ class TrainingEvidence:
     training_output_dir: str | None = None
     runtime_contract_path: str | None = None
     runtime_contract_sha256: str | None = None
+    native_contract_path: str | None = None
+    native_contract_sha256: str | None = None
 
     def validate(self, identity: EvaluationIdentity) -> None:
         if self.system_name != identity.system_name or self.scene_id != identity.scene_id:
@@ -157,6 +165,10 @@ class TrainingEvidence:
             except ValueError as error:
                 raise BenchmarkEvaluationError(str(error)) from error
         if self.role == "continuation":
+            if self.native_contract_path is not None or self.native_contract_sha256 is not None:
+                raise BenchmarkEvaluationError(
+                    "continuation must not carry native training evidence"
+                )
             if self.system_name not in CONTINUATION_SYSTEMS:
                 raise BenchmarkEvaluationError("unknown continuation system")
             if (
@@ -171,6 +183,32 @@ class TrainingEvidence:
             except ValueError as error:
                 raise BenchmarkEvaluationError(str(error)) from error
         elif self.role == "native_reference":
+            if any(
+                value is not None
+                for value in (
+                    self.training_output_dir,
+                    self.runtime_contract_path,
+                    self.runtime_contract_sha256,
+                )
+            ):
+                raise BenchmarkEvaluationError(
+                    "native reference must not carry Task12 continuation evidence"
+                )
+            if (
+                self.native_contract_path is None
+            ) != (self.native_contract_sha256 is None):
+                raise BenchmarkEvaluationError(
+                    "native contract path/hash must be provided together"
+                )
+            if self.native_contract_path is not None:
+                if not Path(self.native_contract_path).is_absolute():
+                    raise BenchmarkEvaluationError(
+                        "native contract path must be absolute"
+                    )
+                try:
+                    _digest(self.native_contract_sha256, "native_contract_sha256")
+                except ValueError as error:
+                    raise BenchmarkEvaluationError(str(error)) from error
             if self.system_name not in NATIVE_SYSTEMS or identity.reporting_step is not None:
                 raise BenchmarkEvaluationError("native reference identity mismatch")
             if self.index_sha256 is not None:
@@ -481,7 +519,12 @@ def verify_evaluation(
     return result
 
 
-def _verify_checkpoint(path_value: object, expected_digest: object) -> bytes:
+def _verify_checkpoint(
+    path_value: object,
+    expected_digest: object,
+    *,
+    reject_components: bool = True,
+) -> bytes:
     checkpoint = Path(str(path_value))
     if (
         not isinstance(path_value, (str, Path))
@@ -492,7 +535,8 @@ def _verify_checkpoint(path_value: object, expected_digest: object) -> bytes:
         raise BenchmarkEvaluationError(
             "strict benchmark checkpoint is missing or unsafe"
         )
-    _reject_symlink_components(checkpoint)
+    if reject_components:
+        _reject_symlink_components(checkpoint)
     data = checkpoint.read_bytes()
     if hashlib.sha256(data).hexdigest() != expected_digest:
         raise BenchmarkEvaluationError("strict benchmark checkpoint hash mismatch")
@@ -562,6 +606,27 @@ def _audit_continuation_evidence(
         raise BenchmarkEvaluationError("Task12 artifact path/layout mismatch")
     _reject_symlink_components(output)
     _reject_symlink_components(runtime_path)
+    try:
+        with BenchmarkOutputReadLock(output) as pinned:
+            _audit_continuation_snapshot(evidence, identity, pinned)
+    except BenchmarkOutputError as error:
+        raise BenchmarkEvaluationError(
+            f"unsafe or changing Task12 output: {error}"
+        ) from error
+
+
+def _audit_continuation_snapshot(
+    evidence: TrainingEvidence,
+    identity: EvaluationIdentity,
+    output: Path,
+) -> None:
+    """Read every Task12 byte through one retained directory descriptor."""
+    try:
+        validate_output_children(output)
+    except BenchmarkOutputError as error:
+        raise BenchmarkEvaluationError(f"unsafe Task12 output child: {error}") from error
+    runtime_path = output / "runtime_contract.json"
+    checkpoint = output / "milestones" / f"step_{identity.reporting_step:06d}.pt"
     contract = _load_exact_json(
         output / "contract.json",
         {
@@ -707,7 +772,9 @@ def _audit_continuation_evidence(
     relative = f"milestones/{checkpoint.name}"
     if artifact_manifest["sha256"][relative] != evidence.checkpoint_sha256:
         raise BenchmarkEvaluationError("Task12 milestone artifact hash mismatch")
-    checkpoint_bytes = _verify_checkpoint(checkpoint, evidence.checkpoint_sha256)
+    checkpoint_bytes = _verify_checkpoint(
+        checkpoint, evidence.checkpoint_sha256, reject_components=False
+    )
     try:
         checkpoint_payload = torch.load(
             io.BytesIO(checkpoint_bytes), map_location="cpu", weights_only=True
@@ -741,7 +808,44 @@ def audit_training_evidence(
     if evidence.role == "continuation":
         _audit_continuation_evidence(evidence, identity)
     else:
-        _verify_checkpoint(evidence.checkpoint_path, evidence.checkpoint_sha256)
+        if not evidence.native_contract_path or not evidence.native_contract_sha256:
+            raise BenchmarkEvaluationError(
+                "native reference requires an immutable native training contract"
+            )
+        contract_path = Path(evidence.native_contract_path)
+        try:
+            _reject_symlink_components(contract_path)
+            if hashlib.sha256(contract_path.read_bytes()).hexdigest() != (
+                evidence.native_contract_sha256
+            ):
+                raise BenchmarkEvaluationError("native contract hash mismatch")
+            kind = (
+                "audiogs"
+                if evidence.system_name == "native_audiogs"
+                else "ftgspp"
+            )
+            contract = verify_native_contract(
+                contract_path,
+                expected_scene=evidence.scene_id,
+                expected_model_kind=kind,
+            )
+        except Exception as error:
+            if isinstance(error, BenchmarkEvaluationError):
+                raise
+            raise BenchmarkEvaluationError(
+                f"native training contract verification failed: {error}"
+            ) from error
+        checkpoint = contract["checkpoint"]
+        if (
+            checkpoint["path"] != str(Path(evidence.checkpoint_path).resolve())
+            or checkpoint["sha256"] != evidence.checkpoint_sha256
+            or contract["inputs"]["protocol_config"]["sha256"]
+            != evidence.config_sha256
+            or contract["upstream"]["source_sha256"] != evidence.source_sha256
+        ):
+            raise BenchmarkEvaluationError(
+                "native training contract/evaluation evidence mismatch"
+            )
 
 
 class BenchmarkEvaluator:
@@ -779,7 +883,7 @@ class BenchmarkEvaluator:
             if evidence.role == "continuation":
                 _audit_continuation_evidence(evidence, identity)
             else:
-                _verify_checkpoint(evidence.checkpoint_path, evidence.checkpoint_sha256)
+                audit_training_evidence(evidence, identity)
         output = Path(output_dir)
         if resume:
             result = load_evaluation(output, identity=identity)

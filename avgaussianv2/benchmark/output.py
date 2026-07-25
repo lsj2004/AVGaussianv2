@@ -226,7 +226,12 @@ class BenchmarkOutputReadLock:
         if (retained.st_dev, retained.st_ino) != self.identity:
             raise BenchmarkOutputError("retained benchmark output identity changed")
         if not _is_proc_fd(self.original):
-            current = self.original.lstat()
+            try:
+                current = self.original.lstat()
+            except FileNotFoundError as error:
+                raise BenchmarkOutputError(
+                    "benchmark output directory disappeared while read-locked"
+                ) from error
             if stat.S_ISLNK(current.st_mode) or (
                 current.st_dev,
                 current.st_ino,

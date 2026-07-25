@@ -120,6 +120,8 @@ def _result(scene, system, step, count, offset=0.0, role="continuation"):
             "training_output_dir": None,
             "runtime_contract_path": None,
             "runtime_contract_sha256": None,
+            "native_contract_path": None,
+            "native_contract_sha256": None,
         },
         content_sha256=_sha(f"{scene}-{system}-{step}-content"),
         generation_path=None,

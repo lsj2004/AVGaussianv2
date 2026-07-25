@@ -17,6 +17,13 @@ from avgaussianv2.benchmark.output import (
     BenchmarkOutputLock,
     BenchmarkOutputReadLock,
 )
+from avgaussianv2.benchmark.native import (
+    NativeContractError,
+    finalize_native_contract,
+    inspect_native_checkpoint,
+    verify_native_contract,
+    write_audiogs_seed_record,
+)
 from avgaussianv2.benchmark.evaluation import (
     BenchmarkEvaluationError,
     BenchmarkEvaluationResult,
@@ -70,6 +77,7 @@ __all__ = [
     "FixedBudgetTrainer",
     "EvaluationIdentity",
     "TrainingEvidence",
+    "NativeContractError",
     "audit_training_evidence",
     "audit_audiogs_conversion",
     "audit_ftgspp_flow_cache",
@@ -82,12 +90,16 @@ __all__ = [
     "build_scene_report",
     "build_suite_report",
     "build_worker_manifest",
+    "finalize_native_contract",
     "hash_shared_indices",
     "make_shared_indices",
     "load_evaluation",
+    "inspect_native_checkpoint",
     "prepare_fresh_ftgspp_namespaces",
     "render_ftgspp_config",
     "verify_evaluation",
+    "verify_native_contract",
+    "write_audiogs_seed_record",
     "verify_scene_report",
     "verify_suite_report",
 ]

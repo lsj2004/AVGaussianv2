@@ -122,6 +122,21 @@ prepare_scene() {
   if [[ "${EXECUTE}" -eq 1 ]]; then
     "${PYTHON}" -m avgaussianv2.cli.audit_cam38_assets \
       --config "${config}" --ftgspp-seed-record "${seed_root}/train.json"
+    "${PYTHON}" -m avgaussianv2.cli.native_contract \
+      --model-kind ftgspp \
+      --config "${config}" \
+      --provenance "${provenance}" \
+      --checkpoint "${run_root}/${scene}/00/gaussians.pt" \
+      --upstream-root "${FTGSPP_ROOT}" \
+      --rendered-config "${generated_config}" \
+      --sampled-scene-root "${source}" \
+      --train-log "${run_root}/${scene}/00/train.log" \
+      --seed-record "${seed_root}/prep.json" \
+      --seed-record "${seed_root}/flow.json" \
+      --seed-record "${seed_root}/train.json" \
+      --output "${ROOT}/runs/cam38_strict/${scene}/ftgspp/native_contract.json"
+  else
+    echo "post-success native contract: ${scene}/ftgspp/native_contract.json"
   fi
 }
 

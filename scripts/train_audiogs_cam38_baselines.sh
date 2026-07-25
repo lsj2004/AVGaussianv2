@@ -48,6 +48,7 @@ prepare_and_train() {
   local upstream_scene="$3"
   local max_clips="$4"
   local data_root="${ROOT}/runs/cam38_strict/${source_scene}/audiogs/dataset"
+  local seed_record="${ROOT}/runs/cam38_strict/${source_scene}/protocol/audiogs_seed_record.json"
 
   audit_scene "${config_name}"
   run_command conda run -n avcloud python \
@@ -70,6 +71,11 @@ prepare_and_train() {
   else
     echo "pre-launch audit: --audiogs-conversion ${data_root}/conversion_manifest.json --expected-clips ${max_clips}"
   fi
+  run_command "${PYTHON}" -m avgaussianv2.cli.native_contract \
+    --write-audiogs-seed-record \
+    --scene-id "${source_scene}" \
+    --upstream-scene "${upstream_scene}" \
+    --output "${seed_record}"
 
   (
     cd "${AUDIOGS_ROOT}"
@@ -89,6 +95,19 @@ prepare_and_train() {
       train.max_epoch 61 \
       train.batch_size 1
   )
+  if [[ "${EXECUTE}" -eq 1 ]]; then
+    "${PYTHON}" -m avgaussianv2.cli.native_contract \
+      --model-kind audiogs \
+      --config "${ROOT}/configs/benchmark_cam38/${config_name}.yaml" \
+      --provenance "${ROOT}/configs/benchmark_cam38/provenance/${config_name}.json" \
+      --checkpoint "${ROOT}/runs/cam38_strict/${source_scene}/audiogs/native/replayNVAS/${upstream_scene}/viewpoint_39/checkpoint_latest.pth" \
+      --upstream-root "${AUDIOGS_ROOT}" \
+      --conversion-manifest "${data_root}/conversion_manifest.json" \
+      --seed-record "${seed_record}" \
+      --output "${ROOT}/runs/cam38_strict/${source_scene}/audiogs/native_contract.json"
+  else
+    echo "post-success native contract: ${source_scene}/audiogs/native_contract.json"
+  fi
 }
 
 echo "Mode: $([[ ${EXECUTE} -eq 1 ]] && echo execute || echo dry-run)"

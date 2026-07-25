@@ -448,6 +448,12 @@ def test_upstream_scripts_are_reproducible_and_do_not_launch_by_default() -> Non
     assert "SC-scene7-playing-cam38-shared" in audio
     assert "A3DGS_FRAME_ID=" not in audio
     assert "--audiogs-conversion" in audio
+    assert "--write-audiogs-seed-record" in audio
+    assert "--model-kind audiogs" in audio
+    assert "--seed-record" in audio
+    assert audio.rindex("--model-kind audiogs") > audio.index(
+        "train_audio_3dgs_replaynvas_viewpoint_per_scene.sh"
+    )
 
     assert "eval_cameras = [37]" in visual
     assert 'train_cameras = { "start" = 0, "stop" = 38 }' in visual
@@ -460,6 +466,11 @@ def test_upstream_scripts_are_reproducible_and_do_not_launch_by_default() -> Non
     assert "--audit-ftgspp-flow" in visual
     assert visual.index("--to prep") < visual.index("ftgspp.data.flow")
     assert visual.index("--audit-ftgspp-flow") < visual.index("--from points")
+    assert "--model-kind ftgspp" in visual
+    assert "--checkpoint" in visual
+    assert visual.rindex("--model-kind ftgspp") > visual.index(
+        "--from points --to train"
+    )
 
 
 def test_ftgspp_dry_run_exposes_audited_stage_order_without_launching() -> None:
@@ -483,6 +494,7 @@ def test_ftgspp_dry_run_exposes_audited_stage_order_without_launching() -> None:
     assert " --cameras 0-37 " in text
     assert "--from extract --to train" not in text
     assert "deterministic wrapper for every executed stage" in text
+    assert text.count("post-success native contract:") == 2
 
 
 def test_readme_documents_cam38_native_budget_and_shared_scene7_model() -> None:
