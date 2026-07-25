@@ -771,16 +771,14 @@ def audit_ftgspp_flow_cache(
     forward = list(pairwise(keyframes))
     pairs = [*forward, *((right, left) for left, right in forward)]
     root = Path(path)
-    expected_directories = {
-        f"f{left:05d}_f{right:05d}" for left, right in pairs
-    }
+    expected_directories = {f"f{left:06d}_f{right:06d}" for left, right in pairs}
     actual_entries = {entry.name for entry in root.iterdir()}
     if actual_entries != expected_directories:
         raise AssetAuditError("FTGS++ flow cache is not complete for all frame pairs")
     expected_files = {f"c{camera:03d}.npz" for camera in range(38)}
     count = 0
     for left, right in pairs:
-        pair = root / f"f{left:05d}_f{right:05d}"
+        pair = root / f"f{left:06d}_f{right:06d}"
         actual_files = {entry.name for entry in pair.iterdir()}
         if actual_files != expected_files:
             raise AssetAuditError(

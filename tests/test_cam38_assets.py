@@ -379,23 +379,53 @@ def test_fresh_ftgspp_namespaces_reject_stale_content(tmp_path: Path) -> None:
 
 def test_flow_cache_requires_every_train_camera_and_no_cam38(tmp_path: Path) -> None:
     root = tmp_path / "flow"
+
+    def write_flow(
+        path: Path,
+        left: int,
+        right: int,
+        camera: int,
+        *,
+        payload_camera: int | None = None,
+    ) -> None:
+        np.savez(
+            path,
+            flow=np.zeros((2, 3, 2), dtype=np.float32),
+            covis=np.ones((2, 3), dtype=np.float32),
+            frame_0=np.int32(left),
+            frame_1=np.int32(right),
+            camera=np.int16(camera if payload_camera is None else payload_camera),
+            height=np.int32(2),
+            width=np.int32(3),
+        )
+
     for left, right in ((0, 10), (10, 0)):
-        pair = root / f"f{left:05d}_f{right:05d}"
+        # FreeTimeGS++ writes frame indices with six digits.
+        pair = root / f"f{left:06d}_f{right:06d}"
         pair.mkdir(parents=True)
         for camera in range(38):
-            np.savez(
-                pair / f"c{camera:03d}.npz",
-                flow=np.zeros((2, 3, 2), dtype=np.float32),
-                covis=np.ones((2, 3), dtype=np.float32),
-                frame_0=np.int32(left),
-                frame_1=np.int32(right),
-                camera=np.int16(camera),
-                height=np.int32(2),
-                width=np.int32(3),
-            )
+            write_flow(pair / f"c{camera:03d}.npz", left, right, camera)
     result = audit_ftgspp_flow_cache(root, frame_count=11, keyframe_stride=10)
     assert result["files"] == 76
-    (root / "f00000_f00010" / "c037.npz").unlink()
+
+    forward = root / "f000000_f000010"
+    write_flow(forward / "c038.npz", 0, 10, 38)
+    with pytest.raises(AssetAuditError, match="complete"):
+        audit_ftgspp_flow_cache(root, frame_count=11, keyframe_stride=10)
+    (forward / "c038.npz").unlink()
+
+    extra_pair = root / "f000010_f000020"
+    extra_pair.mkdir()
+    with pytest.raises(AssetAuditError, match="complete"):
+        audit_ftgspp_flow_cache(root, frame_count=11, keyframe_stride=10)
+    extra_pair.rmdir()
+
+    write_flow(forward / "c000.npz", 0, 10, 0, payload_camera=38)
+    with pytest.raises(AssetAuditError, match="payload"):
+        audit_ftgspp_flow_cache(root, frame_count=11, keyframe_stride=10)
+    write_flow(forward / "c000.npz", 0, 10, 0)
+
+    (root / "f000000_f000010" / "c037.npz").unlink()
     with pytest.raises(AssetAuditError, match="complete"):
         audit_ftgspp_flow_cache(root, frame_count=11, keyframe_stride=10)
 
