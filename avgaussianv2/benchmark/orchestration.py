@@ -186,42 +186,69 @@ def _run_one(
     log: Path,
 ) -> None:
     handle = runner.start(command, env=_environment(gpu), log_path=log)
-    code = handle.wait()
+    try:
+        code = handle.wait()
+    except BaseException:
+        _terminate_handles((handle,))
+        raise
     if code:
         raise OrchestrationError(f"subprocess failed ({code}); log={log}")
+
+
+def _terminate_handles(handles: Sequence[ProcessHandle]) -> None:
+    """Best-effort shutdown that does not mask an orchestration exception."""
+
+    for handle in handles:
+        try:
+            handle.terminate()
+        except BaseException:
+            pass
+    for handle in handles:
+        try:
+            handle.wait(timeout=10)
+        except BaseException:
+            try:
+                handle.kill()
+            except BaseException:
+                pass
+            try:
+                handle.wait()
+            except BaseException:
+                pass
 
 
 def _run_parallel(
     runner: ProcessRunner,
     jobs: Sequence[tuple[str, Sequence[str], int, Path]],
 ) -> None:
-    active = [
-        (name, runner.start(command, env=_environment(gpu), log_path=log), log)
-        for name, command, gpu, log in jobs
-    ]
+    active: list[tuple[str, ProcessHandle, Path]] = []
+    try:
+        for name, command, gpu, log in jobs:
+            handle = runner.start(command, env=_environment(gpu), log_path=log)
+            active.append((name, handle, log))
+    except BaseException:
+        _terminate_handles(tuple(handle for _, handle, _ in active))
+        raise
     failures: list[tuple[str, int, Path]] = []
     pending = list(active)
-    while pending:
-        next_pending = []
-        for name, handle, log in pending:
-            code = handle.poll()
-            if code is None:
-                next_pending.append((name, handle, log))
-            elif code:
-                failures.append((name, code, log))
-        if failures:
-            for _, handle, _ in next_pending:
-                handle.terminate()
-            for _, handle, _ in next_pending:
-                try:
-                    handle.wait(timeout=10)
-                except (TimeoutError, subprocess.TimeoutExpired):
-                    handle.kill()
-                    handle.wait()
-            break
-        pending = next_pending
-        if pending:
-            time.sleep(0.05)
+    try:
+        while pending:
+            next_pending = []
+            for name, handle, log in pending:
+                code = handle.poll()
+                if code is None:
+                    next_pending.append((name, handle, log))
+                elif code:
+                    failures.append((name, code, log))
+            if failures:
+                _terminate_handles(tuple(handle for _, handle, _ in next_pending))
+                break
+            pending = next_pending
+            if pending:
+                time.sleep(0.05)
+    except BaseException:
+        _terminate_handles(tuple(handle for _, handle, _ in pending))
+        raise
     if failures:
         raise OrchestrationError(
             "benchmark subprocess failure: "
