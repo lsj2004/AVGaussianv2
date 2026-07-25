@@ -1329,6 +1329,7 @@ class PilotCheckpointStore:
         self.backup_copy_duration_seconds = 0.0
         self._lock_stream: Any | None = None
         self._directory_fd: int | None = None
+        self._inherited_output_fd = False
         self._lock_depth = 0
         self.inspected_best_state: PilotResumeState | None = None
 
@@ -1470,6 +1471,7 @@ class PilotCheckpointStore:
         os.fsync(stream.fileno())
         self._lock_stream = stream
         self._directory_fd = directory_fd
+        self._inherited_output_fd = inherited_output_fd
         self._lock_depth = 1
 
     def release(self) -> None:
@@ -1482,6 +1484,7 @@ class PilotCheckpointStore:
         directory_fd = self._directory_fd
         self._lock_stream = None
         self._directory_fd = None
+        self._inherited_output_fd = False
         self._lock_depth = 0
         try:
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
@@ -1502,7 +1505,11 @@ class PilotCheckpointStore:
             raise RuntimeError("pilot checkpoint store must be acquired")
         pinned = os.fstat(self._directory_fd)
         try:
-            current = self.output_dir.lstat()
+            current = (
+                self.output_dir.stat()
+                if self._inherited_output_fd
+                else self.output_dir.lstat()
+            )
         except OSError as error:
             raise PilotResumeError(
                 "pilot output directory disappeared while locked"

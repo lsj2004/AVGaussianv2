@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -537,6 +540,45 @@ def test_store_lock_rejects_concurrent_owner_and_stale_file_is_harmless(
         first.release()
     second.acquire()
     second.release()
+    assert (tmp_path / ".pilot.lock").is_file()
+
+
+def test_store_accepts_live_inherited_parent_proc_fd_output(tmp_path: Path) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        inherited_path = f"/proc/{os.getpid()}/fd/{directory_fd}"
+        script = """
+import json
+import sys
+from avgaussianv2.experiment.checkpoint import PilotCheckpointStore, PilotCompatibility
+
+store = PilotCheckpointStore(
+    sys.argv[1],
+    PilotCompatibility.from_mapping(json.loads(sys.argv[2])),
+)
+with store:
+    store.verify_output_identity()
+    store.prepare()
+"""
+        environment = dict(os.environ)
+        environment["AVGAUSSIANV2_ORCHESTRATOR_PID"] = str(os.getpid())
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                inherited_path,
+                json.dumps(compatibility().to_mapping()),
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        os.close(directory_fd)
+
+    assert result.returncode == 0, result.stderr
     assert (tmp_path / ".pilot.lock").is_file()
 
 
