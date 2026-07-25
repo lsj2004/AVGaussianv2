@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
 import tempfile
 from collections.abc import Mapping, Sequence
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import yaml
 
 from avgaussianv2.config import load_project_config_bytes
@@ -86,7 +89,16 @@ AUDIO_CLIP_KEYS = {
     "start_seconds",
     "end_seconds",
 }
-MARKER_NAME = ".cam38-audit.json"
+SEED_RECORD_KEYS = {
+    "schema",
+    "seed",
+    "pythonhashseed",
+    "cublas_workspace_config",
+    "torch_deterministic_algorithms",
+    "cudnn_deterministic",
+    "cudnn_benchmark",
+    "argv",
+}
 
 
 class AssetAuditError(ValueError):
@@ -393,6 +405,9 @@ def audit_audiogs_conversion(
     expected_scene: str,
     expected_clips: int,
     epochs: int,
+    expected_audio_root: str | Path,
+    expected_cameras_npz: str | Path,
+    expected_output_root: str | Path,
 ) -> dict[str, Any]:
     """Bind the exact upstream conversion schema and shared-model update budget."""
     payload = _load_mapping(value)
@@ -413,16 +428,26 @@ def audit_audiogs_conversion(
         )
     if payload["scene"] != expected_scene:
         raise AssetAuditError(f"AudioGS conversion scene must be {expected_scene!r}")
-    for key in ("audio_root", "cameras_npz", "output_root"):
+    expected_paths = {
+        "audio_root": Path(expected_audio_root),
+        "cameras_npz": Path(expected_cameras_npz),
+        "output_root": Path(expected_output_root),
+    }
+    for key, wanted in expected_paths.items():
         if not isinstance(payload[key], str) or not payload[key]:
             raise AssetAuditError(f"AudioGS conversion {key} must be a string")
+        _require_exact_path(Path(payload[key]), wanted, f"AudioGS conversion {key}")
     if payload["format"] != "AudioGS ReplayNVAS-style viewpoint clips":
         raise AssetAuditError("AudioGS conversion format is invalid")
     if not _is_int(payload["sample_rate"]) or payload["sample_rate"] <= 0:
         raise AssetAuditError("AudioGS conversion sample_rate must be an integer")
+    if payload["sample_rate"] != 16_000:
+        raise AssetAuditError("AudioGS conversion sample_rate must be 16000")
     for key in ("clip_sec", "hop_sec"):
         if not isinstance(payload[key], float):
             raise AssetAuditError(f"AudioGS conversion {key} must be a float")
+        if payload[key] != 3.0:
+            raise AssetAuditError(f"AudioGS conversion {key} must be 3.0")
     if not _is_int(payload["num_clips"]):
         raise AssetAuditError("AudioGS conversion num_clips must be an integer")
     if payload["num_clips"] != expected_clips:
@@ -455,6 +480,15 @@ def audit_audiogs_conversion(
                 raise AssetAuditError(f"AudioGS clip {index}.{key} must be a float")
         if clip["frame_id"] != index:
             raise AssetAuditError("AudioGS clip frame_id sequence is invalid")
+        expected_start = index * 48_000
+        expected_end = expected_start + 48_000
+        if (
+            clip["start_sample"] != expected_start
+            or clip["end_sample"] != expected_end
+            or clip["start_seconds"] != float(index * 3)
+            or clip["end_seconds"] != float((index + 1) * 3)
+        ):
+            raise AssetAuditError(f"AudioGS clip {index} boundaries are invalid")
     if epochs != 61:
         raise AssetAuditError("AudioGS native budget must be 61 epochs")
     return {
@@ -614,10 +648,16 @@ def audit_ftgspp_upstream_config(
     _secure_regular_metadata(sampled / "poses_bounds.npy", "data.calibration_path")
     if data.get("frames") != {"start": 0, "stop": expected["test_samples"]}:
         raise AssetAuditError("data.frames does not match the scene sample budget")
-    if data.get("eval_cameras") != [38]:
-        raise AssetAuditError("data.eval_cameras must be exactly [38]")
+    if data.get("eval_cameras") != [37]:
+        raise AssetAuditError(
+            "data.eval_cameras must be exactly [37] for train-only monitoring"
+        )
     _interval(data.get("train_cameras"), "data.train_cameras")
     _interval(init.get("temporal_flow_cameras"), "init.temporal_flow_cameras")
+    if init.get("keyframe_stride") != 10:
+        raise AssetAuditError("init.keyframe_stride must be exactly 10")
+    if init.get("temporal_motion_adapted") is not True:
+        raise AssetAuditError("init.temporal_motion_adapted must be true")
     if train.get("iterations") != 30_000:
         raise AssetAuditError("train.iterations must be exactly 30000")
     if train.get("batch_size") != 1:
@@ -625,6 +665,8 @@ def audit_ftgspp_upstream_config(
     return {
         "scene_id": scene,
         "iterations": 30_000,
+        "train_monitor_camera": 37,
+        "benchmark_test_camera": 38,
         "calibration_path": data["calibration_path"],
         "namespaces": [
             data["extracted_path"],
@@ -641,8 +683,9 @@ def prepare_fresh_ftgspp_namespaces(
     *,
     scene_id: str,
     source_root: str | Path,
+    marker_root: str | Path,
 ) -> None:
-    """Refuse stale caches, then place an exact audit marker in each namespace."""
+    """Refuse stale caches and write markers outside upstream namespaces."""
     if scene_id not in EXPECTED:
         raise AssetAuditError(f"unsupported benchmark scene {scene_id!r}")
     marker = {
@@ -651,6 +694,10 @@ def prepare_fresh_ftgspp_namespaces(
         "test_camera": TEST_CAMERA,
         "source_root": str(Path(source_root).resolve(strict=False)),
     }
+    marker_directory = Path(marker_root)
+    if marker_directory.is_symlink():
+        raise AssetAuditError(f"marker root {marker_directory} must not be a symlink")
+    marker_directory.mkdir(parents=True, exist_ok=True)
     for value in paths:
         namespace = Path(value)
         if namespace.is_symlink():
@@ -658,16 +705,20 @@ def prepare_fresh_ftgspp_namespaces(
         if namespace.exists() and not namespace.is_dir():
             raise AssetAuditError(f"namespace {namespace} must be a directory")
         namespace.mkdir(parents=True, exist_ok=True)
-        entries = list(namespace.iterdir())
-        marker_path = namespace / MARKER_NAME
-        if entries:
-            if entries != [marker_path]:
-                raise AssetAuditError(f"namespace {namespace} is stale/non-empty")
+        if any(namespace.iterdir()):
+            raise AssetAuditError(f"namespace {namespace} is stale/non-empty")
+        namespace_text = str(namespace.resolve(strict=False))
+        marker_payload = {**marker, "namespace": namespace_text}
+        marker_name = (
+            hashlib.sha256(namespace_text.encode("utf-8")).hexdigest() + ".json"
+        )
+        marker_path = marker_directory / marker_name
+        if marker_path.exists():
             existing = _load_mapping(marker_path)
-            if dict(existing) != marker:
+            if dict(existing) != marker_payload:
                 raise AssetAuditError(f"namespace {namespace} audit marker mismatches")
             continue
-        temporary = namespace / f".{MARKER_NAME}.tmp"
+        temporary = marker_directory / f".{marker_name}.tmp"
         descriptor = None
         try:
             descriptor = os.open(
@@ -681,7 +732,7 @@ def prepare_fresh_ftgspp_namespaces(
             )
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 descriptor = None
-                stream.write(json.dumps(marker, sort_keys=True) + "\n")
+                stream.write(json.dumps(marker_payload, sort_keys=True) + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, marker_path)
@@ -689,3 +740,141 @@ def prepare_fresh_ftgspp_namespaces(
             if descriptor is not None:
                 os.close(descriptor)
             temporary.unlink(missing_ok=True)
+
+
+def audit_ftgspp_flow_cache(
+    path: str | Path,
+    *,
+    frame_count: int,
+    keyframe_stride: int,
+) -> dict[str, Any]:
+    """Require valid bidirectional UFM flow for every train camera and pair."""
+    if frame_count <= 1 or keyframe_stride <= 0:
+        raise AssetAuditError("flow frame_count/stride are invalid")
+    keyframes = list(range(0, frame_count, keyframe_stride))
+    if keyframes[-1] != frame_count - 1:
+        keyframes.append(frame_count - 1)
+    forward = list(pairwise(keyframes))
+    pairs = [*forward, *((right, left) for left, right in forward)]
+    root = Path(path)
+    expected_directories = {
+        f"f{left:05d}_f{right:05d}" for left, right in pairs
+    }
+    actual_entries = {entry.name for entry in root.iterdir()}
+    if actual_entries != expected_directories:
+        raise AssetAuditError("FTGS++ flow cache is not complete for all frame pairs")
+    expected_files = {f"c{camera:03d}.npz" for camera in range(38)}
+    count = 0
+    for left, right in pairs:
+        pair = root / f"f{left:05d}_f{right:05d}"
+        actual_files = {entry.name for entry in pair.iterdir()}
+        if actual_files != expected_files:
+            raise AssetAuditError(
+                "FTGS++ flow cache is not complete for all train cameras"
+            )
+        for camera in range(38):
+            flow_path = pair / f"c{camera:03d}.npz"
+            metadata = _secure_regular_metadata(flow_path, str(flow_path))
+            descriptor = os.open(
+                flow_path,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino) != (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ):
+                    raise AssetAuditError(f"{flow_path} changed during audit")
+                with os.fdopen(descriptor, "rb") as stream:
+                    descriptor = -1
+                    with np.load(stream, allow_pickle=False) as archive:
+                        flow = np.asarray(archive["flow"])
+                        covis = np.asarray(archive["covis"])
+                        values = (
+                            int(archive["frame_0"]),
+                            int(archive["frame_1"]),
+                            int(archive["camera"]),
+                            int(archive["height"]),
+                            int(archive["width"]),
+                        )
+            except (KeyError, OSError, ValueError) as exc:
+                raise AssetAuditError(f"invalid FTGS++ flow cache {flow_path}") from exc
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            if (
+                flow.ndim != 3
+                or flow.shape[-1] != 2
+                or covis.shape != flow.shape[:2]
+                or values
+                != (left, right, camera, flow.shape[0], flow.shape[1])
+            ):
+                raise AssetAuditError(f"invalid FTGS++ flow payload {flow_path}")
+            count += 1
+    return {"pairs": len(pairs), "cameras": 38, "files": count}
+
+
+def audit_ftgspp_seed_record(
+    value: str | Path | Mapping[str, Any],
+    *,
+    expected_scene: str,
+) -> dict[str, Any]:
+    payload = _load_mapping(value)
+    _exact_keys(payload, SEED_RECORD_KEYS, "FTGS++ seed record")
+    expected = {
+        "schema": "ftgspp_seed_v1",
+        "seed": 42,
+        "pythonhashseed": "42",
+        "cublas_workspace_config": ":4096:8",
+        "torch_deterministic_algorithms": True,
+        "cudnn_deterministic": True,
+        "cudnn_benchmark": False,
+    }
+    for key, wanted in expected.items():
+        if not _equals_typed(payload.get(key), wanted):
+            raise AssetAuditError(f"FTGS++ seed record {key} must be {wanted!r}")
+    argv = payload.get("argv")
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or not all(isinstance(item, str) and item for item in argv)
+    ):
+        raise AssetAuditError("FTGS++ seed record argv must be non-empty strings")
+    if expected_scene not in " ".join(argv):
+        raise AssetAuditError(
+            f"FTGS++ seed record argv must bind scene {expected_scene}"
+        )
+    if argv[0] == "ftgspp.data.flow":
+        if argv.count("--cameras") != 1:
+            raise AssetAuditError("FTGS++ flow seed record is missing --cameras")
+        index = argv.index("--cameras")
+        if index + 1 >= len(argv) or argv[index + 1] != "0-37":
+            raise AssetAuditError("FTGS++ flow must use exactly cameras 0-37")
+    elif Path(argv[0]).name == "run":
+        if (
+            "eval" in argv
+            or argv.count("--from") != 1
+            or argv.count("--to") != 1
+            or argv.count("--scenes") != 1
+        ):
+            raise AssetAuditError("FTGS++ run seed record has an invalid stage range")
+        try:
+            stage_range = (
+                argv[argv.index("--from") + 1],
+                argv[argv.index("--to") + 1],
+            )
+            bound_scene = argv[argv.index("--scenes") + 1]
+        except IndexError as exc:
+            raise AssetAuditError(
+                "FTGS++ run seed record has truncated options"
+            ) from exc
+        if bound_scene != expected_scene:
+            raise AssetAuditError("FTGS++ run seed record scene is not exact")
+        if stage_range not in {("extract", "prep"), ("points", "train")}:
+            raise AssetAuditError("FTGS++ run seed record has an invalid stage range")
+    else:
+        raise AssetAuditError("FTGS++ seed record target is not an approved entrypoint")
+    return dict(payload)

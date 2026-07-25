@@ -181,6 +181,17 @@ is batch size 1 for 30,000 updates. Optimizer updates, epochs, dataset length,
 batch size, and sample exposures are all recorded so later comparisons do not
 silently equate unlike epoch definitions.
 
+Both native launch paths bind seed 42 in the process that runs the upstream
+code. AudioGS receives `seed 42` in its real configuration override argv. The
+FTGS++ entrypoint sets Python, NumPy, Torch, CUDA, cuDNN, and deterministic
+algorithm state before loading upstream modules and writes audited seed records.
+Its 38-slot train-only dataset uses camera 37 only as an internal training
+monitor; this monitor is not the benchmark evaluation. The upstream pipeline
+stops after preparation, precomputes bidirectional UFM flow explicitly for
+cameras 0–37, verifies every expected pair/camera cache, and only then runs
+point initialization and training. It never runs the upstream final-eval stage;
+the repository's later common evaluator is the first consumer of cam38 targets.
+
 The upstream preparation entrypoints are:
 
 ```bash

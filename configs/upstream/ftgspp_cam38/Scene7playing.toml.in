@@ -9,11 +9,13 @@ colmap_path = "@FTGSPP_ROOT@/_colmap/cam38_strict/Scene7playing"
 fps = 30
 scale = 0.5
 frames = { "start" = 0, "stop" = 293 }
-eval_cameras = [38]
+# Training-only monitor. Benchmark cam38 is evaluated later by this repository.
+eval_cameras = [37]
 train_cameras = { "start" = 0, "stop" = 38 }
 
 [init]
 points_path = "@FTGSPP_ROOT@/_points/cam38_strict/Scene7playing"
+keyframe_stride = 10
 temporal_motion_adapted = true
 temporal_flow_path = "@FTGSPP_ROOT@/_flow/cam38_strict/Scene7playing"
 temporal_flow_cameras = { "start" = 0, "stop" = 38 }

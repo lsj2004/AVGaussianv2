@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-AUDIOGS_ROOT="${AUDIOGS_ROOT:-/mnt/sda/lisujing/Dataset/audioGS-replay}"
-SAMPLED_ROOT="${SAMPLED_ROOT:-/mnt/sda/lisujing/Dataset/Sampled_data}"
+AUDIOGS_ROOT="/mnt/sda/lisujing/Dataset/audioGS-replay"
+SAMPLED_ROOT="/mnt/sda/lisujing/Dataset/Sampled_data"
 PYTHON="${AVGAUSSIANV2_PYTHON:-${ROOT}/.venv/bin/python}"
 EXECUTE=0
 if [[ "${1:-}" == "--execute" ]]; then
@@ -57,12 +57,16 @@ prepare_and_train() {
     --output-root "${data_root}" \
     --scene "${upstream_scene}" \
     --camera-names "${CAMERAS}" \
-    --clip-sec 3 --hop-sec 3 --max-clips "${max_clips}"
+    --clip-sec 3 --hop-sec 3 --max-clips "${max_clips}" \
+    --sample-rate 16000
   if [[ "${EXECUTE}" -eq 1 ]]; then
     "${PYTHON}" -m avgaussianv2.cli.audit_cam38_assets \
       --config "${ROOT}/configs/benchmark_cam38/${config_name}.yaml" \
       --audiogs-conversion "${data_root}/conversion_manifest.json" \
-      --expected-clips "${max_clips}"
+      --expected-clips "${max_clips}" \
+      --expected-audio-root "${SAMPLED_ROOT}/v5_0630_audiogs_audio/${source_scene}" \
+      --expected-cameras-npz "${SAMPLED_ROOT}/v5_0630_dynerf/${source_scene}/cameras.npz" \
+      --expected-output-root "${data_root}"
   else
     echo "pre-launch audit: --audiogs-conversion ${data_root}/conversion_manifest.json --expected-clips ${max_clips}"
   fi
@@ -75,6 +79,7 @@ prepare_and_train() {
       train_audio_3dgs_replaynvas_viewpoint_per_scene.sh \
       "${TEST_VIEWPOINT}" "${upstream_scene}" \
       dataset.data_root "${data_root}" \
+      seed 42 \
       dataset.num_viewpoints "${NUM_VIEWPOINTS}" \
       dataset.pose_source fixed_rotation \
       dataset.fixed_rotation_mode lookat \
