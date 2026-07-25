@@ -5,14 +5,21 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass
+from contextlib import ExitStack
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 import torch
 from torch import nn
 
 from avgaussianv2.benchmark.assets import AssetAuditError, audit_protocol_config
-from avgaussianv2.config import ProjectConfig, TrainConfig, load_project_config
+from avgaussianv2.config import (
+    ProjectConfig,
+    TrainConfig,
+    load_project_config,
+    load_project_config_bytes,
+)
 from avgaussianv2.contracts import AlignedAVSample
 from avgaussianv2.losses import AudioLoss
 from avgaussianv2.runtime import build_runtime
@@ -34,6 +41,164 @@ class BenchmarkRuntime:
     model_initialization_sha256: str
     dataset_identity_sha256: str
     dataset_sample_ids: tuple[str, ...]
+
+
+class ProductionRuntimeSnapshot:
+    """Immutable inputs shared by one or more production runtime builds."""
+
+    def __init__(
+        self, config_path: Path, *, config_origin_path: Path | None = None
+    ) -> None:
+        self.config_path = Path(config_path).absolute()
+        self.config_origin_path = (
+            None if config_origin_path is None else Path(config_origin_path).absolute()
+        )
+        self._stack = ExitStack()
+        self._pins: list[Any] = []
+        self._source_pins: list[Any] = []
+        self.config: ProjectConfig | None = None
+        self.audited_config: ProjectConfig | None = None
+        self.config_proc_path: Path | None = None
+        self.origin_proc_path: Path | None = None
+        self.source_config_proc_path: Path | None = None
+        self.source_config_semantic_path: Path | None = None
+        self.config_sha256 = ""
+        self.source_config_sha256 = ""
+        self.visual_checkpoint_sha256 = ""
+        self.audio_checkpoint_sha256 = ""
+        self.manifest_sha256 = ""
+        self.source_inventory: dict[str, str] = {}
+        self._active = False
+
+    def _pin(self, path: Path, expected_sha256: str | None = None):
+        # Imported lazily to avoid the production -> runtime module cycle.
+        from avgaussianv2.benchmark.production import _PinnedInput
+
+        pin = self._stack.enter_context(_PinnedInput(path, expected_sha256))
+        self._pins.append(pin)
+        return pin
+
+    def __enter__(self) -> ProductionRuntimeSnapshot:
+        if self._active:
+            raise RuntimeError("production runtime snapshot cannot be re-entered")
+        self._active = True
+        try:
+            # This first parse is discovery only.  Every value used by execution
+            # is loaded again from the pinned config below.
+            discovered = load_project_config(self.config_path)
+            config_pin = self._pin(self.config_path)
+            self.config_proc_path = config_pin.proc_path
+            self.config_sha256 = str(config_pin.expected_sha256)
+
+            origin = self.config_origin_path
+            if origin is None and self.config_path.name == "resolved_project.yaml":
+                origin = self.config_path.with_name("resolved_project.origin.json")
+            if origin is not None:
+                origin_pin = self._pin(origin)
+                self.origin_proc_path = origin_pin.proc_path
+                try:
+                    origin_value = json.loads(origin_pin.data)
+                    source_path = Path(origin_value["source_path"])
+                except (KeyError, TypeError, ValueError) as error:
+                    raise ValueError(
+                        "resolved benchmark config origin is invalid"
+                    ) from error
+                if not source_path.is_absolute():
+                    raise ValueError(
+                        "resolved benchmark source config path must be absolute"
+                    )
+                source_pin = self._pin(
+                    source_path, origin_value.get("source_sha256")
+                )
+                self.source_config_proc_path = source_pin.proc_path
+                self.source_config_semantic_path = source_path
+                self.source_config_sha256 = str(source_pin.expected_sha256)
+
+            config, audited_source_sha256 = load_audited_benchmark_config(
+                config_pin.proc_path,
+                origin_path=self.origin_proc_path,
+                config_semantic_path=self.config_path,
+                origin_source_path=self.source_config_proc_path,
+                origin_source_semantic_path=self.source_config_semantic_path,
+                config_snapshot_data=config_pin.data,
+                origin_snapshot_data=(
+                    None if origin is None else origin_pin.data
+                ),
+                origin_source_snapshot_data=(
+                    None if origin is None else source_pin.data
+                ),
+            )
+            if (
+                discovered.scene != config.scene
+                or discovered.model != config.model
+                or discovered.train != config.train
+                or discovered.paths != config.paths
+            ):
+                raise RuntimeError("production config changed before it was pinned")
+            if self.source_config_sha256:
+                if audited_source_sha256 != self.source_config_sha256:
+                    raise RuntimeError("pinned source config identity mismatch")
+            else:
+                self.source_config_sha256 = audited_source_sha256
+
+            self.audited_config = config
+            self.source_inventory = upstream_source_inventory(config)
+            roots = (
+                config.paths.audio_upstream_root,
+                config.paths.visual_upstream_root,
+            )
+            roots_by_kind = {"audiogs": roots[0], "ftgspp": roots[1]}
+            for name, digest in sorted(self.source_inventory.items()):
+                kind, relative = name.split(":", 1)
+                self._source_pins.append(
+                    self._pin(roots_by_kind[kind] / relative, digest)
+                )
+
+            visual_pin = self._pin(config.paths.visual_checkpoint)
+            audio_pin = self._pin(config.paths.audio_checkpoint)
+            manifest_pin = self._pin(config.paths.manifest)
+            self.visual_checkpoint_sha256 = str(visual_pin.expected_sha256)
+            self.audio_checkpoint_sha256 = str(audio_pin.expected_sha256)
+            self.manifest_sha256 = str(manifest_pin.expected_sha256)
+            self.config = replace(
+                config,
+                paths=replace(
+                    config.paths,
+                    visual_checkpoint=visual_pin.proc_path,
+                    audio_checkpoint=audio_pin.proc_path,
+                    manifest=manifest_pin.proc_path,
+                ),
+            )
+            from avgaussianv2.benchmark.production import _snapshot_source_imports
+
+            self._stack.enter_context(
+                _snapshot_source_imports(self._source_pins, roots)
+            )
+            return self
+        except BaseException:
+            self._stack.close()
+            self._active = False
+            raise
+
+    def verify(self) -> None:
+        if not self._active or self.config is None:
+            raise RuntimeError("production runtime snapshot is not active")
+        for pin in self._pins:
+            pin.verify()
+        if (
+            self.audited_config is None
+            or upstream_source_inventory(self.audited_config) != self.source_inventory
+        ):
+            raise RuntimeError("upstream source inventory changed during runtime build")
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        try:
+            if exc_type is None:
+                self.verify()
+        finally:
+            self._stack.close()
+            self._active = False
+        return False
 
 
 def _file_sha256(path: Path) -> str:
@@ -164,18 +329,38 @@ def _dataset_identity(
 
 
 def load_audited_benchmark_config(
-    config_path: Path, *, origin_path: Path | None = None
+    config_path: Path,
+    *,
+    origin_path: Path | None = None,
+    config_semantic_path: Path | None = None,
+    origin_source_path: Path | None = None,
+    origin_source_semantic_path: Path | None = None,
+    config_snapshot_data: bytes | None = None,
+    origin_snapshot_data: bytes | None = None,
+    origin_source_snapshot_data: bytes | None = None,
 ) -> tuple[ProjectConfig, str]:
     """Load a canonical or orchestrator-resolved config and return source SHA."""
     config_path = Path(config_path)
-    source_sha256 = _file_sha256(config_path)
+    semantic_path = (
+        config_path if config_semantic_path is None else Path(config_semantic_path)
+    )
+    config_data = (
+        config_path.read_bytes()
+        if config_snapshot_data is None
+        else config_snapshot_data
+    )
+    source_sha256 = hashlib.sha256(config_data).hexdigest()
     try:
-        audit_protocol_config(config_path)
+        audit_protocol_config(
+            config_path,
+            semantic_path=semantic_path,
+            snapshot_data=config_data,
+        )
     except AssetAuditError:
         # Orchestration materializes an absolute-path copy outside configs/.
         # Bind it back to the audited immutable source instead of weakening the
         # canonical Task11 path checks.
-        if config_path.name != "resolved_project.yaml" and origin_path is None:
+        if semantic_path.name != "resolved_project.yaml" and origin_path is None:
             raise
         origin_path = (
             config_path.with_name("resolved_project.origin.json")
@@ -183,7 +368,12 @@ def load_audited_benchmark_config(
             else Path(origin_path)
         )
         try:
-            origin = json.loads(origin_path.read_text(encoding="utf-8"))
+            origin_data = (
+                origin_path.read_bytes()
+                if origin_snapshot_data is None
+                else origin_snapshot_data
+            )
+            origin = json.loads(origin_data)
         except (OSError, ValueError) as error:
             raise ValueError("resolved benchmark config origin is missing") from error
         if (
@@ -198,16 +388,46 @@ def load_audited_benchmark_config(
             }
             or origin["schema"] != "avgaussianv2.cam38-resolved-config-origin"
             or origin["version"] != 1
-            or origin["resolved_sha256"] != _file_sha256(config_path)
+            or origin["resolved_sha256"] != hashlib.sha256(config_data).hexdigest()
         ):
             raise ValueError("resolved benchmark config origin contract mismatch")
         source = Path(origin["source_path"])
-        if not source.is_absolute() or _file_sha256(source) != origin["source_sha256"]:
+        source_input = (
+            source if origin_source_path is None else Path(origin_source_path)
+        )
+        source_semantic = (
+            source
+            if origin_source_semantic_path is None
+            else Path(origin_source_semantic_path)
+        )
+        if (
+            not source.is_absolute()
+            or source_semantic != source
+            or hashlib.sha256(
+                source_input.read_bytes()
+                if origin_source_snapshot_data is None
+                else origin_source_snapshot_data
+            ).hexdigest()
+            != origin["source_sha256"]
+        ):
             raise ValueError("resolved benchmark source config hash mismatch")
-        audit_protocol_config(source)
+        source_data = (
+            source_input.read_bytes()
+            if origin_source_snapshot_data is None
+            else origin_source_snapshot_data
+        )
+        audit_protocol_config(
+            source_input,
+            semantic_path=source,
+            snapshot_data=source_data,
+        )
         source_sha256 = origin["source_sha256"]
-        source_config = load_project_config(source)
-        resolved_config = load_project_config(config_path)
+        source_config = load_project_config_bytes(
+            source_data, base_dir=source.parent
+        )
+        resolved_config = load_project_config_bytes(
+            config_data, base_dir=semantic_path.parent
+        )
         path_names = (
             "visual_upstream_root",
             "audio_upstream_root",
@@ -237,7 +457,9 @@ def load_audited_benchmark_config(
             )
         ):
             raise ValueError("resolved benchmark config changes protocol semantics")
-    config = load_project_config(config_path)
+    config = load_project_config_bytes(
+        config_data, base_dir=semantic_path.parent
+    )
     if config.scene.train_cameras != TRAIN_CAMERAS:
         raise ValueError("benchmark config must train on exactly cam00 through cam37")
     if config.scene.eval_cameras != (TEST_CAMERA,):
@@ -253,6 +475,7 @@ def build_production_runtime(
     device: torch.device,
     trusted_upstream_artifacts: bool,
     config_origin_path: Path | None = None,
+    input_snapshot: ProductionRuntimeSnapshot | None = None,
 ) -> BenchmarkRuntime:
     """Build train-only state and bind it to canonical source evidence.
 
@@ -260,10 +483,20 @@ def build_production_runtime(
     project-config, dataset-manifest, visual-checkpoint, audio-checkpoint,
     camera-mapping, and ordered training-sample identity digests.
     """
-    config_path = Path(config_path)
-    config, _ = load_audited_benchmark_config(
-        config_path, origin_path=config_origin_path
-    )
+    if input_snapshot is None:
+        with ProductionRuntimeSnapshot(
+            config_path, config_origin_path=config_origin_path
+        ) as snapshot:
+            return build_production_runtime(
+                config_path=config_path,
+                device=device,
+                trusted_upstream_artifacts=trusted_upstream_artifacts,
+                config_origin_path=config_origin_path,
+                input_snapshot=snapshot,
+            )
+    if not input_snapshot._active or input_snapshot.config is None:
+        raise RuntimeError("production runtime input snapshot is not active")
+    config = input_snapshot.config
     bundle = build_runtime(
         config,
         device,
@@ -277,15 +510,16 @@ def build_production_runtime(
     )
     model_initialization_sha256 = _state_sha256(bundle.model)
     evidence = {
-        "audio_checkpoint_sha256": _file_sha256(config.paths.audio_checkpoint),
+        "audio_checkpoint_sha256": input_snapshot.audio_checkpoint_sha256,
         "camera_mapping_sha256": _json_sha256(config.scene.camera_mapping),
-        "config_sha256": _file_sha256(config_path),
+        "config_sha256": input_snapshot.config_sha256,
         "dataset_identity_sha256": dataset_identity_sha256,
-        "dataset_manifest_sha256": _file_sha256(config.paths.manifest),
-        "visual_checkpoint_sha256": _file_sha256(config.paths.visual_checkpoint),
+        "dataset_manifest_sha256": input_snapshot.manifest_sha256,
+        "visual_checkpoint_sha256": input_snapshot.visual_checkpoint_sha256,
         "model_initialization_sha256": model_initialization_sha256,
-        "upstream_source_inventory": upstream_source_inventory(config),
+        "upstream_source_inventory": input_snapshot.source_inventory,
     }
+    input_snapshot.verify()
     return BenchmarkRuntime(
         model=bundle.model,
         train_samples=bundle.train_samples,
@@ -303,6 +537,7 @@ def build_production_runtime(
 
 __all__ = [
     "BenchmarkRuntime",
+    "ProductionRuntimeSnapshot",
     "build_production_runtime",
     "load_audited_benchmark_config",
     "state_sha256",

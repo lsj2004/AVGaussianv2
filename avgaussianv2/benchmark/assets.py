@@ -181,12 +181,26 @@ def _require_exact_path(value: Path, expected: Path, label: str) -> None:
         raise AssetAuditError(f"{label} must be exactly {expected}")
 
 
-def audit_protocol_config(path: str | Path) -> dict[str, Any]:
+def audit_protocol_config(
+    path: str | Path,
+    *,
+    semantic_path: str | Path | None = None,
+    snapshot_data: bytes | None = None,
+) -> dict[str, Any]:
     """Fail closed unless a project config is the exact frozen cam38 protocol."""
     config_path = Path(path)
-    data = _read_bounded_regular_nofollow(config_path)
+    semantic_config_path = (
+        config_path if semantic_path is None else Path(semantic_path)
+    )
+    data = (
+        _read_bounded_regular_nofollow(config_path)
+        if snapshot_data is None
+        else snapshot_data
+    )
+    if len(data) > MAX_METADATA_BYTES:
+        raise AssetAuditError(f"{config_path} exceeds {MAX_METADATA_BYTES} bytes")
     try:
-        project = load_project_config_bytes(data, base_dir=config_path.parent)
+        project = load_project_config_bytes(data, base_dir=semantic_config_path.parent)
         raw = yaml.safe_load(data.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, yaml.YAMLError) as exc:
         raise AssetAuditError(f"cannot parse {config_path}: {exc}") from exc
@@ -242,7 +256,7 @@ def audit_protocol_config(path: str | Path) -> dict[str, Any]:
     if not _equals_typed(dict(budgets), wanted_budgets):
         raise AssetAuditError(f"benchmark.native_budgets must be {wanted_budgets!r}")
 
-    repository = config_path.parent.parent.parent.resolve()
+    repository = semantic_config_path.parent.parent.parent.resolve()
     scene_root = repository / "runs" / "cam38_strict" / project.scene.scene_id
     _require_exact_path(
         project.paths.visual_checkpoint,

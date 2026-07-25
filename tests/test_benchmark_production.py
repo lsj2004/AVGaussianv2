@@ -101,9 +101,42 @@ def _evidence(
     )
 
 
-def test_prepare_builds_train_only_identity_on_each_assigned_device(tmp_path):
+def test_prepare_builds_train_only_identity_on_each_assigned_device(
+    tmp_path, monkeypatch
+):
     source = ROOT / "configs" / "benchmark_cam38" / "scene1_opera.yaml"
     calls = []
+    loaded = load_project_config(source)
+
+    class Snapshot:
+        instances = []
+
+        def __init__(self, path):
+            self.path = path
+            self.config = loaded
+            self.audited_config = loaded
+            self.source_config_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+            self.audio_checkpoint_sha256 = DIGEST
+            self.visual_checkpoint_sha256 = DIGEST
+            self.source_inventory = {
+                "audiogs:source.py": DIGEST,
+                "ftgspp:source.py": DIGEST,
+            }
+            self.verify_calls = 0
+            self.instances.append(self)
+
+        def __enter__(self):
+            return self
+
+        def verify(self):
+            self.verify_calls += 1
+
+        def __exit__(self, *_):
+            return False
+
+    monkeypatch.setattr(
+        "avgaussianv2.benchmark.production.ProductionRuntimeSnapshot", Snapshot
+    )
 
     def build(**kwargs):
         calls.append(kwargs)
@@ -122,6 +155,31 @@ def test_prepare_builds_train_only_identity_on_each_assigned_device(tmp_path):
             dataset_sample_ids=("sample-a", "sample-b"),
         )
 
+    def native_contract(_path, *, expected_scene, expected_model_kind):
+        del expected_scene
+        root = (
+            loaded.paths.audio_upstream_root
+            if expected_model_kind == "audiogs"
+            else loaded.paths.visual_upstream_root
+        )
+        checkpoint = (
+            loaded.paths.audio_checkpoint
+            if expected_model_kind == "audiogs"
+            else loaded.paths.visual_checkpoint
+        )
+        return {
+            "inputs": {
+                "protocol_config": {
+                    "sha256": hashlib.sha256(source.read_bytes()).hexdigest()
+                },
+                "source_audits": [
+                    {"path": str(root / "source.py"), "sha256": DIGEST}
+                ],
+            },
+            "checkpoint": {"path": str(checkpoint), "sha256": DIGEST},
+            "_manifest_sha256": DIGEST,
+        }
+
     result = prepare_worker_manifests(
         config_path=source,
         output_dir=tmp_path,
@@ -132,35 +190,13 @@ def test_prepare_builds_train_only_identity_on_each_assigned_device(tmp_path):
             "ftgspp": tmp_path / "ftgspp",
         },
         runtime_builder=build,
-        native_verifier=lambda path, *, expected_scene, expected_model_kind: {
-            "inputs": {
-                "protocol_config": {
-                    "sha256": hashlib.sha256(source.read_bytes()).hexdigest()
-                }
-            },
-            "checkpoint": {
-                "path": str(
-                    (
-                        ROOT
-                        / "runs"
-                        / "cam38_strict"
-                        / "scene1_opera"
-                        / expected_model_kind
-                        / "native"
-                        / (
-                            "replayNVAS/SC-scene1-opera-cam38-shared/viewpoint_39/checkpoint_latest.pth"
-                            if expected_model_kind == "audiogs"
-                            else "scene1_opera/00/gaussians.pt"
-                        )
-                    ).resolve()
-                ),
-                "sha256": DIGEST,
-            },
-            "_manifest_sha256": DIGEST,
-        },
+        native_verifier=native_contract,
     )
 
     assert [str(call["device"]) for call in calls] == ["cuda:0", "cuda:1", "cuda:2"]
+    assert len({id(call["input_snapshot"]) for call in calls}) == 1
+    assert calls[0]["input_snapshot"] is Snapshot.instances[0]
+    assert Snapshot.instances[0].verify_calls == 4
     assert all(call["trusted_upstream_artifacts"] for call in calls)
     assert result["include_eval"] is False
     assert set(result["worker_manifests"]) == {
@@ -173,6 +209,25 @@ def test_prepare_builds_train_only_identity_on_each_assigned_device(tmp_path):
         assert manifest["mode"] == mode
         assert len(manifest["shared_indices"]) == 30_000
         assert set(manifest["shared_indices"]) <= {0, 1}
+
+    def mismatched_native(*args, **kwargs):
+        contract = native_contract(*args, **kwargs)
+        contract["inputs"]["source_audits"][0]["sha256"] = "b" * 64
+        return contract
+
+    with pytest.raises(ValueError, match="does not bind"):
+        prepare_worker_manifests(
+            config_path=source,
+            output_dir=tmp_path / "mismatched",
+            devices=("cuda:0", "cuda:1", "cuda:2"),
+            trusted_upstream_artifacts=True,
+            native_contract_dirs={
+                "audiogs": tmp_path / "audiogs",
+                "ftgspp": tmp_path / "ftgspp",
+            },
+            runtime_builder=build,
+            native_verifier=mismatched_native,
+        )
 
 
 @pytest.mark.parametrize(
@@ -341,6 +396,67 @@ def test_snapshot_import_failure_is_not_hidden_by_filesystem_fallback(tmp_path):
         with _snapshot_source_imports(pins, (audio_root, visual_root)):
             with pytest.raises(SyntaxError):
                 importlib.import_module("ftgspp.models.gaussians")
+
+
+def test_pinned_input_rejects_symlinked_ancestor(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    source = real / "source.py"
+    source.write_bytes(b"trusted")
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(OSError):
+        with _PinnedInput(alias / "source.py", None):
+            pass
+
+
+def test_pinned_input_detects_ancestor_swap_and_keeps_snapshot_bytes(tmp_path):
+    ancestor = tmp_path / "source"
+    ancestor.mkdir()
+    source = ancestor / "module.py"
+    source.write_bytes(b"trusted")
+    moved = tmp_path / "moved"
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        with _PinnedInput(source, None) as pinned:
+            ancestor.rename(moved)
+            ancestor.mkdir()
+            (ancestor / "module.py").write_bytes(b"attacker")
+            assert pinned.proc_path.read_bytes() == b"trusted"
+
+
+def test_pinned_input_consumes_snapshot_during_final_swap_and_restore(tmp_path):
+    source = tmp_path / "module.py"
+    source.write_bytes(b"trusted")
+    retained = tmp_path / "retained.py"
+
+    with _PinnedInput(source, None) as pinned:
+        source.rename(retained)
+        source.write_bytes(b"attacker")
+        assert pinned.proc_path.read_bytes() == b"trusted"
+        source.unlink()
+        retained.rename(source)
+
+
+def test_snapshot_source_mapping_never_resolves_paths_after_pin(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "upstream"
+    source = root / "package/module.py"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"VALUE = 1\n")
+
+    with _PinnedInput(source, None) as pinned:
+        monkeypatch.setattr(
+            Path,
+            "resolve",
+            lambda *_args, **_kwargs: pytest.fail("resolved after pin"),
+        )
+        with _snapshot_source_imports([pinned], (root, tmp_path / "other")):
+            assert any(
+                isinstance(finder, _SnapshotSourceFinder) for finder in sys.meta_path
+            )
 
 
 def test_native_adapter_rejects_changed_upstream_source_before_runtime(

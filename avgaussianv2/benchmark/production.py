@@ -35,6 +35,7 @@ from avgaussianv2.benchmark.evaluation import (
 from avgaussianv2.benchmark.native import verify_native_contract
 from avgaussianv2.benchmark.runtime import (
     BenchmarkRuntime,
+    ProductionRuntimeSnapshot,
     build_production_runtime,
     load_audited_benchmark_config,
     state_sha256,
@@ -354,49 +355,80 @@ def prepare_worker_manifests(
         raise ValueError("preparation requires three distinct devices")
     if set(native_contract_dirs) != {"audiogs", "ftgspp"}:
         raise ValueError("preparation requires exact AudioGS/FTGS++ native contracts")
-    source_config = load_project_config(config_path)
-    source_sha256 = sha256_file(config_path)
-    native_contracts = {}
-    for kind in ("audiogs", "ftgspp"):
-        contract_dir = Path(native_contract_dirs[kind]).absolute()
-        contract = native_verifier(
-            contract_dir,
-            expected_scene=source_config.scene.scene_id,
-            expected_model_kind=kind,
-        )
-        configured_checkpoint = getattr(
-            source_config.paths,
-            "audio_checkpoint" if kind == "audiogs" else "visual_checkpoint",
-        ).resolve()
-        if (
-            contract["inputs"]["protocol_config"]["sha256"] != source_sha256
-            or Path(contract["checkpoint"]["path"]).resolve() != configured_checkpoint
-        ):
-            raise ValueError("native contract does not bind the requested protocol")
-        native_contracts[kind] = {
-            "path": str(contract_dir),
-            "manifest_sha256": contract["_manifest_sha256"],
-            "checkpoint_sha256": contract["checkpoint"]["sha256"],
-        }
     output_dir.mkdir(parents=True, exist_ok=True)
     resolved = output_dir / "resolved_project.yaml"
     write_resolved_project_config(config_path, resolved)
+    native_contracts = {}
     runtimes: list[BenchmarkRuntime] = []
-    for device in devices:
-        torch.manual_seed(42)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(42)
-        torch.use_deterministic_algorithms(True)
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
-        runtime = runtime_builder(
-            config_path=resolved,
-            device=torch.device(device),
-            trusted_upstream_artifacts=trusted_upstream_artifacts,
-        )
-        if not isinstance(runtime, BenchmarkRuntime):
-            raise TypeError("runtime builder must return BenchmarkRuntime")
-        runtimes.append(runtime)
+    with ProductionRuntimeSnapshot(resolved) as input_snapshot:
+        source_config = input_snapshot.config
+        audited_config = input_snapshot.audited_config
+        if source_config is None or audited_config is None:
+            raise RuntimeError("production runtime snapshot has no config")
+        source_sha256 = input_snapshot.source_config_sha256
+        for kind in ("audiogs", "ftgspp"):
+            contract_dir = Path(native_contract_dirs[kind]).absolute()
+            contract = native_verifier(
+                contract_dir,
+                expected_scene=source_config.scene.scene_id,
+                expected_model_kind=kind,
+            )
+            configured_checkpoint = getattr(
+                audited_config.paths,
+                "audio_checkpoint" if kind == "audiogs" else "visual_checkpoint",
+            )
+            expected_checkpoint_sha256 = (
+                input_snapshot.audio_checkpoint_sha256
+                if kind == "audiogs"
+                else input_snapshot.visual_checkpoint_sha256
+            )
+            source_root = (
+                audited_config.paths.audio_upstream_root
+                if kind == "audiogs"
+                else audited_config.paths.visual_upstream_root
+            )
+            expected_sources = {
+                (str((source_root / name.split(":", 1)[1]).absolute()), digest)
+                for name, digest in input_snapshot.source_inventory.items()
+                if name.startswith(f"{kind}:")
+            }
+            source_audits = contract["inputs"]["source_audits"]
+            actual_sources = {
+                (str(Path(record["path"]).absolute()), record["sha256"])
+                for record in source_audits
+            }
+            if (
+                contract["inputs"]["protocol_config"]["sha256"] != source_sha256
+                or Path(contract["checkpoint"]["path"]).absolute()
+                != configured_checkpoint.absolute()
+                or contract["checkpoint"]["sha256"] != expected_checkpoint_sha256
+                or len(actual_sources) != len(source_audits)
+                or actual_sources != expected_sources
+            ):
+                raise ValueError("native contract does not bind the requested protocol")
+            native_contracts[kind] = {
+                "path": str(contract_dir),
+                "manifest_sha256": contract["_manifest_sha256"],
+                "checkpoint_sha256": contract["checkpoint"]["sha256"],
+            }
+        input_snapshot.verify()
+        for device in devices:
+            torch.manual_seed(42)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(42)
+            torch.use_deterministic_algorithms(True)
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+            runtime = runtime_builder(
+                config_path=resolved,
+                device=torch.device(device),
+                trusted_upstream_artifacts=trusted_upstream_artifacts,
+                input_snapshot=input_snapshot,
+            )
+            if not isinstance(runtime, BenchmarkRuntime):
+                raise TypeError("runtime builder must return BenchmarkRuntime")
+            runtimes.append(runtime)
+            input_snapshot.verify()
     identity_names = (
         "config_sha256",
         "source_sha256",

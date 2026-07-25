@@ -135,6 +135,29 @@ def test_production_runtime_is_train_only_and_hashes_real_inputs(
         "avgaussianv2.benchmark.runtime.upstream_source_inventory",
         lambda _: {"fixture": "f" * 64},
     )
+
+    class Snapshot:
+        def __init__(self, *_args, **_kwargs):
+            self._active = True
+            self.config = project
+            self.config_sha256 = hashlib.sha256(b"project-config").hexdigest()
+            self.audio_checkpoint_sha256 = hashlib.sha256(b"audio.pt").hexdigest()
+            self.visual_checkpoint_sha256 = hashlib.sha256(b"visual.pt").hexdigest()
+            self.manifest_sha256 = hashlib.sha256(b"dataset.json").hexdigest()
+            self.source_inventory = {"fixture": "f" * 64}
+
+        def __enter__(self):
+            return self
+
+        def verify(self):
+            return None
+
+        def __exit__(self, *_):
+            return False
+
+    monkeypatch.setattr(
+        "avgaussianv2.benchmark.runtime.ProductionRuntimeSnapshot", Snapshot
+    )
     first = build_production_runtime(
         config_path=config_path,
         device=torch.device("cpu"),
@@ -166,6 +189,143 @@ def test_production_runtime_is_train_only_and_hashes_real_inputs(
         "scene_id": "scene1_opera",
         "time_seconds": 0.25,
     }
+
+
+def test_production_runtime_executes_only_pinned_inputs_during_live_replacement(
+    tmp_path, monkeypatch
+) -> None:
+    audio_root = tmp_path / "audio"
+    visual_root = tmp_path / "visual"
+    (audio_root / "libs").mkdir(parents=True)
+    (visual_root / "ftgspp").mkdir(parents=True)
+    sources = {
+        audio_root / "libs/__init__.py": b"",
+        audio_root / "libs/snapshot_probe.py": b"VALUE = 'pinned-source'\n",
+        visual_root / "ftgspp/__init__.py": b"",
+    }
+    for path, data in sources.items():
+        path.write_bytes(data)
+    visual_checkpoint = tmp_path / "visual.pt"
+    audio_checkpoint = tmp_path / "audio.pt"
+    manifest = tmp_path / "manifest.json"
+    config_path = tmp_path / "resolved_project.yaml"
+    source_config_path = tmp_path / "source_project.yaml"
+    origin_path = tmp_path / "resolved_project.origin.json"
+    project = _project(tmp_path)
+    source_config_data = b"pinned-source-config"
+    config_data = b"pinned-config"
+    origin_data = json.dumps(
+        {
+            "schema": "avgaussianv2.cam38-resolved-config-origin",
+            "version": 1,
+            "source_path": str(source_config_path),
+            "source_sha256": hashlib.sha256(source_config_data).hexdigest(),
+            "resolved_sha256": hashlib.sha256(config_data).hexdigest(),
+        }
+    ).encode()
+    originals = {
+        visual_checkpoint: b"pinned-visual",
+        audio_checkpoint: b"pinned-audio",
+        manifest: b"pinned-manifest",
+        config_path: config_data,
+        source_config_path: source_config_data,
+        origin_path: origin_data,
+        **sources,
+    }
+    for path, data in originals.items():
+        path.write_bytes(data)
+    project = ProjectConfig(
+        scene=project.scene,
+        paths=PathConfig(
+            visual_upstream_root=visual_root,
+            audio_upstream_root=audio_root,
+            visual_checkpoint=visual_checkpoint,
+            audio_checkpoint=audio_checkpoint,
+            manifest=manifest,
+            visual_memmap=tmp_path,
+        ),
+        model=project.model,
+        train=project.train,
+    )
+
+    def inventory(_config):
+        return {
+            "audiogs:libs/__init__.py": hashlib.sha256(
+                sources[audio_root / "libs/__init__.py"]
+            ).hexdigest(),
+            "audiogs:libs/snapshot_probe.py": hashlib.sha256(
+                (audio_root / "libs/snapshot_probe.py").read_bytes()
+            ).hexdigest(),
+            "ftgspp:ftgspp/__init__.py": hashlib.sha256(
+                sources[visual_root / "ftgspp/__init__.py"]
+            ).hexdigest(),
+        }
+
+    monkeypatch.setattr(
+        "avgaussianv2.benchmark.runtime.load_project_config", lambda _: project
+    )
+    monkeypatch.setattr(
+        "avgaussianv2.benchmark.runtime.load_audited_benchmark_config",
+        lambda *_args, **_kwargs: (
+            project,
+            hashlib.sha256(originals[source_config_path]).hexdigest(),
+        ),
+    )
+    monkeypatch.setattr(
+        "avgaussianv2.benchmark.runtime.upstream_source_inventory", inventory
+    )
+    observed = {}
+
+    def fake_build(config, _device, **_kwargs):
+        live_paths = (
+            config_path,
+            source_config_path,
+            origin_path,
+            visual_checkpoint,
+            audio_checkpoint,
+            manifest,
+            audio_root / "libs/snapshot_probe.py",
+        )
+        try:
+            for path in live_paths:
+                path.write_bytes(b"live-replacement")
+            from libs import snapshot_probe
+
+            observed.update(
+                visual=config.paths.visual_checkpoint.read_bytes(),
+                audio=config.paths.audio_checkpoint.read_bytes(),
+                manifest=config.paths.manifest.read_bytes(),
+                source=snapshot_probe.VALUE,
+                scene=config.scene.scene_id,
+            )
+        finally:
+            for path in live_paths:
+                path.write_bytes(originals[path])
+        return SimpleNamespace(
+            model=_Model(),
+            train_samples=_Samples(),
+            eval_samples=None,
+            audio_loss_fn=nn.L1Loss(),
+        )
+
+    monkeypatch.setattr(
+        "avgaussianv2.benchmark.runtime.build_runtime", fake_build
+    )
+    result = build_production_runtime(
+        config_path=config_path,
+        device=torch.device("cpu"),
+        trusted_upstream_artifacts=True,
+        config_origin_path=origin_path,
+    )
+
+    assert observed == {
+        "visual": b"pinned-visual",
+        "audio": b"pinned-audio",
+        "manifest": b"pinned-manifest",
+        "source": "pinned-source",
+        "scene": "scene1_opera",
+    }
+    assert result.config_sha256 == hashlib.sha256(b"pinned-config").hexdigest()
 
 
 def _write_worker_manifest(path: Path, identity: dict[str, str]) -> None:
