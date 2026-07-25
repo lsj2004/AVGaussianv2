@@ -158,16 +158,18 @@ def test_production_runtime_is_train_only_and_hashes_real_inputs(
     monkeypatch.setattr(
         "avgaussianv2.benchmark.runtime.ProductionRuntimeSnapshot", Snapshot
     )
-    first = build_production_runtime(
+    with build_production_runtime(
         config_path=config_path,
         device=torch.device("cpu"),
         trusted_upstream_artifacts=True,
-    )
-    second = build_production_runtime(
+    ) as first:
+        pass
+    with build_production_runtime(
         config_path=config_path,
         device=torch.device("cpu"),
         trusted_upstream_artifacts=True,
-    )
+    ) as second:
+        pass
 
     assert calls[0][2] == {
         "trusted_upstream_artifacts": True,
@@ -276,6 +278,13 @@ def test_production_runtime_executes_only_pinned_inputs_during_live_replacement(
     )
     observed = {}
 
+    class LazyModel(_Model):
+        def forward(self, _sample):
+            from libs import snapshot_probe
+
+            observed["source"] = snapshot_probe.VALUE
+            return snapshot_probe.VALUE
+
     def fake_build(config, _device, **_kwargs):
         live_paths = (
             config_path,
@@ -289,20 +298,17 @@ def test_production_runtime_executes_only_pinned_inputs_during_live_replacement(
         try:
             for path in live_paths:
                 path.write_bytes(b"live-replacement")
-            from libs import snapshot_probe
-
             observed.update(
                 visual=config.paths.visual_checkpoint.read_bytes(),
                 audio=config.paths.audio_checkpoint.read_bytes(),
                 manifest=config.paths.manifest.read_bytes(),
-                source=snapshot_probe.VALUE,
                 scene=config.scene.scene_id,
             )
         finally:
             for path in live_paths:
                 path.write_bytes(originals[path])
         return SimpleNamespace(
-            model=_Model(),
+            model=LazyModel(),
             train_samples=_Samples(),
             eval_samples=None,
             audio_loss_fn=nn.L1Loss(),
@@ -314,12 +320,22 @@ def test_production_runtime_executes_only_pinned_inputs_during_live_replacement(
     for name in tuple(sys.modules):
         if name == "libs" or name.startswith("libs."):
             monkeypatch.delitem(sys.modules, name)
-    result = build_production_runtime(
+    with build_production_runtime(
         config_path=config_path,
         device=torch.device("cpu"),
         trusted_upstream_artifacts=True,
         config_origin_path=origin_path,
-    )
+    ) as result:
+        assert any(
+            finder.__class__.__name__ == "_SnapshotSourceFinder"
+            for finder in sys.meta_path
+        )
+        lazy_source = audio_root / "libs/snapshot_probe.py"
+        lazy_source.write_bytes(b"VALUE = 'active-attacker'\n")
+        try:
+            assert result.model(object()) == "pinned-source"
+        finally:
+            lazy_source.write_bytes(originals[lazy_source])
 
     assert observed == {
         "visual": b"pinned-visual",
@@ -328,6 +344,10 @@ def test_production_runtime_executes_only_pinned_inputs_during_live_replacement(
         "source": "pinned-source",
         "scene": "scene1_opera",
     }
+    assert not any(
+        finder.__class__.__name__ == "_SnapshotSourceFinder"
+        for finder in sys.meta_path
+    )
     assert result.config_sha256 == hashlib.sha256(b"pinned-config").hexdigest()
 
 
@@ -371,6 +391,15 @@ def test_worker_seeds_before_internal_builder_and_checks_identity(
     _write_worker_manifest(manifest, identity)
     observed = {}
 
+    class Lease:
+        active = True
+
+        def __exit__(self, *_):
+            self.active = False
+            return False
+
+    lease = Lease()
+
     def builder(**kwargs):
         observed["rng"] = (
             random.random(),
@@ -385,6 +414,7 @@ def test_worker_seeds_before_internal_builder_and_checks_identity(
             audio_loss_fn=nn.L1Loss(),
             dataset_identity_sha256="5" * 64,
             dataset_sample_ids=("sample-0",),
+            _input_snapshot=lease,
             **identity,
         )
 
@@ -409,6 +439,7 @@ def test_worker_seeds_before_internal_builder_and_checks_identity(
             self.config = config
 
         def run(self, **kwargs):
+            assert lease.active
             observed["run"] = kwargs
             return fake_result
 
@@ -428,6 +459,7 @@ def test_worker_seeds_before_internal_builder_and_checks_identity(
     )
     assert observed["kwargs"]["trusted_upstream_artifacts"] is True
     assert len(observed["run"]["train_samples"]) == 1
+    assert lease.active is False
     assert str(observed["run"]["output_dir"]).startswith("/proc/self/fd/")
     assert result["completed_main_updates"] == 30_000
     assert result["final_checkpoint"] == str(tmp_path / "output" / "final.pt")
@@ -446,6 +478,37 @@ def test_worker_seeds_before_internal_builder_and_checks_identity(
             (tmp_path / "output" / "runtime_contract.json").read_bytes()
         ).hexdigest()
     )
+
+
+def test_runtime_lease_closes_on_training_exception() -> None:
+    observed = {}
+
+    class Lease:
+        def __exit__(self, exc_type, exc, _traceback):
+            observed["exception"] = (exc_type, exc)
+            return False
+
+    runtime = BenchmarkRuntime(
+        model=_Model(),
+        train_samples=(object(),),
+        train_config=TrainConfig(),
+        audio_loss_fn=nn.L1Loss(),
+        config_sha256="1" * 64,
+        source_sha256="2" * 64,
+        visual_initialization_sha256="3" * 64,
+        audio_initialization_sha256="4" * 64,
+        model_initialization_sha256="5" * 64,
+        dataset_identity_sha256="6" * 64,
+        dataset_sample_ids=("sample",),
+        _input_snapshot=Lease(),
+    )
+
+    with pytest.raises(RuntimeError, match="training failed"):
+        with runtime:
+            raise RuntimeError("training failed")
+
+    assert observed["exception"][0] is RuntimeError
+    assert str(observed["exception"][1]) == "training failed"
 
 
 def test_cli_does_not_expose_external_runtime_factory(monkeypatch, capsys) -> None:

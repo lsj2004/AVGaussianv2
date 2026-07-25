@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from collections.abc import Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
@@ -41,6 +42,21 @@ class BenchmarkRuntime:
     model_initialization_sha256: str
     dataset_identity_sha256: str
     dataset_sample_ids: tuple[str, ...]
+    _input_snapshot: ProductionRuntimeSnapshot | None = None
+    _import_guard_handle: Any | None = None
+
+    def __enter__(self) -> BenchmarkRuntime:
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        if self._import_guard_handle is not None:
+            self._import_guard_handle.remove()
+            object.__setattr__(self, "_import_guard_handle", None)
+        snapshot = self._input_snapshot
+        object.__setattr__(self, "_input_snapshot", None)
+        if snapshot is not None:
+            return snapshot.__exit__(exc_type, exc, traceback)
+        return False
 
 
 class ProductionRuntimeSnapshot:
@@ -68,6 +84,7 @@ class ProductionRuntimeSnapshot:
         self.audio_checkpoint_sha256 = ""
         self.manifest_sha256 = ""
         self.source_inventory: dict[str, str] = {}
+        self.source_finder: Any | None = None
         self._active = False
 
     def _pin(self, path: Path, expected_sha256: str | None = None):
@@ -171,7 +188,7 @@ class ProductionRuntimeSnapshot:
             )
             from avgaussianv2.benchmark.production import _snapshot_source_imports
 
-            self._stack.enter_context(
+            self.source_finder = self._stack.enter_context(
                 _snapshot_source_imports(self._source_pins, roots)
             )
             return self
@@ -185,19 +202,51 @@ class ProductionRuntimeSnapshot:
             raise RuntimeError("production runtime snapshot is not active")
         for pin in self._pins:
             pin.verify()
+        self.assert_no_import_failures()
         if (
             self.audited_config is None
             or upstream_source_inventory(self.audited_config) != self.source_inventory
         ):
             raise RuntimeError("upstream source inventory changed during runtime build")
 
+    def assert_no_import_failures(self) -> None:
+        if self.source_finder is None:
+            raise RuntimeError("production source snapshot finder is unavailable")
+        self.source_finder.assert_no_failures()
+
     def __exit__(self, exc_type, exc, traceback) -> bool:
+        verification_error: BaseException | None = None
         try:
-            if exc_type is None:
-                self.verify()
-        finally:
-            self._stack.close()
-            self._active = False
+            self.verify()
+        except BaseException as error:
+            verification_error = error
+        cleanup_error: BaseException | None = None
+        context_error = verification_error if verification_error is not None else exc
+        try:
+            self._stack.__exit__(
+                None if context_error is None else type(context_error),
+                context_error,
+                None if context_error is None else context_error.__traceback__,
+            )
+        except BaseException as error:
+            cleanup_error = error
+        self._active = False
+        self.source_finder = None
+        if verification_error is not None:
+            if exc is not None:
+                exc.add_note(
+                    f"production snapshot verification also failed: "
+                    f"{verification_error}"
+                )
+            else:
+                raise verification_error
+        if cleanup_error is not None:
+            if exc is not None:
+                exc.add_note(
+                    f"production snapshot cleanup also failed: {cleanup_error}"
+                )
+            else:
+                raise cleanup_error
         return False
 
 
@@ -484,16 +533,34 @@ def build_production_runtime(
     camera-mapping, and ordered training-sample identity digests.
     """
     if input_snapshot is None:
-        with ProductionRuntimeSnapshot(
+        snapshot = ProductionRuntimeSnapshot(
             config_path, config_origin_path=config_origin_path
-        ) as snapshot:
-            return build_production_runtime(
+        )
+        snapshot.__enter__()
+        try:
+            runtime = build_production_runtime(
                 config_path=config_path,
                 device=device,
                 trusted_upstream_artifacts=trusted_upstream_artifacts,
                 config_origin_path=config_origin_path,
                 input_snapshot=snapshot,
             )
+            object.__setattr__(runtime, "_input_snapshot", snapshot)
+
+            def audit_imports(_module, _inputs, _output):
+                snapshot.assert_no_import_failures()
+
+            object.__setattr__(
+                runtime,
+                "_import_guard_handle",
+                runtime.model.register_forward_hook(
+                    audit_imports, always_call=True
+                ),
+            )
+            return runtime
+        except BaseException:
+            snapshot.__exit__(*sys.exc_info())
+            raise
     if not input_snapshot._active or input_snapshot.config is None:
         raise RuntimeError("production runtime input snapshot is not active")
     config = input_snapshot.config

@@ -185,10 +185,20 @@ class _PinnedInput:
 
 
 class _SnapshotSourceLoader(importlib.abc.Loader):
-    def __init__(self, data: bytes, origin: str, *, is_package: bool) -> None:
+    def __init__(
+        self,
+        data: bytes,
+        origin: str,
+        *,
+        is_package: bool,
+        fullname: str,
+        failures: dict[str, BaseException],
+    ) -> None:
         self.data = data
         self.origin = origin
         self._is_package = is_package
+        self.fullname = fullname
+        self.failures = failures
 
     def create_module(self, spec):
         return None
@@ -199,12 +209,24 @@ class _SnapshotSourceLoader(importlib.abc.Loader):
 
     def exec_module(self, module) -> None:
         module.__file__ = self.origin
-        exec(compile(self.data, self.origin, "exec"), module.__dict__)
+        try:
+            exec(compile(self.data, self.origin, "exec"), module.__dict__)
+        except BaseException as error:
+            self.failures[self.fullname] = error
+            raise
 
 
 class _SnapshotSourceFinder(importlib.abc.MetaPathFinder):
     def __init__(self, modules: Mapping[str, tuple[bytes, str, bool]]) -> None:
         self.modules = modules
+        self.failures: dict[str, BaseException] = {}
+
+    def assert_no_failures(self) -> None:
+        if self.failures:
+            names = sorted(self.failures)
+            raise RuntimeError(
+                f"audited upstream snapshot import failed: {names}"
+            ) from self.failures[names[0]]
 
     def find_spec(self, fullname, path=None, target=None):
         del path, target
@@ -214,7 +236,13 @@ class _SnapshotSourceFinder(importlib.abc.MetaPathFinder):
         data, origin, is_package = record
         spec = importlib.util.spec_from_loader(
             fullname,
-            _SnapshotSourceLoader(data, origin, is_package=is_package),
+            _SnapshotSourceLoader(
+                data,
+                origin,
+                is_package=is_package,
+                fullname=fullname,
+                failures=self.failures,
+            ),
             origin=origin,
             is_package=is_package,
         )
@@ -252,7 +280,7 @@ def _snapshot_source_imports(
     finder = _SnapshotSourceFinder(modules)
     sys.meta_path.insert(0, finder)
     try:
-        yield
+        yield finder
     finally:
         sys.meta_path.remove(finder)
         for name in modules:
@@ -282,10 +310,17 @@ def sha256_file(path: Path) -> str:
 class _PinnedEvaluationPredictor:
     """Keep audited inputs/imports alive through every model forward."""
 
-    def __init__(self, predict, stack: ExitStack, pins: tuple[_PinnedInput, ...]) -> None:
+    def __init__(
+        self,
+        predict,
+        stack: ExitStack,
+        pins: tuple[_PinnedInput, ...],
+        source_guards: tuple[_SnapshotSourceFinder, ...] = (),
+    ) -> None:
         self._predict = predict
         self._stack = stack
         self._pins = pins
+        self._source_guards = source_guards
         self._closed = False
 
     def __enter__(self):
@@ -296,6 +331,8 @@ class _PinnedEvaluationPredictor:
             raise RuntimeError("evaluation predictor is closed")
         try:
             result = self._predict(sample)
+            for guard in self._source_guards:
+                guard.assert_no_failures()
             for pin in self._pins:
                 pin.verify()
             return result
@@ -314,6 +351,37 @@ class _PinnedEvaluationPredictor:
     def __exit__(self, exc_type, exc, traceback) -> bool:
         self.close()
         return False
+
+
+class _BorrowedProductionSnapshot:
+    """Expose evaluation-owned pins to train-only identity construction."""
+
+    def __init__(
+        self,
+        *,
+        config,
+        config_sha256: str,
+        visual_checkpoint_pin: _PinnedInput,
+        audio_checkpoint_pin: _PinnedInput,
+        manifest_pin: _PinnedInput,
+        source_inventory: Mapping[str, str],
+        pins: tuple[_PinnedInput, ...],
+        source_finder: _SnapshotSourceFinder,
+    ) -> None:
+        self._active = True
+        self.config = config
+        self.config_sha256 = config_sha256
+        self.visual_checkpoint_sha256 = visual_checkpoint_pin.expected_sha256
+        self.audio_checkpoint_sha256 = audio_checkpoint_pin.expected_sha256
+        self.manifest_sha256 = manifest_pin.expected_sha256
+        self.source_inventory = dict(source_inventory)
+        self._pins = pins
+        self._source_finder = source_finder
+
+    def verify(self) -> None:
+        self._source_finder.assert_no_failures()
+        for pin in self._pins:
+            pin.verify()
 
 
 class _RetainedExitStack(ExitStack):
@@ -686,6 +754,9 @@ def build_evaluation_adapters(
             relevant_checkpoint: Path | None = None
             continuation_pin: _PinnedInput | None = None
             checkpoint_pin: _PinnedInput | None = None
+            visual_initialization_pin: _PinnedInput | None = None
+            audio_initialization_pin: _PinnedInput | None = None
+            manifest_pin: _PinnedInput | None = None
             native_source_records: tuple[tuple[Path, str], ...] = ()
             training_runtime: BenchmarkRuntime | None = None
             if evidence.role == "continuation":
@@ -740,12 +811,13 @@ def build_evaluation_adapters(
                 "audiogs": upstream_roots[0],
                 "ftgspp": upstream_roots[1],
             }
+            source_inventory = upstream_source_inventory(config)
             all_source_records = tuple(
                 (
                     roots_by_kind[key.split(":", 1)[0]] / key.split(":", 1)[1],
                     digest,
                 )
-                for key, digest in sorted(upstream_source_inventory(config).items())
+                for key, digest in sorted(source_inventory.items())
             )
             if relevant_checkpoint is not None:
                 checkpoint_pin = pinned_inputs.enter_context(
@@ -766,16 +838,52 @@ def build_evaluation_adapters(
                 pinned_inputs.enter_context(_PinnedInput(path, digest))
                 for path, digest in all_source_records
             ]
-            pinned_inputs.enter_context(
+            source_finder = pinned_inputs.enter_context(
                 _snapshot_source_imports(source_pins, upstream_roots)
             )
             if evidence.role == "continuation":
+                visual_initialization_pin = pinned_inputs.enter_context(
+                    _PinnedInput(config.paths.visual_checkpoint, None)
+                )
+                audio_initialization_pin = pinned_inputs.enter_context(
+                    _PinnedInput(config.paths.audio_checkpoint, None)
+                )
+                manifest_pin = pinned_inputs.enter_context(
+                    _PinnedInput(config.paths.manifest, None)
+                )
+                config = replace(
+                    config,
+                    paths=replace(
+                        config.paths,
+                        visual_checkpoint=visual_initialization_pin.proc_path,
+                        audio_checkpoint=audio_initialization_pin.proc_path,
+                        manifest=manifest_pin.proc_path,
+                    ),
+                )
+                borrowed_snapshot = _BorrowedProductionSnapshot(
+                    config=config,
+                    config_sha256=resolved_sha256,
+                    visual_checkpoint_pin=visual_initialization_pin,
+                    audio_checkpoint_pin=audio_initialization_pin,
+                    manifest_pin=manifest_pin,
+                    source_inventory=source_inventory,
+                    pins=(
+                        config_pin,
+                        origin_pin,
+                        visual_initialization_pin,
+                        audio_initialization_pin,
+                        manifest_pin,
+                        *source_pins,
+                    ),
+                    source_finder=source_finder,
+                )
                 _seed_evaluation_runtime(evidence.seed)
                 training_runtime = build_production_runtime(
                     config_path=pinned_config,
                     device=torch.device(device),
                     trusted_upstream_artifacts=trusted_upstream_artifacts,
                     config_origin_path=pinned_origin,
+                    input_snapshot=borrowed_snapshot,
                 )
                 for name in (
                     "config_sha256",
@@ -828,11 +936,15 @@ def build_evaluation_adapters(
                 origin_pin,
                 continuation_pin,
                 checkpoint_pin,
+                visual_initialization_pin,
+                audio_initialization_pin,
+                manifest_pin,
                 *source_pins,
             )
             if pin is not None
         )
         holder["stack"] = stack
+        holder["source_guards"] = (source_finder,)
         return BenchmarkEvaluationRuntime(bundle.eval_samples, bundle.audio_loss_fn)
 
     def predictor_factory(_runtime: BenchmarkEvaluationRuntime):
@@ -855,6 +967,7 @@ def build_evaluation_adapters(
         except BaseException as error:
             stack = holder.pop("stack", None)
             holder.pop("pins", None)
+            holder.pop("source_guards", None)
             if isinstance(stack, ExitStack):
                 try:
                     stack.close()
@@ -881,9 +994,14 @@ def build_evaluation_adapters(
 
         stack = holder.pop("stack", None)
         pins = holder.pop("pins", None)
+        source_guards = holder.pop("source_guards", None)
         if not isinstance(stack, ExitStack) or not isinstance(pins, tuple):
             raise RuntimeError("evaluation input lifetime is unavailable")
-        return _PinnedEvaluationPredictor(predict, stack, pins)
+        if not isinstance(source_guards, tuple):
+            raise RuntimeError("evaluation source audit lifetime is unavailable")
+        return _PinnedEvaluationPredictor(
+            predict, stack, pins, source_guards=source_guards
+        )
 
     return runtime_factory, predictor_factory
 

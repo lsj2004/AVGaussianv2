@@ -195,54 +195,63 @@ def run_worker(
         )
         if not isinstance(runtime, BenchmarkRuntime):
             raise TypeError("internal runtime builder must return BenchmarkRuntime")
-        expected_identity = {
-            "config_sha256": compatibility.config_sha256,
-            "source_sha256": compatibility.source_sha256,
-            "visual_initialization_sha256": compatibility.visual_initialization_sha256,
-            "audio_initialization_sha256": compatibility.audio_initialization_sha256,
-            "model_initialization_sha256": compatibility.model_initialization_sha256,
-        }
-        for name, expected in expected_identity.items():
-            if getattr(runtime, name) != expected:
-                raise ValueError(f"runtime {name} mismatch")
-        if len(runtime.train_samples) <= 0:
-            raise ValueError("runtime training dataset is empty")
-        if len(runtime.dataset_sample_ids) != len(runtime.train_samples):
-            raise ValueError("runtime dataset sample-ID sequence length mismatch")
-        if any(index < 0 or index >= len(runtime.train_samples) for index in indices):
-            raise ValueError("shared sample index is outside the training dataset")
-        result = FixedBudgetTrainer(config).run(
-            model=runtime.model,
-            train_samples=runtime.train_samples,
-            shared_indices=indices,
-            mode=mode,
-            train_config=runtime.train_config,
-            audio_loss_fn=runtime.audio_loss_fn,
-            output_dir=pinned_output,
-            compatibility=compatibility,
-            resume=resume,
-        )
-        runtime_contract_sha256 = _atomic_runtime_contract(
-            pinned_output,
-            runtime=runtime,
-            compatibility=compatibility,
-        )
-        return {
-            "mode": result.mode.value,
-            "completed_warmup_steps": result.completed_warmup_steps,
-            "completed_main_updates": result.completed_main_updates,
-            "resumed_from_main_step": result.resumed_from_main_step,
-            "redone_main_updates": result.redone_main_updates,
-            "selection": result.selection,
-            "final_checkpoint": str(original_output / "final.pt"),
-            "milestones": [
-                str(original_output / "milestones" / path.name)
-                for path in result.milestones
-            ],
-            "io": asdict(result.io),
-            "runtime_contract": str(original_output / "runtime_contract.json"),
-            "runtime_contract_sha256": runtime_contract_sha256,
-        }
+        with runtime:
+            expected_identity = {
+                "config_sha256": compatibility.config_sha256,
+                "source_sha256": compatibility.source_sha256,
+                "visual_initialization_sha256": (
+                    compatibility.visual_initialization_sha256
+                ),
+                "audio_initialization_sha256": (
+                    compatibility.audio_initialization_sha256
+                ),
+                "model_initialization_sha256": (
+                    compatibility.model_initialization_sha256
+                ),
+            }
+            for name, expected in expected_identity.items():
+                if getattr(runtime, name) != expected:
+                    raise ValueError(f"runtime {name} mismatch")
+            if len(runtime.train_samples) <= 0:
+                raise ValueError("runtime training dataset is empty")
+            if len(runtime.dataset_sample_ids) != len(runtime.train_samples):
+                raise ValueError("runtime dataset sample-ID sequence length mismatch")
+            if any(
+                index < 0 or index >= len(runtime.train_samples) for index in indices
+            ):
+                raise ValueError("shared sample index is outside the training dataset")
+            result = FixedBudgetTrainer(config).run(
+                model=runtime.model,
+                train_samples=runtime.train_samples,
+                shared_indices=indices,
+                mode=mode,
+                train_config=runtime.train_config,
+                audio_loss_fn=runtime.audio_loss_fn,
+                output_dir=pinned_output,
+                compatibility=compatibility,
+                resume=resume,
+            )
+            runtime_contract_sha256 = _atomic_runtime_contract(
+                pinned_output,
+                runtime=runtime,
+                compatibility=compatibility,
+            )
+            return {
+                "mode": result.mode.value,
+                "completed_warmup_steps": result.completed_warmup_steps,
+                "completed_main_updates": result.completed_main_updates,
+                "resumed_from_main_step": result.resumed_from_main_step,
+                "redone_main_updates": result.redone_main_updates,
+                "selection": result.selection,
+                "final_checkpoint": str(original_output / "final.pt"),
+                "milestones": [
+                    str(original_output / "milestones" / path.name)
+                    for path in result.milestones
+                ],
+                "io": asdict(result.io),
+                "runtime_contract": str(original_output / "runtime_contract.json"),
+                "runtime_contract_sha256": runtime_contract_sha256,
+            }
 
 
 def main() -> None:

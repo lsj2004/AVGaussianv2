@@ -403,9 +403,11 @@ def test_snapshot_import_failure_is_not_hidden_by_filesystem_fallback(tmp_path):
         fallback.write_bytes(b"VALUE = 'filesystem fallback'\n")
         stack.callback(sys.path.remove, str(fallback.parents[2]))
         sys.path.append(str(fallback.parents[2]))
-        with _snapshot_source_imports(pins, (audio_root, visual_root)):
+        with _snapshot_source_imports(pins, (audio_root, visual_root)) as finder:
             with pytest.raises(SyntaxError):
                 importlib.import_module("ftgspp.models.gaussians")
+            with pytest.raises(RuntimeError, match="snapshot import failed"):
+                finder.assert_no_failures()
 
 
 def test_pinned_input_rejects_symlinked_ancestor(tmp_path):
@@ -558,7 +560,18 @@ def test_continuation_adapter_reseeds_both_random_runtime_constructions(
         runtime_contract_path=str(tmp_path / "runtime_contract.json"),
         runtime_contract_sha256=DIGEST,
     )
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}")
     config = load_project_config(resolved)
+    config = replace(
+        config,
+        paths=replace(
+            config.paths,
+            visual_checkpoint=checkpoint,
+            audio_checkpoint=checkpoint,
+            manifest=manifest,
+        ),
+    )
     consumed_configs = []
 
     def training_runtime(**_kwargs):
