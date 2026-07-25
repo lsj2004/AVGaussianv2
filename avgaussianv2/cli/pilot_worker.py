@@ -583,16 +583,60 @@ def _bound_component_identities(
 ) -> dict[str, str]:
     """Bind canonical worker semantics and trust mode into Task 6."""
     identities = dict(manifest.component_identities)
-    identities["worker_contract_sha256"] = hash_index_manifest(
+    identities["worker_contract_sha256"] = build_worker_contract_sha256(
+        manifest_sha256=manifest.sha256,
+        source_hashes=manifest.source_hashes,
+        trust_upstream_artifacts=trust_upstream_artifacts,
+    )
+    return identities
+
+
+def build_worker_component_identities(
+    model_class: str,
+    *,
+    audio_loss_fn: str = "runtime.audio_loss_fn-v1",
+) -> dict[str, str]:
+    """Return the single canonical producer contract for Task 7 manifests."""
+    if not isinstance(model_class, str) or not model_class:
+        raise TypeError("model_class must be a nonempty string")
+    if not isinstance(audio_loss_fn, str) or not audio_loss_fn:
+        raise TypeError("audio_loss_fn must be a nonempty string")
+    return {
+        "model_class": model_class,
+        "warmup_optimizer_factory": "avgaussianv2.train.build_warmup_optimizer-v1",
+        "joint_optimizer_factory": "avgaussianv2.train.build_joint_optimizer-v1",
+        "warmup_optimizer_class": "torch.optim.adam.Adam",
+        "joint_optimizer_class": "torch.optim.adam.Adam",
+        "warmup_step_fn": "avgaussianv2.train.condition_warmup_step-v1",
+        "joint_step_fn": "avgaussianv2.train.joint_train_step-v1",
+        "audio_loss_fn": audio_loss_fn,
+    }
+
+
+def build_worker_contract_sha256(
+    *,
+    manifest_sha256: str,
+    source_hashes: Mapping[str, str],
+    trust_upstream_artifacts: bool,
+) -> str:
+    """Bind manifest version, sources, and explicit trust mode in one place."""
+    if not isinstance(trust_upstream_artifacts, bool):
+        raise TypeError("trust_upstream_artifacts must be boolean")
+    _digest(manifest_sha256, "manifest_sha256")
+    hashes = _exact(source_hashes, _SOURCE_HASH_FIELDS, "source_hashes")
+    normalized = {
+        name: _digest(hashes[name], f"source_hashes.{name}")
+        for name in sorted(_SOURCE_HASH_FIELDS)
+    }
+    return hash_index_manifest(
         {
             "manifest_schema": MANIFEST_SCHEMA,
             "manifest_version": MANIFEST_VERSION,
-            "manifest_sha256": manifest.sha256,
-            "source_hashes": manifest.source_hashes,
+            "manifest_sha256": manifest_sha256,
+            "source_hashes": normalized,
             "trust_upstream_artifacts": trust_upstream_artifacts,
         }
     )
-    return identities
 
 
 class _ManifestFingerprintModel(nn.Module):
