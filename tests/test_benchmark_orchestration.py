@@ -199,7 +199,8 @@ def test_scene_starts_evaluation_only_after_training_and_supervises_failure(
     assert "avgaussianv2.cli.benchmark_eval" not in modules
     sibling_handles = runner.handles[-2:]
     assert all(handle.terminated for handle in sibling_handles)
-    assert all(handle.result == -15 for handle in sibling_handles)
+    assert all(handle.killed for handle in sibling_handles)
+    assert all(handle.result == -9 for handle in sibling_handles)
 
 
 @pytest.mark.parametrize("mode", ["resume", "verify_only"])

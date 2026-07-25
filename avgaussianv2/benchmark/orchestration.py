@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import json
+import errno
 import hashlib
+import json
 import os
 import shutil
 import signal
@@ -257,12 +258,18 @@ class _Handle:
                 self.stream.close()
 
     def terminate(self) -> None:
-        if self.process.poll() is None:
+        try:
             os.killpg(self.process.pid, signal.SIGTERM)
+        except OSError as error:
+            if error.errno != errno.ESRCH:
+                raise
 
     def kill(self) -> None:
-        if self.process.poll() is None:
+        try:
             os.killpg(self.process.pid, signal.SIGKILL)
+        except OSError as error:
+            if error.errno != errno.ESRCH:
+                raise
 
 
 class SubprocessRunner:
@@ -627,6 +634,7 @@ def _run_one(
         _terminate_handles((handle,))
         raise
     if code:
+        _terminate_handles((handle,))
         raise OrchestrationError(f"subprocess failed ({code}); log={log}")
 
 
@@ -642,14 +650,17 @@ def _terminate_handles(handles: Sequence[ProcessHandle]) -> None:
         try:
             handle.wait(timeout=10)
         except BaseException:
-            try:
-                handle.kill()
-            except BaseException:
-                pass
-            try:
-                handle.wait()
-            except BaseException:
-                pass
+            pass
+    for handle in handles:
+        try:
+            handle.kill()
+        except BaseException:
+            pass
+    for handle in handles:
+        try:
+            handle.wait()
+        except BaseException:
+            pass
 
 
 def _run_parallel(
@@ -668,6 +679,7 @@ def _run_parallel(
     pending = list(active)
     try:
         while pending:
+            cleanup_targets = tuple(handle for _, handle, _ in pending)
             next_pending = []
             for name, handle, log in pending:
                 code = handle.poll()
@@ -676,7 +688,7 @@ def _run_parallel(
                 elif code:
                     failures.append((name, code, log))
             if failures:
-                _terminate_handles(tuple(handle for _, handle, _ in next_pending))
+                _terminate_handles(cleanup_targets)
                 break
             pending = next_pending
             if pending:
