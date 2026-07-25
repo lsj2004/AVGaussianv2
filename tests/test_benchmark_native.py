@@ -197,7 +197,12 @@ def _install_native_audit_stubs(monkeypatch):
     monkeypatch.setattr(
         native_module,
         "audit_ftgspp_flow_cache",
-        lambda *_, **__: {"pairs": 0, "cameras": 38, "files": 0},
+        lambda *_, **__: {
+            "pairs": 0,
+            "cameras": 38,
+            "files": 0,
+            "complete": True,
+        },
     )
     monkeypatch.setattr(
         native_module, "_source_files", lambda _, root: (Path(root) / "source.py",)

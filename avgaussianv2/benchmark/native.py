@@ -1251,11 +1251,12 @@ def _verify_native_snapshot(
             relative_paths.append(relative)
         flow_audit = _exact(
             completion["flow_audit"],
-            {"pairs", "cameras", "files"},
+            {"pairs", "cameras", "files", "complete"},
             "FTGS++ flow audit",
         )
         if (
             len(set(relative_paths)) != len(relative_paths)
+            or flow_audit["complete"] is not True
             or flow_audit["cameras"] != 38
             or flow_audit["files"] != len(relative_paths)
             or flow_audit["pairs"]
