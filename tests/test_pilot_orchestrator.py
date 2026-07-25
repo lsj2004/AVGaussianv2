@@ -205,6 +205,29 @@ def test_shared_sequences_are_deterministic_and_condition_off_has_no_warmup() ->
     assert _evenly_spaced(3, 32) == (0, 1, 2)
 
 
+def test_expired_proc_checkpoint_provenance_is_a_targeted_migration(
+    tmp_path,
+) -> None:
+    from avgaussianv2.cli.pilot import _has_expired_proc_checkpoint_provenance
+
+    manifest = tmp_path / "evaluation_manifest.json"
+    manifest.write_text(json.dumps({
+        "systems": [{
+            "checkpoint": {
+                "checkpoint_path": "/proc/999999999/fd/47/best.pt"
+            }
+        }]
+    }))
+    assert _has_expired_proc_checkpoint_provenance(manifest)
+
+    payload = json.loads(manifest.read_text())
+    payload["systems"][0]["checkpoint"]["checkpoint_path"] = str(
+        tmp_path / "missing.pt"
+    )
+    manifest.write_text(json.dumps(payload))
+    assert not _has_expired_proc_checkpoint_provenance(manifest)
+
+
 def _verify_config(tmp_path):
     for name in ("visual.pt", "audio.pt", "dataset.json"):
         (tmp_path / name).write_text(name)

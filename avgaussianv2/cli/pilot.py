@@ -219,6 +219,34 @@ def _strict_json_equal(left: object, right: object) -> bool:
     return left == right
 
 
+def _has_expired_proc_checkpoint_provenance(manifest_path: Path) -> bool:
+    """Recognize the pre-fix evaluation manifest migration case only."""
+    try:
+        payload = json.loads(_read_regular(manifest_path).decode())
+        systems = payload["systems"]
+        paths = [
+            Path(item["checkpoint"]["checkpoint_path"])
+            for item in systems
+        ]
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not paths:
+        return False
+    for path in paths:
+        parts = path.parts
+        if not (
+            len(parts) >= 6
+            and parts[0] == "/"
+            and parts[1] == "proc"
+            and parts[2].isdigit()
+            and parts[3] == "fd"
+            and parts[4].isdigit()
+            and not path.exists()
+        ):
+            return False
+    return True
+
+
 def _validate_experiment_types(value: object) -> Mapping[str, object]:
     if not isinstance(value, Mapping) or set(value) != _EXPERIMENT_FIELDS:
         raise ValueError("experiment manifest fields mismatch")
@@ -1325,14 +1353,24 @@ def run_pilot(
                 (destination / "evaluation_manifest.json").is_file()
                 and not replace_stale
             ):
-                eval_jobs[variant] = _verify_existing(
-                    destination,
-                    specs,
-                    config_path=config_source,
-                    shared_manifest=shared_path,
-                    variant=variant,
-                )
-                continue
+                try:
+                    eval_jobs[variant] = _verify_existing(
+                        destination,
+                        specs,
+                        config_path=config_source,
+                        shared_manifest=shared_path,
+                        variant=variant,
+                    )
+                except FileNotFoundError:
+                    manifest_path = destination / "evaluation_manifest.json"
+                    if not (
+                        resume
+                        and _has_expired_proc_checkpoint_provenance(manifest_path)
+                    ):
+                        raise
+                    replace_stale = True
+                else:
+                    continue
             if verify_only:
                 raise FileNotFoundError(f"{variant.value} final evaluation is incomplete")
             command = [
