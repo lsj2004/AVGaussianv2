@@ -2543,15 +2543,20 @@ def resolve_current_report(
         os.close(output_fd)
 
 
-def build_comparison(
+def _prepare_comparison(
     systems: Sequence[SystemReportInput],
-    output_dir: str | Path,
     *,
     checkpoint_identity_resolver: Callable[
         [Path, EvaluationProvenance], CheckpointArtifactIdentity
     ] = resolve_pilot_checkpoint_identity,
-) -> ComparisonResult:
-    """Validate five systems, decide acceptance, and atomically publish reports."""
+) -> tuple[
+    dict[str, dict[str, object]],
+    dict[str, tuple[dict[str, object], ...]],
+    dict[str, object],
+    dict[str, dict[str, object]],
+    PilotDecision,
+    dict[str, str],
+]:
     normalized, rows = _normalize_systems(
         systems,
         checkpoint_identity_resolver=checkpoint_identity_resolver,
@@ -2577,16 +2582,34 @@ def build_comparison(
     paired_jsonl = "".join(
         _json_text(record, indent=None) for record in paired["records"]
     )
+    contents = {
+        "comparison.json": _json_text(json_payload),
+        "comparison.csv": _csv_text(output_systems),
+        "comparison.md": _markdown_text(
+            output_systems, paired, descriptive, decision
+        ),
+        "paired_condition_deltas.jsonl": paired_jsonl,
+    }
+    return output_systems, rows, paired, descriptive, decision, contents
+
+
+def build_comparison(
+    systems: Sequence[SystemReportInput],
+    output_dir: str | Path,
+    *,
+    checkpoint_identity_resolver: Callable[
+        [Path, EvaluationProvenance], CheckpointArtifactIdentity
+    ] = resolve_pilot_checkpoint_identity,
+) -> ComparisonResult:
+    """Validate five systems, decide acceptance, and atomically publish reports."""
+    output_systems, rows, paired, descriptive, decision, contents = (
+        _prepare_comparison(
+            systems,
+            checkpoint_identity_resolver=checkpoint_identity_resolver,
+        )
+    )
     digest, generation_path, durability_warnings = _publish_generation(
-        Path(output_dir),
-        {
-            "comparison.json": _json_text(json_payload),
-            "comparison.csv": _csv_text(output_systems),
-            "comparison.md": _markdown_text(
-                output_systems, paired, descriptive, decision
-            ),
-            "paired_condition_deltas.jsonl": paired_jsonl,
-        },
+        Path(output_dir), contents,
     )
     return ComparisonResult(
         systems=output_systems,
@@ -2598,6 +2621,50 @@ def build_comparison(
         generation_path=generation_path,
         committed=True,
         durability_warnings=durability_warnings,
+    )
+
+
+def verify_current_comparison(
+    systems: Sequence[SystemReportInput],
+    output_dir: str | Path,
+    *,
+    checkpoint_identity_resolver: Callable[
+        [Path, EvaluationProvenance], CheckpointArtifactIdentity
+    ] = resolve_pilot_checkpoint_identity,
+) -> ComparisonResult:
+    """Recompute and byte-verify the authoritative report without publication."""
+    output_systems, rows, paired, descriptive, decision, contents = (
+        _prepare_comparison(
+            systems,
+            checkpoint_identity_resolver=checkpoint_identity_resolver,
+        )
+    )
+    resolved = resolve_current_report(output_dir, include_warnings=True)
+    if not isinstance(resolved, ResolvedReport):  # pragma: no cover - type guard
+        raise RuntimeError("report resolver did not return metadata")
+    encoded = {name: contents[name].encode("utf-8") for name in _REPORT_FILES}
+    expected_digest = str(_generation_metadata(encoded)["content_digest"])
+    if resolved.generation_path.name != expected_digest:
+        raise ValueError("authoritative report digest disagrees with recomputed inputs")
+    for name, expected in encoded.items():
+        actual = _read_verified_artifact(
+            resolved.generation_path / name,
+            hashlib.sha256(expected).hexdigest(),
+            limit=max(len(expected), 1),
+            name=f"report {name}",
+        )
+        if actual != expected:
+            raise ValueError(f"authoritative report content mismatch: {name}")
+    return ComparisonResult(
+        systems=output_systems,
+        rows=rows,
+        paired_condition=paired,
+        descriptive_comparisons=descriptive,
+        decision=decision,
+        content_digest=expected_digest,
+        generation_path=resolved.generation_path,
+        committed=True,
+        durability_warnings=resolved.durability_warnings,
     )
 
 
@@ -2618,4 +2685,5 @@ __all__ = [
     "paired_audio_deltas",
     "resolve_current_report",
     "resolve_pilot_checkpoint_identity",
+    "verify_current_comparison",
 ]

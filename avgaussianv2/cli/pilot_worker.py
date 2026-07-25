@@ -96,6 +96,17 @@ class FileSnapshot:
     sha256: str
 
 
+@dataclass(frozen=True)
+class VerifiedWorkerOutput:
+    manifest: WorkerManifest
+    summary: dict[str, object]
+    latest: Any
+    best: Any
+    worker_summary_sha256: str
+    latest_sha256: str
+    best_sha256: str
+
+
 def _read_bounded_regular_bytes(path: Path, limit: int) -> bytes:
     before = path.lstat()
     if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
@@ -854,6 +865,246 @@ def _verify_worker_reports(
     ):
         raise RuntimeError("best checkpoint disagrees with latest checkpoint")
     return summary
+
+
+def verify_worker_output(
+    config_path: str | Path,
+    shared_indices_path: str | Path,
+    visual_baseline_path: str | Path,
+    output_dir: str | Path,
+    variant: Variant | str,
+    *,
+    trust_upstream_artifacts: bool,
+) -> VerifiedWorkerOutput:
+    """Verify a completed worker output without constructing a runtime."""
+    resolved_variant = Variant(variant)
+    config_source = Path(config_path)
+    config_bytes = _read_bounded_regular_bytes(config_source, MAX_SMALL_INPUT_BYTES)
+    config = load_project_config_bytes(config_bytes, base_dir=config_source.parent)
+    source_snapshots = (
+        _snapshot_file(config.paths.visual_checkpoint),
+        _snapshot_file(config.paths.audio_checkpoint),
+        _snapshot_file(config.paths.manifest),
+    )
+    actual_hashes = {
+        "project_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "visual_checkpoint_sha256": source_snapshots[0].sha256,
+        "audio_checkpoint_sha256": source_snapshots[1].sha256,
+        "dataset_manifest_sha256": source_snapshots[2].sha256,
+        "camera_mapping_sha256": hash_index_manifest(config.scene.camera_mapping),
+    }
+    manifest = load_worker_manifest(
+        shared_indices_path,
+        config_path=config_source,
+        config=config,
+        actual_source_hashes=actual_hashes,
+    )
+    baseline = _validate_baseline(manifest, Path(visual_baseline_path))
+    expected_fingerprint = _expected_run_fingerprint(
+        manifest,
+        config,
+        baseline,
+        trust_upstream_artifacts=trust_upstream_artifacts,
+    )
+    indices = manifest.indices_for(resolved_variant)
+    output = Path(output_dir)
+    latest_path = output / "latest.pt"
+    best_path = output / "best.pt"
+    summary_path = output / "worker_summary.json"
+    curve_path = output / "training_curve.csv"
+    latest_snapshot = _snapshot_file(latest_path)
+    best_snapshot = _snapshot_file(best_path)
+    summary_snapshot = _snapshot_file(summary_path)
+    curve_snapshot = _snapshot_file(curve_path)
+    latest = inspect_pilot_checkpoint(
+        latest_path,
+        expected_compatibility=manifest.compatibility_for(resolved_variant),
+        indices=indices,
+        expected_run_fingerprint=expected_fingerprint,
+        active_resume=False,
+        allow_complete=True,
+    )
+    best = inspect_pilot_checkpoint(
+        best_path,
+        expected_compatibility=manifest.compatibility_for(resolved_variant),
+        indices=indices,
+        expected_run_fingerprint=expected_fingerprint,
+        active_resume=False,
+    )
+    if latest.checkpoint_kind != "latest" or latest.stage != "complete":
+        raise PilotResumeError("worker latest checkpoint is not complete")
+    if best.checkpoint_kind != "best" or best.generation != latest.best_generation:
+        raise PilotResumeError("worker best checkpoint generation mismatch")
+    summary_value = _strict_json_bytes(
+        _read_bounded_regular_bytes(summary_path, MAX_SUMMARY_BYTES),
+        "worker_summary.json",
+    )
+    fields_expected = {
+        "variant", "completed_warmup_steps", "completed_joint_steps",
+        "best_step", "stop_reason", "training_history", "validation_history",
+        "selector_state", "stopper_state", "checkpoint_io", "worker",
+    }
+    summary = dict(_exact(summary_value, fields_expected, "worker summary"))
+    worker = _exact(
+        summary["worker"],
+        {
+            "variant", "device", "scene_id", "config_sha256",
+            "manifest_sha256", "visual_baseline_sha256",
+            "trusted_upstream_artifacts",
+        },
+        "worker summary identity",
+    )
+    expected_identity = {
+        "variant": resolved_variant.value,
+        "scene_id": manifest.scene_id,
+        "config_sha256": manifest.source_hashes["project_config_sha256"],
+        "manifest_sha256": manifest.sha256,
+        "visual_baseline_sha256": manifest.visual_baseline_sha256,
+        "trusted_upstream_artifacts": trust_upstream_artifacts,
+    }
+    for name, expected in expected_identity.items():
+        if worker[name] != expected:
+            raise ValueError(f"worker summary identity mismatch: {name}")
+    if not isinstance(worker["device"], str) or not worker["device"]:
+        raise TypeError("worker device identity must be nonempty")
+    expected_summary = {
+        "variant": resolved_variant.value,
+        "completed_warmup_steps": latest.completed_warmup_steps,
+        "completed_joint_steps": latest.completed_joint_steps,
+        "best_step": latest.selector.best_step,
+        "stop_reason": latest.stop_reason,
+        "training_history": list(latest.training_history),
+        "validation_history": list(latest.validation_history),
+        "selector_state": latest.selector.state_dict(),
+        "stopper_state": latest.stopper.state_dict(),
+    }
+    for name, expected in expected_summary.items():
+        if summary[name] != expected:
+            raise ValueError(f"worker summary/checkpoint mismatch: {name}")
+    selected = next(
+        (
+            row["summary"]
+            for row in latest.validation_history
+            if row["step"] == latest.selector.best_step
+        ),
+        None,
+    )
+    if (
+        selected is None
+        or best.validation_summary != selected
+        or best.best_evaluation_summary != latest.best_evaluation_summary
+        or best.selector.best_step != latest.selector.best_step
+    ):
+        raise ValueError("worker best/latest selection mismatch")
+    curve_data = _read_bounded_regular_bytes(curve_path, MAX_CURVE_BYTES)
+    try:
+        reader = csv.DictReader(curve_data.decode("utf-8").splitlines())
+    except UnicodeError as error:
+        raise ValueError("training curve must be UTF-8") from error
+    expected_columns = [
+        "stage", "step", "sample_index", "total",
+        "audio_to_visual_grad_norm", "losses", "gradient_norms",
+    ]
+    if reader.fieldnames != expected_columns:
+        raise ValueError("training curve columns mismatch")
+    rows = list(reader)
+    if len(rows) != len(latest.training_history):
+        raise ValueError("training curve/checkpoint row count mismatch")
+    for actual, expected in zip(rows, latest.training_history, strict=True):
+        if (
+            actual["stage"] != expected["stage"]
+            or int(actual["step"]) != expected["step"]
+            or int(actual["sample_index"]) != expected["sample_index"]
+            or float(actual["total"]) != float(expected["total"])
+            or float(actual["audio_to_visual_grad_norm"])
+            != float(expected["audio_to_visual_grad_norm"])
+            or _strict_json_bytes(actual["losses"].encode(), "curve losses")
+            != expected["losses"]
+            or _strict_json_bytes(
+                actual["gradient_norms"].encode(), "curve gradients"
+            )
+            != expected["gradient_norms"]
+        ):
+            raise ValueError("training curve/checkpoint mismatch")
+    _finite(summary, "worker summary")
+    from avgaussianv2.experiment.report import _validate_worker
+
+    report_system = {
+        Variant.JOINT_CONDITIONED: "joint_conditioned_on",
+        Variant.FROZEN_VISUAL: "frozen_visual_on",
+        Variant.CONDITION_OFF: "condition_off",
+    }[resolved_variant]
+    _validate_worker(summary, report_system, manifest.scene_id)
+    for snapshot in (
+        *source_snapshots,
+        latest_snapshot,
+        best_snapshot,
+        summary_snapshot,
+        curve_snapshot,
+    ):
+        _verify_snapshot(snapshot)
+    return VerifiedWorkerOutput(
+        manifest=manifest,
+        summary=summary,
+        latest=latest,
+        best=best,
+        worker_summary_sha256=summary_snapshot.sha256,
+        latest_sha256=latest_snapshot.sha256,
+        best_sha256=best_snapshot.sha256,
+    )
+
+
+def verify_worker_resume_state(
+    config_path: str | Path,
+    shared_indices_path: str | Path,
+    visual_baseline_path: str | Path,
+    output_dir: str | Path,
+    variant: Variant | str,
+    *,
+    trust_upstream_artifacts: bool,
+) -> Any:
+    """Verify that an incomplete output is compatible with Task 7 resume."""
+    resolved_variant = Variant(variant)
+    config_source = Path(config_path)
+    config_bytes = _read_bounded_regular_bytes(config_source, MAX_SMALL_INPUT_BYTES)
+    config = load_project_config_bytes(config_bytes, base_dir=config_source.parent)
+    snapshots = (
+        _snapshot_file(config.paths.visual_checkpoint),
+        _snapshot_file(config.paths.audio_checkpoint),
+        _snapshot_file(config.paths.manifest),
+    )
+    manifest = load_worker_manifest(
+        shared_indices_path,
+        config_path=config_source,
+        config=config,
+        actual_source_hashes={
+            "project_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+            "visual_checkpoint_sha256": snapshots[0].sha256,
+            "audio_checkpoint_sha256": snapshots[1].sha256,
+            "dataset_manifest_sha256": snapshots[2].sha256,
+            "camera_mapping_sha256": hash_index_manifest(
+                config.scene.camera_mapping
+            ),
+        },
+    )
+    baseline = _validate_baseline(manifest, Path(visual_baseline_path))
+    expected_fingerprint = _expected_run_fingerprint(
+        manifest,
+        config,
+        baseline,
+        trust_upstream_artifacts=trust_upstream_artifacts,
+    )
+    state = inspect_pilot_checkpoint(
+        Path(output_dir) / "latest.pt",
+        expected_compatibility=manifest.compatibility_for(resolved_variant),
+        indices=manifest.indices_for(resolved_variant),
+        expected_run_fingerprint=expected_fingerprint,
+        active_resume=False,
+        allow_complete=True,
+    )
+    for snapshot in snapshots:
+        _verify_snapshot(snapshot)
+    return state
 
 
 RuntimeFactory = Callable[[ProjectConfig, torch.device], Any]

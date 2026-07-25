@@ -12,7 +12,6 @@ import hashlib
 import json
 import os
 import random
-import shutil
 import stat
 import subprocess
 import sys
@@ -33,6 +32,8 @@ from avgaussianv2.cli.pilot_worker import (
     build_worker_component_identities,
     load_worker_manifest,
     pilot_index_hash,
+    verify_worker_output,
+    verify_worker_resume_state,
 )
 from avgaussianv2.config import load_project_config_bytes
 from avgaussianv2.experiment.checkpoint import (
@@ -46,7 +47,7 @@ from avgaussianv2.experiment.report import (
     SystemReportInput,
     WorkerArtifactProvenance,
     build_comparison,
-    resolve_current_report,
+    verify_current_comparison,
 )
 
 
@@ -148,6 +149,14 @@ class PilotOrchestrationResult:
     durability_warnings: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class LaunchSpec:
+    name: str
+    command: tuple[str, ...]
+    gpu: int
+    log_path: Path
+
+
 def parse_gpus(value: str) -> tuple[int, int, int]:
     parts = value.split(",")
     if len(parts) != 3 or any(not part.isdigit() for part in parts):
@@ -208,11 +217,45 @@ def _sha(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _verify_output_ancestors(path: Path) -> None:
+    current = Path(path.anchor)
+    for part in path.parts[1:-1]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"pilot output parent is unsafe: {current}")
+
+
 def _atomic_json(path: Path, value: object) -> None:
     data = (
         json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False, allow_nan=False)
         + "\n"
     ).encode()
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(name)
+    try:
+        os.write(descriptor, data)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+        parent = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_bytes(path: Path, data: bytes) -> None:
     descriptor, name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
@@ -243,6 +286,7 @@ def _stage_status(
     report: str,
     report_digest: str | None = None,
     ready: bool | None = None,
+    durability_warnings: Sequence[str] | None = None,
 ) -> None:
     payload: dict[str, object] = {
         "schema": EXPERIMENT_SCHEMA,
@@ -258,6 +302,8 @@ def _stage_status(
         payload["report_digest"] = report_digest
     if ready is not None:
         payload["ready"] = ready
+    if durability_warnings is not None:
+        payload["durability_warnings"] = list(durability_warnings)
     _atomic_json(output / "status.json", payload)
 
 
@@ -300,6 +346,44 @@ def _wait_group(
         raise
     if failures:
         raise PilotProcessError(failures)
+
+
+def _launch_group(
+    runner: ProcessRunner, specs: Sequence[LaunchSpec]
+) -> None:
+    jobs: list[tuple[str, ProcessHandle, Path]] = []
+    try:
+        for spec in specs:
+            handle = runner.start(
+                spec.command,
+                env=_command_env(spec.gpu),
+                log_path=spec.log_path,
+            )
+            jobs.append((spec.name, handle, spec.log_path))
+    except (KeyboardInterrupt, SystemExit):
+        for _, handle, _ in jobs:
+            handle.terminate()
+        for _, handle, _ in jobs:
+            try:
+                handle.wait()
+            except BaseException:
+                pass
+        raise
+    except BaseException:
+        failures: list[tuple[str, int, Path]] = []
+        for _, handle, _ in jobs:
+            handle.terminate()
+        for name, handle, log in jobs:
+            try:
+                code = handle.wait()
+            except BaseException:
+                code = -1
+            if code:
+                failures.append((name, code, log))
+        failed_spec = specs[len(jobs)]
+        failures.append((failed_spec.name, -1, failed_spec.log_path))
+        raise PilotProcessError(failures)
+    _wait_group(jobs)
 
 
 def _command_env(gpu: int) -> dict[str, str]:
@@ -404,11 +488,12 @@ def _worker_provenance(
     )
 
 
-def _build_report(output: Path, eval_jobs: Mapping[Variant, EvaluationJobResult]) -> object:
-    baseline = _verify_existing(
-        output / "baseline",
-        (EvaluationSpec("baseline_imported", False),),
-    )
+def _report_inputs(
+    output: Path,
+    baseline: EvaluationJobResult,
+    eval_jobs: Mapping[Variant, EvaluationJobResult],
+    verified_workers: Mapping[Variant, object],
+) -> list[SystemReportInput]:
     inputs: list[SystemReportInput] = [
         SystemReportInput(
             "baseline_imported",
@@ -421,7 +506,7 @@ def _build_report(output: Path, eval_jobs: Mapping[Variant, EvaluationJobResult]
     for variant in VARIANT_GPU_ORDER:
         job = eval_jobs[variant]
         worker_dir = output / "workers" / variant.value
-        summary = json.loads(_read_regular(worker_dir / "worker_summary.json").decode())
+        summary = verified_workers[variant].summary
         worker_provenance = _worker_provenance(worker_dir, job)
         for evaluation, artifact in zip(job.evaluations, job.artifacts, strict=True):
             inputs.append(
@@ -435,7 +520,19 @@ def _build_report(output: Path, eval_jobs: Mapping[Variant, EvaluationJobResult]
             )
     if {item.name for item in inputs} != set(REQUIRED_SYSTEMS):
         raise ValueError("final report requires exactly five systems")
-    return build_comparison(inputs, output / "report")
+    return inputs
+
+
+def _build_report(
+    output: Path,
+    baseline: EvaluationJobResult,
+    eval_jobs: Mapping[Variant, EvaluationJobResult],
+    verified_workers: Mapping[Variant, object],
+) -> object:
+    return build_comparison(
+        _report_inputs(output, baseline, eval_jobs, verified_workers),
+        output / "report",
+    )
 
 
 def run_pilot(
@@ -464,6 +561,7 @@ def run_pilot(
     if config.scene.scene_id != "scene1_opera":
         raise ValueError("three-GPU pilot requires exact scene_id scene1_opera")
     output = Path(output_dir).absolute()
+    _verify_output_ancestors(output)
     if output.exists():
         metadata = output.lstat()
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
@@ -527,8 +625,14 @@ def run_pilot(
             ]
             if trust_upstream_artifacts:
                 command.append("--trust-upstream-artifacts")
+            if resume and baseline_dir.exists():
+                command.append("--resume")
             _run_one(runner, "baseline", command, gpus[0], logs / "baseline.log")
-        baseline_job = _verify_existing(baseline_dir, baseline_specs)
+        baseline_job = _verify_existing(
+            baseline_dir,
+            baseline_specs,
+            config_path=config_source,
+        )
         if not verify_only:
             _stage_status(
                 output,
@@ -545,7 +649,7 @@ def run_pilot(
         if not visual_baseline.exists():
             if verify_only:
                 raise FileNotFoundError("visual baseline binding is missing")
-            shutil.copyfile(baseline_summary_path, visual_baseline)
+            _atomic_bytes(visual_baseline, _read_regular(baseline_summary_path))
         elif _read_regular(visual_baseline) != _read_regular(baseline_summary_path):
             raise ValueError("visual baseline binding is corrupt")
 
@@ -599,16 +703,36 @@ def run_pilot(
         else:
             _atomic_json(experiment_path, experiment)
 
-        worker_jobs = []
+        worker_specs: list[LaunchSpec] = []
+        verified_workers: dict[Variant, object] = {}
         for variant, gpu in zip(VARIANT_GPU_ORDER, gpus, strict=True):
             worker_dir = workers_root / variant.value
-            complete = all(
-                (worker_dir / name).is_file()
-                for name in ("worker_summary.json", "latest.pt", "best.pt")
-            )
-            if complete:
-                continue
-            if verify_only:
+            has_entries = worker_dir.is_dir() and any(worker_dir.iterdir())
+            if has_entries:
+                try:
+                    verified_workers[variant] = verify_worker_output(
+                        config_source,
+                        shared_path,
+                        visual_baseline,
+                        worker_dir,
+                        variant,
+                        trust_upstream_artifacts=trust_upstream_artifacts,
+                    )
+                    continue
+                except Exception:
+                    if verify_only or not resume:
+                        raise
+                    if not (worker_dir / "latest.pt").is_file():
+                        raise
+                    verify_worker_resume_state(
+                        config_source,
+                        shared_path,
+                        visual_baseline,
+                        worker_dir,
+                        variant,
+                        trust_upstream_artifacts=trust_upstream_artifacts,
+                    )
+            elif verify_only:
                 raise FileNotFoundError(f"{variant.value} worker is incomplete")
             command = [
                 python, "-m", "avgaussianv2.cli.pilot_worker",
@@ -619,16 +743,25 @@ def run_pilot(
                 "--output-dir", str(worker_dir),
                 "--device", "cuda:0",
             ]
-            if resume and (worker_dir / "latest.pt").is_file():
+            if resume and has_entries:
                 command.append("--resume")
             if trust_upstream_artifacts:
                 command.append("--trust-upstream-artifacts")
             log = logs / f"worker-{variant.value}.log"
-            worker_jobs.append(
-                (variant.value, runner.start(command, env=_command_env(gpu), log_path=log), log)
+            worker_specs.append(
+                LaunchSpec(variant.value, tuple(command), gpu, log)
             )
-        if worker_jobs:
-            _wait_group(worker_jobs)
+        if worker_specs:
+            _launch_group(runner, worker_specs)
+        for variant in VARIANT_GPU_ORDER:
+            verified_workers[variant] = verify_worker_output(
+                config_source,
+                shared_path,
+                visual_baseline,
+                workers_root / variant.value,
+                variant,
+                trust_upstream_artifacts=trust_upstream_artifacts,
+            )
         if not verify_only:
             _stage_status(
                 output,
@@ -639,12 +772,18 @@ def run_pilot(
             )
 
         eval_jobs: dict[Variant, EvaluationJobResult] = {}
-        pending = []
+        pending: list[LaunchSpec] = []
         for variant, gpu in zip(VARIANT_GPU_ORDER, gpus, strict=True):
             destination = eval_root / variant.value
             specs = EVAL_SPECS[variant]
             if (destination / "evaluation_manifest.json").is_file():
-                eval_jobs[variant] = _verify_existing(destination, specs)
+                eval_jobs[variant] = _verify_existing(
+                    destination,
+                    specs,
+                    config_path=config_source,
+                    shared_manifest=shared_path,
+                    variant=variant,
+                )
                 continue
             if verify_only:
                 raise FileNotFoundError(f"{variant.value} final evaluation is incomplete")
@@ -663,15 +802,21 @@ def run_pilot(
                 )
             if trust_upstream_artifacts:
                 command.append("--trust-upstream-artifacts")
+            if resume and destination.exists():
+                command.append("--resume")
             log = logs / f"eval-{variant.value}.log"
             pending.append(
-                (variant.value, runner.start(command, env=_command_env(gpu), log_path=log), log)
+                LaunchSpec(variant.value, tuple(command), gpu, log)
             )
         if pending:
-            _wait_group(pending)
+            _launch_group(runner, pending)
             for variant in VARIANT_GPU_ORDER:
                 eval_jobs[variant] = _verify_existing(
-                    eval_root / variant.value, EVAL_SPECS[variant]
+                    eval_root / variant.value,
+                    EVAL_SPECS[variant],
+                    config_path=config_source,
+                    shared_manifest=shared_path,
+                    variant=variant,
                 )
         if not verify_only:
             _stage_status(
@@ -682,29 +827,54 @@ def run_pilot(
                 report="pending",
             )
 
+        if _read_regular(config_source) != config_bytes:
+            raise ValueError("project config changed during orchestration")
+        if _source_hashes(config_bytes, config) != desired_shared["source_hashes"]:
+            raise ValueError("upstream source changed during orchestration")
+        if load_worker_manifest(
+            shared_path, config_path=config_source, config=config
+        ).sha256 != loaded.sha256:
+            raise ValueError("shared manifest changed during orchestration")
+
         if verify_only:
-            for variant in VARIANT_GPU_ORDER:
-                _worker_provenance(
-                    workers_root / variant.value, eval_jobs[variant]
-                )
-            report = resolve_current_report(
-                output / "report", include_warnings=True
+            comparison = verify_current_comparison(
+                _report_inputs(
+                    output, baseline_job, eval_jobs, verified_workers
+                ),
+                output / "report",
             )
             status_path = output / "status.json"
             status = json.loads(_read_regular(status_path).decode())
-            report_summary = json.loads(
-                _read_regular(report.generation_path / "comparison.json").decode()
-            )
-            if status.get("report_digest") != report.generation_path.name:
+            if set(status) != {
+                "schema", "version", "stages", "report_digest", "ready",
+                "durability_warnings",
+            }:
+                raise ValueError("status fields mismatch")
+            if status["schema"] != EXPERIMENT_SCHEMA or status["version"] != EXPERIMENT_VERSION:
+                raise ValueError("status schema/version mismatch")
+            if status["stages"] != {
+                "baseline": "complete",
+                "workers": "complete",
+                "evaluations": "complete",
+                "report": "complete",
+            }:
+                raise ValueError("status stages are incomplete")
+            if status.get("report_digest") != comparison.content_digest:
                 raise ValueError("status/report digest mismatch")
-            ready = bool(report_summary["decision"]["ready"])
+            ready = comparison.decision.ready
             if status.get("ready") is not ready:
                 raise ValueError("status/report decision mismatch")
+            if status["durability_warnings"] != list(
+                comparison.durability_warnings
+            ):
+                raise ValueError("status/report durability warnings mismatch")
             return PilotOrchestrationResult(
-                experiment_path.resolve(), report.generation_path, ready,
-                report.durability_warnings,
+                experiment_path.resolve(), comparison.generation_path, ready,
+                comparison.durability_warnings,
             )
-        comparison = _build_report(output, eval_jobs)
+        comparison = _build_report(
+            output, baseline_job, eval_jobs, verified_workers
+        )
         _stage_status(
             output,
             baseline="complete",
@@ -713,6 +883,7 @@ def run_pilot(
             report="complete",
             report_digest=comparison.content_digest,
             ready=comparison.decision.ready,
+            durability_warnings=comparison.durability_warnings,
         )
         return PilotOrchestrationResult(
             experiment_path.resolve(),

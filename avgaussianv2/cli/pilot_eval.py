@@ -16,7 +16,7 @@ import shutil
 import stat
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,7 @@ from avgaussianv2.experiment.report import (
     EvaluationProvenance,
     build_evaluation_manifest_sha256,
     build_evaluation_run_id,
+    _validate_evaluation,
 )
 
 
@@ -48,7 +49,7 @@ _CONDITIONS = {
 _JOB_FIELDS = {
     "schema", "version", "scene_id", "camera", "config_sha256",
     "source_hashes", "condition_specs", "train_length", "eval_length",
-    "runtime_identity", "systems",
+    "runtime_identity", "shared_manifest", "variant", "systems",
 }
 _SYSTEM_FIELDS = {
     "metrics_per_sample_path", "metrics_per_sample_sha256",
@@ -75,6 +76,16 @@ class EvaluationJobResult:
     manifest_path: Path
     artifacts: tuple[EvaluationArtifactProvenance, ...]
     evaluations: tuple[EvaluationResult, ...]
+
+
+@dataclass(frozen=True)
+class SourceSnapshot:
+    path: Path
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    sha256: str
 
 
 def parse_evaluation_spec(value: str) -> EvaluationSpec:
@@ -150,6 +161,27 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _snapshot(path: Path) -> SourceSnapshot:
+    original = path.lstat()
+    if stat.S_ISLNK(original.st_mode) or not stat.S_ISREG(original.st_mode):
+        raise ValueError(f"source must be a non-symlink regular file: {path}")
+    resolved = path.resolve(strict=True)
+    metadata = resolved.lstat()
+    return SourceSnapshot(
+        resolved,
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        _sha256_file(resolved),
+    )
+
+
+def _verify_snapshot(snapshot: SourceSnapshot) -> None:
+    if _snapshot(snapshot.path) != snapshot:
+        raise ValueError(f"source changed during evaluation: {snapshot.path}")
+
+
 def _atomic_json(path: Path, value: object) -> None:
     text = json.dumps(
         value, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False
@@ -190,6 +222,15 @@ def _strict_json(path: Path) -> Mapping[str, object]:
 
 
 def _preflight_output(output: Path, *, resume: bool, overwrite: bool) -> None:
+    current = Path(output.anchor)
+    for part in output.parts[1:-1]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"output parent is unsafe: {current}")
     if output.exists():
         metadata = output.lstat()
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
@@ -197,28 +238,91 @@ def _preflight_output(output: Path, *, resume: bool, overwrite: bool) -> None:
         entries = [item for item in output.iterdir() if item.name != ".evaluation.lock"]
         if entries and not (resume or overwrite):
             raise FileExistsError(f"evaluation output is nonempty: {output}")
-        if overwrite and entries:
-            for item in entries:
-                metadata = item.lstat()
-                if stat.S_ISLNK(metadata.st_mode):
-                    raise ValueError(f"overwrite refuses unsafe symlink: {item}")
-            for item in entries:
-                if item.is_dir():
-                    shutil.rmtree(item)
-                else:
-                    item.unlink()
     else:
         output.mkdir(parents=True)
 
 
 def _verify_existing(
-    output: Path, expected_specs: Sequence[EvaluationSpec]
+    output: Path,
+    expected_specs: Sequence[EvaluationSpec],
+    *,
+    config_path: Path | None = None,
+    shared_manifest: Path | None = None,
+    variant: Variant | None = None,
 ) -> EvaluationJobResult:
     raw = _strict_json(output / "evaluation_manifest.json")
     if set(raw) != _JOB_FIELDS:
         raise ValueError("evaluation manifest fields mismatch")
     if raw.get("schema") != JOB_SCHEMA or raw.get("version") != JOB_VERSION:
         raise ValueError("evaluation manifest schema/version mismatch")
+    runtime_identity = raw["runtime_identity"]
+    if (
+        not isinstance(runtime_identity, Mapping)
+        or set(runtime_identity) != {"model_class", "model_format_version"}
+        or any(
+            not isinstance(runtime_identity[name], str) or not runtime_identity[name]
+            for name in runtime_identity
+        )
+    ):
+        raise ValueError("evaluation runtime identity is invalid")
+    if (
+        isinstance(raw["train_length"], bool)
+        or not isinstance(raw["train_length"], int)
+        or raw["train_length"] <= 0
+        or isinstance(raw["eval_length"], bool)
+        or not isinstance(raw["eval_length"], int)
+        or raw["eval_length"] <= 0
+    ):
+        raise ValueError("evaluation dataset lengths are invalid")
+    expected_baseline_path: Path | None = None
+    if config_path is not None:
+        config_bytes = _read_regular(config_path)
+        config = load_project_config_bytes(config_bytes, base_dir=config_path.parent)
+        if raw["scene_id"] != config.scene.scene_id:
+            raise ValueError("evaluation scene identity mismatch")
+        if raw["config_sha256"] != hashlib.sha256(config_bytes).hexdigest():
+            raise ValueError("evaluation config hash mismatch")
+        actual_sources = {
+            "project_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+            "dataset_manifest_sha256": _sha256_file(
+                config.paths.manifest.resolve(strict=True)
+            ),
+            "visual_checkpoint_sha256": _sha256_file(
+                config.paths.visual_checkpoint.resolve(strict=True)
+            ),
+            "audio_checkpoint_sha256": _sha256_file(
+                config.paths.audio_checkpoint.resolve(strict=True)
+            ),
+            "camera_mapping_sha256": hash_index_manifest(config.scene.camera_mapping),
+        }
+        if raw["source_hashes"] != actual_sources:
+            raise ValueError("evaluation source hashes mismatch")
+        expected_baseline_path = config.paths.visual_checkpoint.resolve(strict=True)
+    expected_shared = (
+        None
+        if shared_manifest is None
+        else {
+            "path": str(shared_manifest.resolve(strict=True)),
+            "sha256": _sha256_file(shared_manifest.resolve(strict=True)),
+        }
+    )
+    if raw["shared_manifest"] != expected_shared:
+        raise ValueError("evaluation shared manifest identity mismatch")
+    if raw["variant"] != (None if variant is None else variant.value):
+        raise ValueError("evaluation variant identity mismatch")
+    if shared_manifest is not None:
+        shared = _strict_json(shared_manifest)
+        if (
+            raw["scene_id"] != shared.get("scene_id")
+            or raw["source_hashes"] != shared.get("source_hashes")
+            or raw["runtime_identity"] != shared.get("runtime_identity")
+            or {
+                "train": raw["train_length"],
+                "eval": raw["eval_length"],
+            }
+            != shared.get("dataset_lengths")
+        ):
+            raise ValueError("evaluation/shared runtime identity mismatch")
     recorded = tuple(
         EvaluationSpec(str(item["system_name"]), bool(item["condition_enabled"]))
         for item in raw.get("systems", [])
@@ -226,6 +330,10 @@ def _verify_existing(
     )
     if recorded != tuple(expected_specs):
         raise ValueError("existing evaluation systems mismatch")
+    if raw["condition_specs"] != [
+        asdict(spec) for spec in expected_specs
+    ]:
+        raise ValueError("evaluation condition specs mismatch")
     artifacts: list[EvaluationArtifactProvenance] = []
     evaluations: list[EvaluationResult] = []
     for item in raw["systems"]:
@@ -236,6 +344,11 @@ def _verify_existing(
         system_dir = output / str(item["system_name"])
         rows_path = system_dir / "metrics_per_sample.jsonl"
         summary_path = system_dir / "metrics_summary.json"
+        if (
+            Path(str(item["metrics_per_sample_path"])) != rows_path.resolve()
+            or Path(str(item["metrics_summary_path"])) != summary_path.resolve()
+        ):
+            raise ValueError(f"{item['system_name']} artifact path mismatch")
         if _sha256_file(rows_path) != item["metrics_per_sample_sha256"]:
             raise ValueError(f"{item['system_name']} rows hash mismatch")
         if _sha256_file(summary_path) != item["metrics_summary_sha256"]:
@@ -245,10 +358,25 @@ def _verify_existing(
         count = int(item["count"])
         if count != len(rows) or count != int(raw["eval_length"]):
             raise ValueError(f"{item['system_name']} is not a full-heldout evaluation")
+        expected_indices = tuple(range(int(raw["eval_length"])))
+        if tuple(item["evaluation_indices"]) != expected_indices:
+            raise ValueError(f"{item['system_name']} evaluation indices mismatch")
+        if item["evaluation_indices_hash"] != hash_index_manifest(
+            list(expected_indices)
+        ):
+            raise ValueError(f"{item['system_name']} index hash mismatch")
         if not _finite_tree((rows, summary)):
             raise ValueError(f"{item['system_name']} contains non-finite values")
         provenance = _artifact_from_json(item, output)
         checkpoint = provenance.checkpoint
+        if (
+            checkpoint.condition_enabled != provenance.condition_enabled
+            or checkpoint.evaluation_run_id != provenance.evaluation_run_id
+            or checkpoint.evaluation_indices_hash
+            != provenance.evaluation_indices_hash
+            or checkpoint.scene_id != raw["scene_id"]
+        ):
+            raise ValueError(f"{item['system_name']} nested provenance mismatch")
         if _sha256_file(checkpoint.checkpoint_path) != checkpoint.checkpoint_sha256:
             raise ValueError(f"{item['system_name']} checkpoint hash mismatch")
         expected_run_id = build_evaluation_run_id(
@@ -287,15 +415,93 @@ def _verify_existing(
                 or state.generation != checkpoint.checkpoint_generation
             ):
                 raise ValueError(f"{item['system_name']} best checkpoint mismatch")
-        artifacts.append(provenance)
-        evaluations.append(
-            EvaluationResult(str(item["system_name"]), count, rows, summary)
+        else:
+            expected_inputs = {
+                "kind": "imported_visual_baseline",
+                "scene_id": raw["scene_id"],
+                "visual_checkpoint_sha256": raw["source_hashes"][
+                    "visual_checkpoint_sha256"
+                ],
+                "audio_checkpoint_sha256": raw["source_hashes"][
+                    "audio_checkpoint_sha256"
+                ],
+                "project_config_sha256": raw["config_sha256"],
+                "runtime_identity": dict(runtime_identity),
+            }
+            expected_fingerprint = {
+                "algorithm": "avgaussianv2-imported-baseline-v1",
+                "sha256": hash_index_manifest(expected_inputs),
+                "inputs": expected_inputs,
+            }
+            if (
+                checkpoint.checkpoint_generation != 0
+                or checkpoint.compatibility is not None
+                or checkpoint.variant_indices is not None
+                or checkpoint.pilot_config is not None
+                or checkpoint.run_fingerprint != expected_fingerprint
+                or (
+                    expected_baseline_path is not None
+                    and checkpoint.checkpoint_path != expected_baseline_path
+                )
+            ):
+                raise ValueError("baseline imported-artifact identity mismatch")
+        evaluation = EvaluationResult(
+            str(item["system_name"]), count, rows, summary
         )
+        _validate_evaluation(evaluation, str(item["system_name"]))
+        artifacts.append(provenance)
+        evaluations.append(evaluation)
     return EvaluationJobResult(
         (output / "evaluation_manifest.json").resolve(),
         tuple(artifacts),
         tuple(evaluations),
     )
+
+
+def _clean_owned_partial(output: Path, specs: Sequence[EvaluationSpec]) -> None:
+    allowed = {".evaluation.lock"}
+    allowed.update(spec.system_name for spec in specs)
+    for item in output.iterdir():
+        if item.name in allowed:
+            continue
+        if item.name.startswith(".evaluation_manifest.") and item.name.endswith(".tmp"):
+            item.unlink()
+            continue
+        raise ValueError(f"resume refuses unrelated evaluation output: {item.name}")
+    for spec in specs:
+        item = output / spec.system_name
+        if not item.exists():
+            continue
+        metadata = item.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"partial system output is unsafe: {item}")
+        for child in item.iterdir():
+            known = child.name in {
+                ".metrics-publication.lock",
+                "metrics_per_sample.jsonl",
+                "metrics_summary.json",
+            } or (
+                child.name.startswith(
+                    (".metrics_per_sample.jsonl.", ".metrics_summary.json.")
+                )
+                and child.name.endswith((".tmp", ".backup", ".restore"))
+            )
+            if child.is_symlink() or not known:
+                raise ValueError(f"partial system output is not owned: {child}")
+        shutil.rmtree(item)
+
+
+def _clean_overwrite(output: Path) -> None:
+    entries = [item for item in output.iterdir() if item.name != ".evaluation.lock"]
+    for item in entries:
+        metadata = item.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"overwrite refuses unsafe symlink: {item}")
+    for item in entries:
+        if item.is_dir():
+            shutil.rmtree(item)
+        else:
+            item.unlink()
 
 
 def _finite_tree(value: object) -> bool:
@@ -384,6 +590,8 @@ def run_evaluation(
     )
     if not specs or len({item.system_name for item in specs}) != len(specs):
         raise ValueError("evaluation systems must be nonempty and unique")
+    if resume and overwrite:
+        raise ValueError("--resume and --overwrite are mutually exclusive")
     for item in specs:
         if _CONDITIONS.get(item.system_name) is not item.condition_enabled:
             raise ValueError(f"invalid condition matrix for {item.system_name}")
@@ -423,7 +631,8 @@ def run_evaluation(
             raise ValueError(f"CUDA device is unavailable: {device}")
 
     config_source = Path(config_path)
-    config_bytes = _read_regular(config_source)
+    config_snapshot = _snapshot(config_source)
+    config_bytes = _read_regular(config_snapshot.path)
     config = load_project_config_bytes(config_bytes, base_dir=config_source.parent)
     checkpoint_state = None
     compatibility = variant_indices = pilot_config = None
@@ -432,17 +641,30 @@ def run_evaluation(
     checkpoint_generation: int
     fingerprint: Mapping[str, object]
     baseline_audio_sha: str | None = None
+    dataset_snapshot = _snapshot(config.paths.manifest)
+    visual_snapshot = _snapshot(config.paths.visual_checkpoint)
+    audio_snapshot = _snapshot(config.paths.audio_checkpoint)
+    shared_snapshot = None if manifest is None else _snapshot(Path(manifest))
+    source_snapshots = (
+        config_snapshot, dataset_snapshot, visual_snapshot, audio_snapshot,
+        *((shared_snapshot,) if shared_snapshot is not None else ()),
+    )
+    config = replace(
+        config,
+        paths=replace(
+            config.paths,
+            manifest=dataset_snapshot.path,
+            visual_checkpoint=visual_snapshot.path,
+            audio_checkpoint=audio_snapshot.path,
+        ),
+    )
     if checkpoint is None:
-        checkpoint_path = config.paths.visual_checkpoint.resolve(strict=True)
-        checkpoint_sha = _sha256_file(checkpoint_path)
-        baseline_audio_sha = _sha256_file(
-            config.paths.audio_checkpoint.resolve(strict=True)
-        )
+        checkpoint_path = visual_snapshot.path
+        checkpoint_sha = visual_snapshot.sha256
+        baseline_audio_sha = audio_snapshot.sha256
         source_hashes = {
             "project_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
-            "dataset_manifest_sha256": _sha256_file(
-                config.paths.manifest.resolve(strict=True)
-            ),
+            "dataset_manifest_sha256": dataset_snapshot.sha256,
             "visual_checkpoint_sha256": checkpoint_sha,
             "audio_checkpoint_sha256": baseline_audio_sha,
             "camera_mapping_sha256": hash_index_manifest(
@@ -453,7 +675,7 @@ def run_evaluation(
         from avgaussianv2.cli.pilot_worker import load_worker_manifest
 
         worker_manifest = load_worker_manifest(
-            manifest, config_path=config_source, config=config
+            shared_snapshot.path, config_path=config_snapshot.path, config=config
         )
         resolved_variant = Variant(variant)
         compatibility = worker_manifest.compatibility[resolved_variant]
@@ -462,8 +684,10 @@ def run_evaluation(
         )
         pilot_config = worker_manifest.pilot_config
         source_hashes = dict(worker_manifest.source_hashes)
-        checkpoint_path = Path(checkpoint).resolve(strict=True)
-        checkpoint_sha = _sha256_file(checkpoint_path)
+        checkpoint_snapshot = _snapshot(Path(checkpoint))
+        source_snapshots = (*source_snapshots, checkpoint_snapshot)
+        checkpoint_path = checkpoint_snapshot.path
+        checkpoint_sha = checkpoint_snapshot.sha256
         checkpoint_state = inspect_pilot_checkpoint(
             checkpoint_path,
             expected_compatibility=compatibility,
@@ -487,8 +711,21 @@ def run_evaluation(
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise RuntimeError("evaluation output already has an active writer") from error
+        if overwrite:
+            _clean_overwrite(output)
         if resume:
-            return _verify_existing(output, specs)
+            manifest_path = output / "evaluation_manifest.json"
+            if manifest_path.exists():
+                return _verify_existing(
+                    output,
+                    specs,
+                    config_path=config_snapshot.path,
+                    shared_manifest=(
+                        None if shared_snapshot is None else shared_snapshot.path
+                    ),
+                    variant=(None if variant is None else Variant(variant)),
+                )
+            _clean_owned_partial(output, specs)
 
         if runtime_factory is None:
             from avgaussianv2.runtime import build_runtime
@@ -570,6 +807,8 @@ def run_evaluation(
                 spec.condition_enabled,
                 system_dir,
             )
+            for snapshot in source_snapshots:
+                _verify_snapshot(snapshot)
             if result.count != len(indices) or not _finite_tree(asdict(result)):
                 raise ValueError("evaluator did not produce a finite full-heldout result")
             rows_path = system_dir / "metrics_per_sample.jsonl"
@@ -651,8 +890,19 @@ def run_evaluation(
                     getattr(bundle.model, "checkpoint_format_version", "state-dict-v1")
                 ),
             },
+            "shared_manifest": (
+                None
+                if shared_snapshot is None
+                else {
+                    "path": str(shared_snapshot.path),
+                    "sha256": shared_snapshot.sha256,
+                }
+            ),
+            "variant": None if variant is None else Variant(variant).value,
             "systems": system_records,
         }
+        for snapshot in source_snapshots:
+            _verify_snapshot(snapshot)
         manifest_path = output / "evaluation_manifest.json"
         _atomic_json(manifest_path, job)
         return EvaluationJobResult(
@@ -678,8 +928,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--overwrite", action="store_true")
+    policy = parser.add_mutually_exclusive_group()
+    policy.add_argument("--resume", action="store_true")
+    policy.add_argument("--overwrite", action="store_true")
     parser.add_argument("--trust-upstream-artifacts", action="store_true")
     return parser
 

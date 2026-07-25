@@ -1557,3 +1557,25 @@ def test_unsafe_existing_current_pointer_is_rejected(tmp_path):
     (report_dir / "current").symlink_to("/tmp")
     with pytest.raises(ValueError, match="current pointer is unsafe"):
         build_comparison(_ready_systems(tmp_path), report_dir)
+
+
+def test_verify_current_comparison_is_semantic_and_read_only(tmp_path):
+    from avgaussianv2.experiment.report import verify_current_comparison
+
+    systems = _ready_systems(tmp_path)
+    report_dir = tmp_path / "report"
+    built = build_comparison(systems, report_dir)
+    pointer = report_dir / "current"
+    before = pointer.lstat()
+
+    verified = verify_current_comparison(systems, report_dir)
+
+    after = pointer.lstat()
+    assert verified.content_digest == built.content_digest
+    assert verified.decision == built.decision
+    assert verified.systems == built.systems
+    assert (before.st_dev, before.st_ino, before.st_mtime_ns) == (
+        after.st_dev,
+        after.st_ino,
+        after.st_mtime_ns,
+    )

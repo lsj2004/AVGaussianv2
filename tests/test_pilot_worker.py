@@ -608,6 +608,50 @@ def test_worker_runs_exact_variant_and_writes_inspectable_outputs(
     assert summary["worker"]["device"] == "cpu"
 
 
+def test_zero_runtime_worker_output_verifier_binds_every_artifact(tmp_path) -> None:
+    from avgaussianv2.cli.pilot_worker import run_worker, verify_worker_output
+
+    config, manifest, baseline, _ = _manifest_files(tmp_path)
+    output = tmp_path / "run"
+    run_worker(
+        config,
+        Variant.FROZEN_VISUAL,
+        manifest,
+        baseline,
+        output,
+        device="cpu",
+        runtime_factory=_fake_runtime,
+        evaluator_factory=_FeasibleEvaluator,
+    )
+
+    verified = verify_worker_output(
+        config,
+        manifest,
+        baseline,
+        output,
+        Variant.FROZEN_VISUAL,
+        trust_upstream_artifacts=False,
+    )
+    assert verified.latest.stage == "complete"
+    assert verified.best.generation == verified.latest.best_generation
+    assert verified.summary["training_history"] == list(
+        verified.latest.training_history
+    )
+
+    summary = json.loads((output / "worker_summary.json").read_text())
+    summary["completed_joint_steps"] += 1
+    (output / "worker_summary.json").write_text(json.dumps(summary))
+    with pytest.raises(ValueError, match="summary/checkpoint"):
+        verify_worker_output(
+            config,
+            manifest,
+            baseline,
+            output,
+            Variant.FROZEN_VISUAL,
+            trust_upstream_artifacts=False,
+        )
+
+
 def test_worker_resumes_interrupted_run_exactly_and_complete_is_finalize_only(
     tmp_path,
 ) -> None:
