@@ -4,6 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+import json
+import os
 
 import pytest
 
@@ -186,3 +188,120 @@ def test_owned_partial_resume_restarts_but_source_mutation_is_rejected(tmp_path)
             )
     finally:
         _Evaluator.mutate = None
+
+
+@pytest.mark.parametrize(
+    "mutate,match",
+    [
+        (lambda value: value["systems"][0].__setitem__("count", "3"), "integer"),
+        (
+            lambda value: value["systems"][0]["checkpoint"].__setitem__(
+                "checkpoint_generation", False
+            ),
+            "integer",
+        ),
+        (
+            lambda value: value["systems"][0].__setitem__("system_name", 7),
+            "string",
+        ),
+        (
+            lambda value: value["systems"][0].__setitem__(
+                "metrics_summary_sha256", 7
+            ),
+            "string",
+        ),
+        (
+            lambda value: value["systems"][0].__setitem__(
+                "metrics_summary_path", "relative.json"
+            ),
+            "absolute",
+        ),
+    ],
+)
+def test_resume_rejects_json_type_coercion_before_runtime(
+    tmp_path, mutate, match
+) -> None:
+    config, _ = _config(tmp_path)
+    output = tmp_path / "evaluation"
+    run_evaluation(
+        config,
+        output,
+        ("baseline_imported:off",),
+        device="cpu",
+        runtime_factory=_runtime,
+        evaluator_factory=_Evaluator,
+    )
+    manifest = output / "evaluation_manifest.json"
+    value = json.loads(manifest.read_text())
+    mutate(value)
+    manifest.write_text(json.dumps(value))
+    with pytest.raises((TypeError, ValueError), match=match):
+        run_evaluation(
+            config,
+            output,
+            ("baseline_imported:off",),
+            device="cpu",
+            resume=True,
+            runtime_factory=lambda *_: pytest.fail("verification built a runtime"),
+            evaluator_factory=_Evaluator,
+        )
+
+
+def test_resume_rejects_wrong_camera_even_when_rows_are_coherently_resigned(
+    tmp_path,
+) -> None:
+    config, _ = _config(tmp_path)
+    output = tmp_path / "evaluation"
+    run_evaluation(
+        config,
+        output,
+        ("baseline_imported:off",),
+        device="cpu",
+        runtime_factory=_runtime,
+        evaluator_factory=_Evaluator,
+    )
+    manifest = output / "evaluation_manifest.json"
+    value = json.loads(manifest.read_text())
+    value["camera"] = ["cam09"]
+    manifest.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="camera identity"):
+        run_evaluation(
+            config,
+            output,
+            ("baseline_imported:off",),
+            device="cpu",
+            resume=True,
+            runtime_factory=lambda *_: pytest.fail("verification built a runtime"),
+            evaluator_factory=_Evaluator,
+        )
+
+
+@pytest.mark.parametrize("kind", ["directory", "hardlink", "symlink"])
+def test_partial_resume_refuses_unsafe_recognized_metric_entry(
+    tmp_path, kind
+) -> None:
+    config, _ = _config(tmp_path)
+    output = tmp_path / "evaluation"
+    system = output / "baseline_imported"
+    system.mkdir(parents=True)
+    target = tmp_path / "target"
+    target.write_text("keep")
+    entry = system / "metrics_summary.json"
+    if kind == "directory":
+        entry.mkdir()
+    elif kind == "hardlink":
+        os.link(target, entry)
+    else:
+        entry.symlink_to(target)
+    with pytest.raises(ValueError, match="unsafe"):
+        run_evaluation(
+            config,
+            output,
+            ("baseline_imported:off",),
+            device="cpu",
+            resume=True,
+            runtime_factory=lambda *_: pytest.fail("unsafe cleanup built a runtime"),
+            evaluator_factory=_Evaluator,
+        )
+    assert target.read_text() == "keep"
+    assert entry.exists() or entry.is_symlink()

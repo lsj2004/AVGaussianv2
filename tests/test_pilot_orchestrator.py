@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +16,7 @@ from avgaussianv2.cli.pilot import (
     _shared_indices,
     _wait_group,
     parse_gpus,
+    run_pilot,
 )
 from avgaussianv2.cli.pilot_worker import build_worker_component_identities
 from avgaussianv2.experiment.contracts import PilotConfig, Variant
@@ -146,3 +150,214 @@ def test_shared_sequences_are_deterministic_and_condition_off_has_no_warmup() ->
     assert first.for_variant(Variant.CONDITION_OFF).joint == first.joint
     assert _evenly_spaced(100, 32) == _evenly_spaced(100, 32)
     assert _evenly_spaced(3, 32) == (0, 1, 2)
+
+
+def _verify_config(tmp_path):
+    for name in ("visual.pt", "audio.pt", "dataset.json"):
+        (tmp_path / name).write_text(name)
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"""
+scene:
+  id: scene1_opera
+  fps: 20
+  train_cameras: [cam00]
+  eval_cameras: [cam10]
+  camera_mapping: {{cam00: 0, cam10: 10}}
+paths:
+  visual_upstream_root: {tmp_path}
+  audio_upstream_root: {tmp_path}
+  visual_checkpoint: {tmp_path / "visual.pt"}
+  audio_checkpoint: {tmp_path / "audio.pt"}
+  manifest: {tmp_path / "dataset.json"}
+model: {{}}
+train: {{seed: 7}}
+"""
+    )
+    return config
+
+
+def test_verify_only_derives_trusted_run_identity_without_cli_permission(tmp_path) -> None:
+    config = _verify_config(tmp_path)
+    output = tmp_path / "run"
+    output.mkdir()
+    (output / "experiment_manifest.json").write_text(
+        json.dumps({"trusted_upstream_artifacts": True})
+    )
+    (output / ".pilot-parent.lock").write_text("")
+
+    class Runner:
+        assignments = []
+
+        def start(self, *args, **kwargs):
+            pytest.fail("verify-only started a process")
+
+    before = set(output.iterdir())
+    with pytest.raises(FileNotFoundError, match="existing directory"):
+        run_pilot(
+            config,
+            output,
+            verify_only=True,
+            runner=Runner(),
+        )
+    assert set(output.iterdir()) == before
+    assert Runner.assignments == []
+
+    (output / "experiment_manifest.json").write_text(
+        json.dumps({"trusted_upstream_artifacts": "true"})
+    )
+    with pytest.raises(TypeError, match="must be boolean"):
+        run_pilot(
+            config,
+            output,
+            verify_only=True,
+            runner=Runner(),
+        )
+
+
+def test_run_pilot_sequences_baseline_workers_and_evaluations(
+    tmp_path, monkeypatch
+) -> None:
+    import avgaussianv2.cli.pilot as pilot_module
+    from avgaussianv2.experiment.evaluation import METRIC_NAMES
+
+    config = _verify_config(tmp_path)
+    output = tmp_path / "pilot"
+    events = []
+    assignments = []
+    baseline_summary = {
+        metric: {"mean": 0.5, "std": 0.0, "median": 0.5}
+        for metric in METRIC_NAMES
+    }
+    baseline_summary["rgb_psnr"]["mean"] = 30.0
+    baseline_summary["rgb_psnr"]["median"] = 30.0
+    baseline_summary["rgb_ssim"]["mean"] = 0.95
+    baseline_summary["rgb_ssim"]["median"] = 0.95
+
+    class Handle:
+        def __init__(self, command):
+            self.command = command
+
+        def terminate(self):
+            events.append(("terminate", tuple(self.command)))
+
+        def wait(self):
+            module = self.command[2]
+            events.append(("wait", module, tuple(self.command)))
+            destination = Path(
+                self.command[self.command.index("--output-dir") + 1]
+            )
+            destination.mkdir(parents=True, exist_ok=True)
+            if module == "avgaussianv2.cli.pilot_eval":
+                (destination / "evaluation_manifest.json").write_text("{}")
+                if "--checkpoint" not in self.command:
+                    system = destination / "baseline_imported"
+                    system.mkdir(exist_ok=True)
+                    (system / "metrics_summary.json").write_text(
+                        json.dumps(baseline_summary)
+                    )
+            else:
+                (destination / "complete.marker").write_text("ok")
+            return 0
+
+    class Runner:
+        def start(self, command, *, env, log_path):
+            command = tuple(command)
+            module = command[2]
+            if module == "avgaussianv2.cli.pilot_worker":
+                assert any(
+                    event[:2] == ("wait", "avgaussianv2.cli.pilot_eval")
+                    for event in events
+                ), "worker started before baseline completed"
+            assignments.append((command, dict(env), log_path))
+            events.append(("start", module, command))
+            return Handle(command)
+
+    def verified_eval(destination, specs, **kwargs):
+        assert (destination / "evaluation_manifest.json").is_file()
+        return SimpleNamespace(
+            manifest_path=destination / "evaluation_manifest.json",
+            artifacts=(),
+            evaluations=(),
+        )
+
+    def verified_worker(*args, **kwargs):
+        worker_dir = Path(args[3])
+        assert (worker_dir / "complete.marker").is_file()
+        return SimpleNamespace(summary={})
+
+    monkeypatch.setattr(pilot_module, "_verify_existing", verified_eval)
+    monkeypatch.setattr(pilot_module, "verify_worker_output", verified_worker)
+    monkeypatch.setattr(
+        pilot_module,
+        "load_worker_manifest",
+        lambda *args, **kwargs: SimpleNamespace(sha256="a" * 64),
+    )
+    monkeypatch.setattr(
+        pilot_module,
+        "_build_report",
+        lambda *args, **kwargs: SimpleNamespace(
+            content_digest="b" * 64,
+            generation_path=output / "report-generation",
+            decision=SimpleNamespace(ready=True),
+            durability_warnings=(),
+        ),
+    )
+
+    # The baseline manifest drives deterministic shared-manifest construction.
+    original_wait = Handle.wait
+
+    def wait_with_baseline_manifest(self):
+        code = original_wait(self)
+        if (
+            self.command[2] == "avgaussianv2.cli.pilot_eval"
+            and "--checkpoint" not in self.command
+        ):
+            destination = Path(
+                self.command[self.command.index("--output-dir") + 1]
+            )
+            (destination / "evaluation_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "train_length": 5,
+                        "eval_length": 40,
+                        "runtime_identity": {
+                            "model_class": "tests.Model",
+                            "model_format_version": "state-dict-v1",
+                        },
+                    }
+                )
+            )
+        return code
+
+    monkeypatch.setattr(Handle, "wait", wait_with_baseline_manifest)
+    result = run_pilot(
+        config,
+        output,
+        runner=Runner(),
+        gpu_validator=lambda ids: None,
+        trust_upstream_artifacts=True,
+    )
+
+    worker = [
+        item for item in assignments
+        if item[0][2] == "avgaussianv2.cli.pilot_worker"
+    ]
+    evaluations = [
+        item for item in assignments
+        if item[0][2] == "avgaussianv2.cli.pilot_eval"
+        and "--checkpoint" in item[0]
+    ]
+    assert len(worker) == len(evaluations) == 3
+    assert [item[1]["CUDA_VISIBLE_DEVICES"] for item in worker] == ["0", "1", "2"]
+    assert [item[1]["CUDA_VISIBLE_DEVICES"] for item in evaluations] == [
+        "0", "1", "2"
+    ]
+    joint = evaluations[0][0]
+    assert joint.count("--system") == 2
+    assert "joint_conditioned_on:on" in joint
+    assert "joint_conditioned_off:off" in joint
+    shared = json.loads((output / "shared_manifest.json").read_text())
+    assert shared["compatibility"]["condition_off"]["variant"] == "condition_off"
+    assert result.ready
+    assert json.loads((output / "status.json").read_text())["ready"] is True

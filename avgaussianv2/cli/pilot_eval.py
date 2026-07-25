@@ -65,6 +65,42 @@ _CHECKPOINT_FIELDS = {
 }
 
 
+def _json_text_value(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise TypeError(f"{name} must be a nonempty string")
+    return value
+
+
+def _json_bool(value: object, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} must be boolean")
+    return value
+
+
+def _json_int(value: object, name: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer")
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return value
+
+
+def _json_digest(value: object, name: str) -> str:
+    result = _json_text_value(value, name)
+    if len(result) != 64 or any(char not in "0123456789abcdef" for char in result):
+        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+    return result
+
+
+def _json_absolute_path(value: object, name: str) -> Path:
+    result = Path(_json_text_value(value, name))
+    if not result.is_absolute():
+        raise ValueError(f"{name} must be absolute")
+    if Path(os.path.abspath(result)) != result:
+        raise ValueError(f"{name} must be lexically normalized")
+    return result
+
+
 @dataclass(frozen=True)
 class EvaluationSpec:
     system_name: str
@@ -255,6 +291,29 @@ def _verify_existing(
         raise ValueError("evaluation manifest fields mismatch")
     if raw.get("schema") != JOB_SCHEMA or raw.get("version") != JOB_VERSION:
         raise ValueError("evaluation manifest schema/version mismatch")
+    scene_id = _json_text_value(raw["scene_id"], "scene_id")
+    config_sha256 = _json_digest(raw["config_sha256"], "config_sha256")
+    if not isinstance(raw["camera"], list) or any(
+        not isinstance(camera, str) or not camera for camera in raw["camera"]
+    ):
+        raise TypeError("camera must be a list of nonempty strings")
+    if not isinstance(raw["systems"], list):
+        raise TypeError("systems must be a list")
+    if not isinstance(raw["condition_specs"], list):
+        raise TypeError("condition_specs must be a list")
+    train_length = _json_int(raw["train_length"], "train_length", minimum=1)
+    eval_length = _json_int(raw["eval_length"], "eval_length", minimum=1)
+    source_fields = {
+        "project_config_sha256", "dataset_manifest_sha256",
+        "visual_checkpoint_sha256", "audio_checkpoint_sha256",
+        "camera_mapping_sha256",
+    }
+    if not isinstance(raw["source_hashes"], Mapping) or set(
+        raw["source_hashes"]
+    ) != source_fields:
+        raise ValueError("source_hashes fields mismatch")
+    for name in source_fields:
+        _json_digest(raw["source_hashes"][name], f"source_hashes.{name}")
     runtime_identity = raw["runtime_identity"]
     if (
         not isinstance(runtime_identity, Mapping)
@@ -268,20 +327,22 @@ def _verify_existing(
     if (
         isinstance(raw["train_length"], bool)
         or not isinstance(raw["train_length"], int)
-        or raw["train_length"] <= 0
+        or train_length <= 0
         or isinstance(raw["eval_length"], bool)
         or not isinstance(raw["eval_length"], int)
-        or raw["eval_length"] <= 0
+        or eval_length <= 0
     ):
         raise ValueError("evaluation dataset lengths are invalid")
     expected_baseline_path: Path | None = None
     if config_path is not None:
         config_bytes = _read_regular(config_path)
         config = load_project_config_bytes(config_bytes, base_dir=config_path.parent)
-        if raw["scene_id"] != config.scene.scene_id:
+        if scene_id != config.scene.scene_id:
             raise ValueError("evaluation scene identity mismatch")
-        if raw["config_sha256"] != hashlib.sha256(config_bytes).hexdigest():
+        if config_sha256 != hashlib.sha256(config_bytes).hexdigest():
             raise ValueError("evaluation config hash mismatch")
+        if raw["camera"] != list(config.scene.eval_cameras):
+            raise ValueError("evaluation camera identity mismatch")
         actual_sources = {
             "project_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
             "dataset_manifest_sha256": _sha256_file(
@@ -323,11 +384,22 @@ def _verify_existing(
             != shared.get("dataset_lengths")
         ):
             raise ValueError("evaluation/shared runtime identity mismatch")
-    recorded = tuple(
-        EvaluationSpec(str(item["system_name"]), bool(item["condition_enabled"]))
-        for item in raw.get("systems", [])
-        if isinstance(item, Mapping)
-    )
+    recorded_items: list[EvaluationSpec] = []
+    for position, item in enumerate(raw["systems"]):
+        if not isinstance(item, Mapping):
+            raise TypeError(f"systems[{position}] must be an object")
+        recorded_items.append(
+            EvaluationSpec(
+                _json_text_value(
+                    item.get("system_name"), f"systems[{position}].system_name"
+                ),
+                _json_bool(
+                    item.get("condition_enabled"),
+                    f"systems[{position}].condition_enabled",
+                ),
+            )
+        )
+    recorded = tuple(recorded_items)
     if recorded != tuple(expected_specs):
         raise ValueError("existing evaluation systems mismatch")
     if raw["condition_specs"] != [
@@ -341,12 +413,41 @@ def _verify_existing(
             raise ValueError("evaluation system record fields mismatch")
         if not isinstance(item["condition_enabled"], bool):
             raise TypeError("evaluation condition_enabled must be boolean")
-        system_dir = output / str(item["system_name"])
+        system_name = _json_text_value(item["system_name"], "system_name")
+        condition_enabled = _json_bool(
+            item["condition_enabled"], f"{system_name}.condition_enabled"
+        )
+        count = _json_int(item["count"], f"{system_name}.count", minimum=1)
+        _json_digest(
+            item["metrics_per_sample_sha256"],
+            f"{system_name}.metrics_per_sample_sha256",
+        )
+        _json_digest(
+            item["metrics_summary_sha256"],
+            f"{system_name}.metrics_summary_sha256",
+        )
+        _json_digest(item["manifest_sha256"], f"{system_name}.manifest_sha256")
+        _json_digest(
+            item["evaluation_indices_hash"],
+            f"{system_name}.evaluation_indices_hash",
+        )
+        _json_digest(
+            item["evaluation_run_id"], f"{system_name}.evaluation_run_id"
+        )
+        system_dir = output / system_name
         rows_path = system_dir / "metrics_per_sample.jsonl"
         summary_path = system_dir / "metrics_summary.json"
         if (
-            Path(str(item["metrics_per_sample_path"])) != rows_path.resolve()
-            or Path(str(item["metrics_summary_path"])) != summary_path.resolve()
+            _json_absolute_path(
+                item["metrics_per_sample_path"],
+                f"{system_name}.metrics_per_sample_path",
+            )
+            != rows_path.resolve()
+            or _json_absolute_path(
+                item["metrics_summary_path"],
+                f"{system_name}.metrics_summary_path",
+            )
+            != summary_path.resolve()
         ):
             raise ValueError(f"{item['system_name']} artifact path mismatch")
         if _sha256_file(rows_path) != item["metrics_per_sample_sha256"]:
@@ -355,10 +456,14 @@ def _verify_existing(
             raise ValueError(f"{item['system_name']} summary hash mismatch")
         rows = tuple(json.loads(line) for line in _read_regular(rows_path).decode().splitlines())
         summary = dict(_strict_json(summary_path))
-        count = int(item["count"])
-        if count != len(rows) or count != int(raw["eval_length"]):
+        if count != len(rows) or count != eval_length:
             raise ValueError(f"{item['system_name']} is not a full-heldout evaluation")
-        expected_indices = tuple(range(int(raw["eval_length"])))
+        if not isinstance(item["evaluation_indices"], list) or any(
+            isinstance(index, bool) or not isinstance(index, int)
+            for index in item["evaluation_indices"]
+        ):
+            raise TypeError(f"{system_name} evaluation_indices must be integers")
+        expected_indices = tuple(range(eval_length))
         if tuple(item["evaluation_indices"]) != expected_indices:
             raise ValueError(f"{item['system_name']} evaluation indices mismatch")
         if item["evaluation_indices_hash"] != hash_index_manifest(
@@ -446,9 +551,14 @@ def _verify_existing(
             ):
                 raise ValueError("baseline imported-artifact identity mismatch")
         evaluation = EvaluationResult(
-            str(item["system_name"]), count, rows, summary
+            system_name, count, rows, summary
         )
-        _validate_evaluation(evaluation, str(item["system_name"]))
+        _validate_evaluation(evaluation, system_name)
+        for row in evaluation.rows:
+            if row["scene_id"] != scene_id:
+                raise ValueError(f"{system_name} row scene identity mismatch")
+            if row["camera"] not in raw["camera"]:
+                raise ValueError(f"{system_name} row camera identity mismatch")
         artifacts.append(provenance)
         evaluations.append(evaluation)
     return EvaluationJobResult(
@@ -459,36 +569,92 @@ def _verify_existing(
 
 
 def _clean_owned_partial(output: Path, specs: Sequence[EvaluationSpec]) -> None:
-    allowed = {".evaluation.lock"}
-    allowed.update(spec.system_name for spec in specs)
-    for item in output.iterdir():
-        if item.name in allowed:
-            continue
-        if item.name.startswith(".evaluation_manifest.") and item.name.endswith(".tmp"):
-            item.unlink()
-            continue
-        raise ValueError(f"resume refuses unrelated evaluation output: {item.name}")
-    for spec in specs:
-        item = output / spec.system_name
-        if not item.exists():
-            continue
-        metadata = item.lstat()
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-            raise ValueError(f"partial system output is unsafe: {item}")
-        for child in item.iterdir():
-            known = child.name in {
-                ".metrics-publication.lock",
-                "metrics_per_sample.jsonl",
-                "metrics_summary.json",
-            } or (
-                child.name.startswith(
-                    (".metrics_per_sample.jsonl.", ".metrics_summary.json.")
-                )
-                and child.name.endswith((".tmp", ".backup", ".restore"))
+    output_fd = os.open(
+        output,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    system_fds: dict[str, tuple[int, tuple[str, ...]]] = {}
+    root_temps: list[str] = []
+    try:
+        allowed = {".evaluation.lock", *(spec.system_name for spec in specs)}
+        for name in os.listdir(output_fd):
+            if name in allowed:
+                continue
+            if name.startswith(".evaluation_manifest.") and name.endswith(".tmp"):
+                metadata = os.stat(name, dir_fd=output_fd, follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise ValueError(f"partial staging file is unsafe: {name}")
+                root_temps.append(name)
+                continue
+            raise ValueError(f"resume refuses unrelated evaluation output: {name}")
+        for spec in specs:
+            name = spec.system_name
+            try:
+                before = os.stat(name, dir_fd=output_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(before.st_mode):
+                raise ValueError(f"partial system output is unsafe: {name}")
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=output_fd,
             )
-            if child.is_symlink() or not known:
-                raise ValueError(f"partial system output is not owned: {child}")
-        shutil.rmtree(item)
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                os.close(descriptor)
+                raise ValueError(f"partial system output changed: {name}")
+            children = tuple(os.listdir(descriptor))
+            try:
+                for child in children:
+                    known = child in {
+                        ".metrics-publication.lock",
+                        "metrics_per_sample.jsonl",
+                        "metrics_summary.json",
+                    } or (
+                        child.startswith(
+                            (
+                                ".metrics_per_sample.jsonl.",
+                                ".metrics_summary.json.",
+                            )
+                        )
+                        and child.endswith((".tmp", ".backup", ".restore"))
+                    )
+                    metadata = os.stat(
+                        child, dir_fd=descriptor, follow_symlinks=False
+                    )
+                    if (
+                        not known
+                        or not stat.S_ISREG(metadata.st_mode)
+                        or metadata.st_nlink != 1
+                    ):
+                        raise ValueError(
+                            f"partial system file is unsafe: {name}/{child}"
+                        )
+            except BaseException:
+                os.close(descriptor)
+                raise
+            system_fds[name] = (descriptor, children)
+        # No removal begins until every owned entry has passed validation.
+        for name in root_temps:
+            os.unlink(name, dir_fd=output_fd)
+        for name, (descriptor, children) in system_fds.items():
+            for child in children:
+                os.unlink(child, dir_fd=descriptor)
+            os.fsync(descriptor)
+            os.close(descriptor)
+            system_fds[name] = (-1, ())
+            os.rmdir(name, dir_fd=output_fd)
+        os.fsync(output_fd)
+    finally:
+        for descriptor, _ in system_fds.values():
+            if descriptor >= 0:
+                os.close(descriptor)
+        os.close(output_fd)
 
 
 def _clean_overwrite(output: Path) -> None:
@@ -523,8 +689,29 @@ def _artifact_from_json(
     assert isinstance(checkpoint, Mapping)
     if set(checkpoint) != _CHECKPOINT_FIELDS:
         raise ValueError("evaluation checkpoint provenance fields mismatch")
-    if not isinstance(checkpoint["condition_enabled"], bool):
-        raise TypeError("checkpoint condition_enabled must be boolean")
+    condition = _json_bool(
+        checkpoint["condition_enabled"], "checkpoint.condition_enabled"
+    )
+    scene_id = _json_text_value(checkpoint["scene_id"], "checkpoint.scene_id")
+    checkpoint_path = _json_absolute_path(
+        checkpoint["checkpoint_path"], "checkpoint.checkpoint_path"
+    )
+    checkpoint_sha = _json_digest(
+        checkpoint["checkpoint_sha256"], "checkpoint.checkpoint_sha256"
+    )
+    generation = _json_int(
+        checkpoint["checkpoint_generation"],
+        "checkpoint.checkpoint_generation",
+    )
+    indices_hash = _json_digest(
+        checkpoint["evaluation_indices_hash"],
+        "checkpoint.evaluation_indices_hash",
+    )
+    run_id = _json_digest(
+        checkpoint["evaluation_run_id"], "checkpoint.evaluation_run_id"
+    )
+    if not isinstance(checkpoint["run_fingerprint"], Mapping):
+        raise TypeError("checkpoint.run_fingerprint must be an object")
     compatibility = checkpoint.get("compatibility")
     pilot_config = checkpoint.get("pilot_config")
     variant_indices = checkpoint.get("variant_indices")
@@ -533,38 +720,56 @@ def _artifact_from_json(
         from avgaussianv2.experiment.contracts import PilotConfig, VariantIndices
 
         compatibility = PilotCompatibility.from_mapping(compatibility)
+        if not isinstance(pilot_config, Mapping):
+            raise TypeError("checkpoint.pilot_config must be an object")
         pilot_config = PilotConfig(**pilot_config)
+        if not isinstance(variant_indices, Mapping) or set(variant_indices) != {
+            "warmup", "joint"
+        }:
+            raise TypeError("checkpoint.variant_indices must be an exact object")
+        for name in ("warmup", "joint"):
+            if not isinstance(variant_indices[name], list) or any(
+                isinstance(index, bool) or not isinstance(index, int)
+                for index in variant_indices[name]
+            ):
+                raise TypeError(f"checkpoint.variant_indices.{name} is invalid")
         variant_indices = VariantIndices(
             warmup=tuple(variant_indices["warmup"]),
             joint=tuple(variant_indices["joint"]),
         )
     provenance = EvaluationProvenance(
-        scene_id=str(checkpoint["scene_id"]),
-        checkpoint_path=Path(str(checkpoint["checkpoint_path"])),
-        checkpoint_sha256=str(checkpoint["checkpoint_sha256"]),
-        checkpoint_generation=int(checkpoint["checkpoint_generation"]),
+        scene_id=scene_id,
+        checkpoint_path=checkpoint_path,
+        checkpoint_sha256=checkpoint_sha,
+        checkpoint_generation=generation,
         run_fingerprint=dict(checkpoint["run_fingerprint"]),
-        evaluation_indices_hash=str(checkpoint["evaluation_indices_hash"]),
-        condition_enabled=bool(checkpoint["condition_enabled"]),
-        evaluation_run_id=str(checkpoint["evaluation_run_id"]),
+        evaluation_indices_hash=indices_hash,
+        condition_enabled=condition,
+        evaluation_run_id=run_id,
         compatibility=compatibility,
         variant_indices=variant_indices,
         pilot_config=pilot_config,
     )
-    name = str(item["system_name"])
+    name = _json_text_value(item["system_name"], "system_name")
     return EvaluationArtifactProvenance(
         metrics_per_sample_path=(output / name / "metrics_per_sample.jsonl").resolve(),
-        metrics_per_sample_sha256=str(item["metrics_per_sample_sha256"]),
+        metrics_per_sample_sha256=_json_digest(
+            item["metrics_per_sample_sha256"], "metrics_per_sample_sha256"
+        ),
         metrics_summary_path=(output / name / "metrics_summary.json").resolve(),
-        metrics_summary_sha256=str(item["metrics_summary_sha256"]),
-        manifest_sha256=str(item["manifest_sha256"]),
+        metrics_summary_sha256=_json_digest(
+            item["metrics_summary_sha256"], "metrics_summary_sha256"
+        ),
+        manifest_sha256=_json_digest(item["manifest_sha256"], "manifest_sha256"),
         system_name=name,
-        condition_enabled=bool(item["condition_enabled"]),
-        count=int(item["count"]),
+        condition_enabled=_json_bool(item["condition_enabled"], "condition_enabled"),
+        count=_json_int(item["count"], "count", minimum=1),
         evaluation_indices=tuple(item["evaluation_indices"]),
-        evaluation_indices_hash=str(item["evaluation_indices_hash"]),
+        evaluation_indices_hash=_json_digest(
+            item["evaluation_indices_hash"], "evaluation_indices_hash"
+        ),
         checkpoint=provenance,
-        evaluation_run_id=str(item["evaluation_run_id"]),
+        evaluation_run_id=_json_digest(item["evaluation_run_id"], "evaluation_run_id"),
     )
 
 

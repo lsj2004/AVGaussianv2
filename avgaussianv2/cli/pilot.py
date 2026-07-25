@@ -573,6 +573,18 @@ def run_pilot(
         if verify_only:
             raise FileNotFoundError("verify-only requires an existing output")
         output.mkdir(parents=True)
+    effective_trust = trust_upstream_artifacts
+    existing_experiment_path = output / "experiment_manifest.json"
+    if verify_only and existing_experiment_path.is_file():
+        existing_experiment = json.loads(
+            _read_regular(existing_experiment_path).decode()
+        )
+        recorded_trust = existing_experiment.get("trusted_upstream_artifacts")
+        if not isinstance(recorded_trust, bool):
+            raise TypeError(
+                "experiment trusted_upstream_artifacts must be boolean"
+            )
+        effective_trust = recorded_trust
     if runner is None:
         runner = SubprocessRunner()
     if gpu_validator is None and not verify_only:
@@ -586,7 +598,9 @@ def run_pilot(
 
     lock_fd = os.open(
         output / ".pilot-parent.lock",
-        os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+        os.O_RDWR
+        | (0 if verify_only else os.O_CREAT)
+        | getattr(os, "O_NOFOLLOW", 0),
         0o600,
     )
     try:
@@ -694,6 +708,7 @@ def run_pilot(
             "baseline_manifest_path": str(baseline_manifest.resolve()),
             "baseline_manifest_sha256": _sha(baseline_manifest),
             "source_hashes": desired_shared["source_hashes"],
+            "trusted_upstream_artifacts": effective_trust,
         }
         if experiment_path.exists():
             if json.loads(_read_regular(experiment_path).decode()) != experiment:
@@ -716,7 +731,7 @@ def run_pilot(
                         visual_baseline,
                         worker_dir,
                         variant,
-                        trust_upstream_artifacts=trust_upstream_artifacts,
+                        trust_upstream_artifacts=effective_trust,
                     )
                     continue
                 except Exception:
@@ -730,7 +745,7 @@ def run_pilot(
                         visual_baseline,
                         worker_dir,
                         variant,
-                        trust_upstream_artifacts=trust_upstream_artifacts,
+                        trust_upstream_artifacts=effective_trust,
                     )
             elif verify_only:
                 raise FileNotFoundError(f"{variant.value} worker is incomplete")
@@ -760,7 +775,7 @@ def run_pilot(
                 visual_baseline,
                 workers_root / variant.value,
                 variant,
-                trust_upstream_artifacts=trust_upstream_artifacts,
+                trust_upstream_artifacts=effective_trust,
             )
         if not verify_only:
             _stage_status(
