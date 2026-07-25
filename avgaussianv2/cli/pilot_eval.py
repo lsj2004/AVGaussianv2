@@ -804,6 +804,7 @@ def _registered_state_identity(model: object) -> tuple[tuple[object, ...], ...]:
                 raw = (
                     tensor.detach()
                     .contiguous()
+                    .reshape(-1)
                     .view(torch.uint8)
                     .cpu()
                     .numpy()

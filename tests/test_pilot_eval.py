@@ -385,6 +385,35 @@ def test_evaluation_rejects_registered_buffer_mutation(tmp_path) -> None:
         )
 
 
+def test_evaluation_accepts_unchanged_scalar_registered_buffer(tmp_path) -> None:
+    config, _ = _config(tmp_path)
+
+    class ScalarBufferedModel(torch.nn.Module):
+        checkpoint_format_version = "state-dict-v1"
+
+        def __init__(self):
+            super().__init__()
+            self.condition_enabled = True
+            self.register_buffer("step", torch.tensor(0, dtype=torch.long))
+
+    model = ScalarBufferedModel()
+    result = run_evaluation(
+        config,
+        tmp_path / "scalar-state",
+        ("baseline_imported:off",),
+        device="cpu",
+        runtime_factory=lambda *_: SimpleNamespace(
+            model=model,
+            train_samples=(object(),),
+            eval_samples=(object(),),
+            audio_loss_fn=lambda *_: {},
+        ),
+        evaluator_factory=_Evaluator,
+    )
+
+    assert result.artifacts[0].count == 1
+
+
 def test_evaluation_rejects_hardlinked_lock(tmp_path) -> None:
     config, _ = _config(tmp_path)
     output = tmp_path / "evaluation"
