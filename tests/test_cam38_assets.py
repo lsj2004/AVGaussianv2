@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -10,8 +11,11 @@ from avgaussianv2.benchmark.assets import (
     AssetAuditError,
     audit_audiogs_conversion,
     audit_ftgspp_train_source,
+    audit_ftgspp_upstream_config,
     audit_initialization_provenance,
     audit_protocol_config,
+    prepare_fresh_ftgspp_namespaces,
+    render_ftgspp_config,
 )
 from avgaussianv2.config import load_project_config
 
@@ -78,6 +82,18 @@ def test_config_audit_rejects_non_exact_cam38_split(tmp_path: Path) -> None:
     with pytest.raises(AssetAuditError, match="exactly cam00 through cam37"):
         audit_protocol_config(path)
 
+    raw = yaml.safe_load(source.read_text())
+    raw["benchmark"]["unexpected"] = True
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(AssetAuditError, match="exact keys"):
+        audit_protocol_config(path)
+
+    raw = yaml.safe_load(source.read_text())
+    raw["train"]["seed"] = 0
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(AssetAuditError, match="train.seed"):
+        audit_protocol_config(path)
+
 
 def test_provenance_allows_cam38_geometry_but_rejects_test_rgb_for_init(
     tmp_path: Path,
@@ -100,7 +116,7 @@ def test_provenance_allows_cam38_geometry_but_rejects_test_rgb_for_init(
             },
         ],
     }
-    audit_initialization_provenance(allowed)
+    audit_initialization_provenance(allowed, expected_scene="scene1_opera")
 
     allowed["assets"].append(
         {
@@ -111,42 +127,207 @@ def test_provenance_allows_cam38_geometry_but_rejects_test_rgb_for_init(
         }
     )
     with pytest.raises(AssetAuditError, match="cam38 RGB"):
-        audit_initialization_provenance(allowed)
+        audit_initialization_provenance(allowed, expected_scene="scene1_opera")
 
     path = tmp_path / "provenance.json"
     path.write_text(json.dumps(allowed))
     with pytest.raises(AssetAuditError, match="cam38 RGB"):
-        audit_initialization_provenance(path)
+        audit_initialization_provenance(path, expected_scene="scene1_opera")
+
+    malformed = {
+        "scene_id": "other",
+        "test_camera": "cam38",
+        "assets": [],
+        "unknown": 1,
+    }
+    with pytest.raises(AssetAuditError, match="exact keys"):
+        audit_initialization_provenance(malformed, expected_scene="scene1_opera")
+
+    malformed.pop("unknown")
+    with pytest.raises(AssetAuditError, match="scene_id"):
+        audit_initialization_provenance(malformed, expected_scene="scene1_opera")
 
 
 def test_runtime_asset_audits_reject_test_rgb_and_bind_shared_audio_updates(
     tmp_path: Path,
 ) -> None:
+    sampled = tmp_path / "sampled"
+    sampled.mkdir()
     visual = tmp_path / "visual"
     visual.mkdir()
     for camera in TRAIN_CAMERAS:
-        (visual / f"{camera}.mp4").touch()
-    audit_ftgspp_train_source(visual)
+        source = sampled / f"{camera}.mp4"
+        source.touch()
+        os.link(source, visual / source.name)
+    audit_ftgspp_train_source(visual, allowed_sampled_root=sampled)
+    visual_link = tmp_path / "visual-link"
+    visual_link.symlink_to(visual, target_is_directory=True)
+    with pytest.raises(AssetAuditError, match="must not be a symlink"):
+        audit_ftgspp_train_source(visual_link, allowed_sampled_root=sampled)
     (visual / "cam38.mp4").touch()
     with pytest.raises(AssetAuditError, match="cam38 RGB"):
-        audit_ftgspp_train_source(visual)
+        audit_ftgspp_train_source(visual, allowed_sampled_root=sampled)
+
+    (visual / "cam38.mp4").unlink()
+    (visual / "cam00.mp4").unlink()
+    (visual / "cam00.mp4").symlink_to(sampled / "cam00.mp4")
+    with pytest.raises(AssetAuditError, match="symlink"):
+        audit_ftgspp_train_source(visual, allowed_sampled_root=sampled)
+    (visual / "cam00.mp4").unlink()
+    (visual / "cam00.mp4").symlink_to(sampled / "missing.mp4")
+    with pytest.raises(AssetAuditError, match="symlink"):
+        audit_ftgspp_train_source(visual, allowed_sampled_root=sampled)
+    (visual / "cam00.mp4").unlink()
+    (visual / "cam00.mp4").mkdir()
+    with pytest.raises(AssetAuditError, match="regular file"):
+        audit_ftgspp_train_source(visual, allowed_sampled_root=sampled)
 
     conversion = {
         "scene": "SC-scene7-playing-cam38-shared",
+        "audio_root": "/audio",
+        "cameras_npz": "/cameras.npz",
+        "output_root": "/output",
+        "format": "AudioGS ReplayNVAS-style viewpoint clips",
+        "sample_rate": 16000,
+        "clip_sec": 3.0,
+        "hop_sec": 3.0,
         "num_clips": 3,
         "camera_names": [*TRAIN_CAMERAS, "cam38"],
         "viewpoint_mapping": {
             str(index + 1): camera
             for index, camera in enumerate((*TRAIN_CAMERAS, "cam38"))
         },
+        "clips": [
+            {
+                "frame_id": index,
+                "start_sample": index * 48000,
+                "end_sample": (index + 1) * 48000,
+                "start_seconds": float(index * 3),
+                "end_seconds": float((index + 1) * 3),
+            }
+            for index in range(3)
+        ],
     }
     result = audit_audiogs_conversion(
-        conversion, expected_clips=3, epochs=61
+        conversion,
+        expected_scene="SC-scene7-playing-cam38-shared",
+        expected_clips=3,
+        epochs=61,
     )
     assert result["resolved_updates"] == 6_954
     conversion["num_clips"] = 1
     with pytest.raises(AssetAuditError, match="clips"):
-        audit_audiogs_conversion(conversion, expected_clips=3, epochs=61)
+        audit_audiogs_conversion(
+            conversion,
+            expected_scene="SC-scene7-playing-cam38-shared",
+            expected_clips=3,
+            epochs=61,
+        )
+
+
+def test_audio_conversion_rejects_mapping_gaps_unknown_keys_and_wrong_scene() -> None:
+    manifest = {
+        "scene": "SC-scene1-opera-cam38-shared",
+        "audio_root": "/audio",
+        "cameras_npz": "/cameras.npz",
+        "output_root": "/output",
+        "format": "AudioGS ReplayNVAS-style viewpoint clips",
+        "sample_rate": 16000,
+        "clip_sec": 3.0,
+        "hop_sec": 3.0,
+        "num_clips": 1,
+        "camera_names": [*TRAIN_CAMERAS, "cam38"],
+        "viewpoint_mapping": {
+            str(index + 1): camera
+            for index, camera in enumerate((*TRAIN_CAMERAS, "cam38"))
+        },
+        "clips": [
+            {
+                "frame_id": 0,
+                "start_sample": 0,
+                "end_sample": 48000,
+                "start_seconds": 0.0,
+                "end_seconds": 3.0,
+            }
+        ],
+    }
+    kwargs = {
+        "expected_scene": "SC-scene1-opera-cam38-shared",
+        "expected_clips": 1,
+        "epochs": 61,
+    }
+    broken = json.loads(json.dumps(manifest))
+    broken["viewpoint_mapping"].pop("1")
+    with pytest.raises(AssetAuditError, match="exactly viewpoints 1 through 39"):
+        audit_audiogs_conversion(broken, **kwargs)
+    broken = dict(manifest, unknown=True)
+    with pytest.raises(AssetAuditError, match="exact keys"):
+        audit_audiogs_conversion(broken, **kwargs)
+    with pytest.raises(AssetAuditError, match="scene"):
+        audit_audiogs_conversion(
+            manifest, **dict(kwargs, expected_scene="wrong")
+        )
+
+
+@pytest.mark.parametrize("scene", ("scene1_opera", "Scene7playing"))
+def test_rendered_ftgspp_config_is_parsed_and_audited(
+    tmp_path: Path, scene: str
+) -> None:
+    template = ROOT / "configs" / "upstream" / "ftgspp_cam38" / f"{scene}.toml.in"
+    output = tmp_path / f"{scene}.toml"
+    ftgspp = Path("/mnt/sda/lisujing/Dataset/FreeTimeGSPlusPlus")
+    sampled = (
+        Path("/mnt/sda/lisujing/Dataset/Sampled_data/v5_0630_dynerf") / scene
+    )
+    render_ftgspp_config(
+        template,
+        output,
+        repo_root=ROOT,
+        ftgspp_root=ftgspp,
+        sampled_scene_root=sampled,
+    )
+    result = audit_ftgspp_upstream_config(
+        output,
+        protocol_config=ROOT / "configs" / "benchmark_cam38" / f"{scene}.yaml",
+        repo_root=ROOT,
+        ftgspp_root=ftgspp,
+        sampled_scene_root=sampled,
+    )
+    assert result["scene_id"] == scene
+    assert result["iterations"] == 30_000
+    assert result["calibration_path"] == str(
+        sampled / "poses_bounds.npy"
+    )
+
+    text = output.read_text().replace(
+        'temporal_flow_cameras = { "start" = 0, "stop" = 38 }',
+        'temporal_flow_cameras = { "start" = 0, "stop" = 39 }',
+    )
+    output.write_text(text)
+    with pytest.raises(AssetAuditError, match="temporal_flow_cameras"):
+        audit_ftgspp_upstream_config(
+            output,
+            protocol_config=ROOT / "configs" / "benchmark_cam38" / f"{scene}.yaml",
+            repo_root=ROOT,
+            ftgspp_root=ftgspp,
+            sampled_scene_root=sampled,
+        )
+
+
+def test_fresh_ftgspp_namespaces_reject_stale_content(tmp_path: Path) -> None:
+    namespaces = [tmp_path / name for name in ("extracted", "memmap", "run")]
+    prepare_fresh_ftgspp_namespaces(
+        namespaces, scene_id="scene1_opera", source_root=tmp_path / "sampled"
+    )
+    for namespace in namespaces:
+        marker = json.loads((namespace / ".cam38-audit.json").read_text())
+        assert marker["scene_id"] == "scene1_opera"
+
+    (namespaces[0] / "old-cache.bin").touch()
+    with pytest.raises(AssetAuditError, match="stale/non-empty"):
+        prepare_fresh_ftgspp_namespaces(
+            namespaces, scene_id="scene1_opera", source_root=tmp_path / "sampled"
+        )
 
 
 def test_upstream_scripts_are_reproducible_and_do_not_launch_by_default() -> None:

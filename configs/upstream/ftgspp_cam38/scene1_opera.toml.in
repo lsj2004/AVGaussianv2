@@ -2,6 +2,7 @@ extends = "@FTGSPP_ROOT@/configs/dynerf/ftgs/coffee_martini.toml"
 
 [data]
 video_path = "@ROOT@/runs/cam38_strict/scene1_opera/ftgspp/train_only_source"
+calibration_path = "@SAMPLED_SCENE_ROOT@/poses_bounds.npy"
 extracted_path = "@FTGSPP_ROOT@/_extracted/cam38_strict/scene1_opera"
 memmap_path = "@FTGSPP_ROOT@/_memmap/cam38_strict/scene1_opera"
 colmap_path = "@FTGSPP_ROOT@/_colmap/cam38_strict/scene1_opera"

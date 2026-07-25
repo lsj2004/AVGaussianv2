@@ -49,18 +49,29 @@ prepare_scene() {
     mkdir -p "${train_source}"
     for index in {0..37}; do
       camera="$(printf 'cam%02d' "${index}")"
-      ln -sfn "${source}/${camera}.mp4" "${train_source}/${camera}.mp4"
+      if [[ -L "${source}/${camera}.mp4" || ! -f "${source}/${camera}.mp4" ]]; then
+        echo "refusing non-regular sampled input: ${source}/${camera}.mp4" >&2
+        exit 1
+      fi
+      if [[ -e "${train_source}/${camera}.mp4" || -L "${train_source}/${camera}.mp4" ]]; then
+        echo "refusing pre-existing train-only entry: ${train_source}/${camera}.mp4" >&2
+        exit 1
+      fi
+      ln "${source}/${camera}.mp4" "${train_source}/${camera}.mp4"
     done
     "${PYTHON}" -m avgaussianv2.cli.audit_cam38_assets \
-      --config "${config}" --ftgspp-train-source "${train_source}"
-    mkdir -p "${generated_config_dir}"
-    sed \
-      -e "s|@ROOT@|${ROOT}|g" \
-      -e "s|@FTGSPP_ROOT@|${FTGSPP_ROOT}|g" \
-      "${template}" > "${generated_config}"
+      --config "${config}" \
+      --ftgspp-train-source "${train_source}" \
+      --allowed-sampled-root "${source}" \
+      --ftgspp-template "${template}" \
+      --ftgspp-output "${generated_config}" \
+      --repo-root "${ROOT}" \
+      --ftgspp-root "${FTGSPP_ROOT}" \
+      --prepare-ftgspp-namespaces \
+      --ftgspp-run-root "${run_root}"
   else
-    echo "pre-launch audit: --ftgspp-train-source ${train_source}"
-    echo "render config: ${template} -> ${generated_config}"
+    echo "pre-launch audit: --ftgspp-train-source ${train_source} --allowed-sampled-root ${source}"
+    echo "safe Python render+audit: ${template} -> ${generated_config}"
   fi
 
   (

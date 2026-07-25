@@ -190,8 +190,9 @@ scripts/prepare_ftgspp_cam38_baselines.sh
 
 Each command audits the strict split and initialization provenance, prints its
 fully resolved upstream commands, and does not launch training unless `--execute` is supplied.
-In particular, the FTGS++ train-only source links only cam00
-through cam37; the committed provenance permits cam38 pose/intrinsics but
+In particular, the FTGS++ train-only source hard-links only cam00
+through cam37 and audits each link against the matching sampled-file inode;
+the committed provenance permits cam38 pose/intrinsics but
 fails closed if cam38 RGB/depth is declared as an image-driven initialization,
 point, SfM/COLMAP, or temporal-flow input. These scripts prepare native assets
 only; the fixed 30,000-update fusion/audio-only/visual-only continuations and
