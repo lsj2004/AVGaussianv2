@@ -15,6 +15,7 @@ from avgaussianv2.benchmark.evaluation import (
     BenchmarkPrediction,
     EvaluationIdentity,
     TrainingEvidence,
+    audit_training_evidence,
     verify_evaluation,
 )
 from avgaussianv2.benchmark.native import (
@@ -35,10 +36,6 @@ def _sha_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _sha_file(path: Path) -> str:
-    return _sha_bytes(path.read_bytes())
-
-
 def _install_native_audit_stubs(monkeypatch):
     protocols: dict[str, dict[str, object]] = {}
     flow_roots: dict[str, Path] = {}
@@ -55,7 +52,7 @@ def _install_native_audit_stubs(monkeypatch):
         return {"namespaces": [str(root)], "iterations": 30_000}
 
     def seed_record(path, **_):
-        name = Path(path).stem
+        name = path["stage"] if isinstance(path, dict) else Path(path).stem
         argv = (
             ["run", "--from", "extract", "--to", "prep"]
             if name == "prep"
@@ -75,7 +72,7 @@ def _install_native_audit_stubs(monkeypatch):
     monkeypatch.setattr(
         native_module,
         "audit_ftgspp_flow_cache",
-        lambda *_, **__: {"complete": True},
+        lambda *_, **__: {"pairs": 0, "cameras": 38, "files": 0},
     )
     monkeypatch.setattr(
         native_module, "_source_files", lambda _, root: (Path(root) / "source.py",)
@@ -106,9 +103,14 @@ def _make_native_contract(
     upstream.mkdir(parents=True)
     (upstream / "source.py").write_text("source = 1\n")
     config = root / "config.yaml"
-    config.write_text(f"scene: {scene}\n")
+    config.write_text("{}\n")
     provenance = root / "provenance.json"
-    provenance.write_text("{}\n")
+    provenance.write_text(
+        json.dumps(
+            {"scene_id": scene, "test_camera": "cam38", "assets": []}
+        )
+        + "\n"
+    )
     checkpoint = root / "checkpoint.pt"
     if kind == "audiogs":
         updates = 2_318 if scene == "scene1_opera" else 6_954
@@ -146,7 +148,11 @@ def _make_native_contract(
             checkpoint,
         )
     protocols[str(config.resolve())] = {
-        "scene": {"id": scene},
+        "scene": {
+            "id": scene,
+            "train_cameras": [f"cam{x:02d}" for x in range(38)],
+            "eval_cameras": ["cam38"],
+        },
         "paths": {
             "audio_checkpoint": str(checkpoint),
             "visual_checkpoint": str(checkpoint),
@@ -154,10 +160,22 @@ def _make_native_contract(
             "visual_upstream_root": str(upstream),
         },
         "benchmark": {
-            "expected_test_samples": 130 if scene == "scene1_opera" else 293
+            "expected_test_samples": 130 if scene == "scene1_opera" else 293,
+            "protocol": "dual_dataset_cam38_v1",
+            "seed": 42,
+            "native_budgets": {
+                "audiogs_epochs": 61,
+                "audiogs_batch_size": 1,
+                "audiogs_resolved_updates": (
+                    2_318 if scene == "scene1_opera" else 6_954
+                ),
+                "ftgspp_updates": 30_000,
+                "ftgspp_batch_size": 1,
+            },
         },
     }
-    contract_path = root / "native_contract.json"
+    config.write_text(json.dumps(protocols[str(config.resolve())]))
+    contract_path = root / "native_contract"
     kwargs = {}
     if kind == "audiogs":
         conversion = root / "conversion.json"
@@ -180,7 +198,19 @@ def _make_native_contract(
         kwargs = {"conversion_manifest": conversion, "seed_records": [seed]}
     else:
         rendered = root / "rendered.toml"
-        rendered.write_text("iterations = 30000\n")
+        rendered.write_text(
+            "[data]\n"
+            f'frames = {{ start = 0, stop = {130 if scene == "scene1_opera" else 293} }}\n'
+            "eval_cameras = [37]\n"
+            "train_cameras = { start = 0, stop = 38 }\n"
+            "[init]\n"
+            "temporal_flow_cameras = { start = 0, stop = 38 }\n"
+            "keyframe_stride = 10\n"
+            "temporal_motion_adapted = true\n"
+            "[train]\n"
+            "iterations = 30000\n"
+            "batch_size = 1\n"
+        )
         flow_root = root / "flow"
         flow_root.mkdir()
         flow_roots[str(rendered.resolve())] = flow_root
@@ -189,7 +219,7 @@ def _make_native_contract(
         seeds = []
         for name in ("prep", "flow", "train"):
             seed = root / f"{name}.json"
-            seed.write_text("{}\n")
+            seed.write_text(json.dumps({"stage": name}) + "\n")
             seeds.append(seed)
         kwargs = {
             "rendered_config": rendered,
@@ -224,6 +254,14 @@ def test_native_contract_finalizer_verifies_every_bound_byte(
     assert verify_native_contract(path) == contract
     source = Path(contract["inputs"]["source_audits"][0]["path"])
     source.write_text("source = 2\n")
+    assert verify_native_contract(path) == contract
+    pointer = json.loads((path / "current.json").read_text())
+    snapshot = (
+        path
+        / pointer["generation"]
+        / contract["inputs"]["source_audits"][0]["snapshot"]
+    )
+    snapshot.write_text("tampered snapshot\n")
     with pytest.raises(NativeContractError, match="hash|audit"):
         verify_native_contract(path)
 
@@ -243,6 +281,103 @@ def test_native_contract_rejects_non_torch_and_checkpoint_tamper(
     checkpoint.write_bytes(b"not a torch archive")
     with pytest.raises(NativeContractError, match="hash|Torch"):
         verify_native_contract(path)
+
+
+def test_native_snapshot_and_checkpoint_replacement_races_are_rejected(
+    tmp_path, monkeypatch
+):
+    protocols, flow_roots = _install_native_audit_stubs(monkeypatch)
+    path, contract = _make_native_contract(
+        tmp_path,
+        scene="scene1_opera",
+        kind="audiogs",
+        protocols=protocols,
+        flow_roots=flow_roots,
+    )
+    pointer = json.loads((path / "current.json").read_text())
+    snapshot = (
+        path
+        / pointer["generation"]
+        / contract["inputs"]["source_audits"][0]["snapshot"]
+    )
+    original_read = native_module._read_fd
+    replaced = False
+
+    def replace_snapshot_after_read(fd, label):
+        nonlocal replaced
+        data = original_read(fd, label)
+        if "source_00.snapshot" in label and not replaced:
+            replacement = snapshot.with_suffix(".replacement")
+            replacement.write_bytes(data)
+            replacement.replace(snapshot)
+            replaced = True
+        return data
+
+    monkeypatch.setattr(native_module, "_read_fd", replace_snapshot_after_read)
+    with pytest.raises(NativeContractError, match="identity changed"):
+        verify_native_contract(path)
+    assert replaced
+
+    path, contract = _make_native_contract(
+        tmp_path / "checkpoint-race",
+        scene="scene1_opera",
+        kind="audiogs",
+        protocols=protocols,
+        flow_roots=flow_roots,
+    )
+    monkeypatch.setattr(native_module, "_read_fd", original_read)
+    checkpoint = Path(contract["checkpoint"]["path"])
+    original_hash = native_module._hash_fd
+    checkpoint_replaced = False
+
+    def replace_checkpoint_after_hash(fd, label):
+        nonlocal checkpoint_replaced
+        digest = original_hash(fd, label)
+        if label == "native checkpoint" and not checkpoint_replaced:
+            replacement = checkpoint.with_suffix(".replacement")
+            replacement.write_bytes(checkpoint.read_bytes())
+            replacement.replace(checkpoint)
+            checkpoint_replaced = True
+        return digest
+
+    monkeypatch.setattr(native_module, "_hash_fd", replace_checkpoint_after_hash)
+    with pytest.raises(NativeContractError, match="identity changed"):
+        verify_native_contract(path)
+    assert checkpoint_replaced
+
+
+def test_native_evidence_rejects_self_reported_initialization_hash(
+    tmp_path, monkeypatch
+):
+    protocols, flow_roots = _install_native_audit_stubs(monkeypatch)
+    path, contract = _make_native_contract(
+        tmp_path,
+        scene="scene1_opera",
+        kind="audiogs",
+        protocols=protocols,
+        flow_roots=flow_roots,
+    )
+    evidence = _native_evidence(
+        "scene1_opera", "native_audiogs", path, contract
+    )
+    evidence = TrainingEvidence(
+        **{
+            **evidence.__dict__,
+            "visual_initialization_sha256": _sha_bytes(b"self-reported"),
+        }
+    )
+    identity = EvaluationIdentity(
+        "scene1_opera",
+        "native_audiogs",
+        None,
+        ("scene1_opera/cam38/000000",),
+        1,
+    )
+    with pytest.raises(
+        evaluation_module.BenchmarkEvaluationError,
+        match="contract/evaluation evidence mismatch",
+    ):
+        audit_training_evidence(evidence, identity)
 
 
 def _sample(scene: str) -> AlignedAVSample:
@@ -286,14 +421,20 @@ def _native_evidence(scene, system, path, contract):
         checkpoint_sha256=contract["checkpoint"]["sha256"],
         config_sha256=contract["inputs"]["protocol_config"]["sha256"],
         source_sha256=contract["upstream"]["source_sha256"],
-        visual_initialization_sha256=_sha_bytes(b"visual"),
-        audio_initialization_sha256=_sha_bytes(b"audio"),
-        model_initialization_sha256=_sha_bytes(b"model"),
+        visual_initialization_sha256=contract["derived_initialization"][
+            "visual_initialization_sha256"
+        ],
+        audio_initialization_sha256=contract["derived_initialization"][
+            "audio_initialization_sha256"
+        ],
+        model_initialization_sha256=contract["derived_initialization"][
+            "model_initialization_sha256"
+        ],
         index_sha256=None,
         batch_size=1,
         epochs=61.0 if audio else None,
         native_contract_path=str(path.resolve()),
-        native_contract_sha256=_sha_file(path),
+        native_contract_sha256=contract["_manifest_sha256"],
     )
 
 

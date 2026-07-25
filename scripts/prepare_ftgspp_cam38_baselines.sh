@@ -134,9 +134,9 @@ prepare_scene() {
       --seed-record "${seed_root}/prep.json" \
       --seed-record "${seed_root}/flow.json" \
       --seed-record "${seed_root}/train.json" \
-      --output "${ROOT}/runs/cam38_strict/${scene}/ftgspp/native_contract.json"
+      --output "${ROOT}/runs/cam38_strict/${scene}/ftgspp/native_contract"
   else
-    echo "post-success native contract: ${scene}/ftgspp/native_contract.json"
+    echo "post-success native contract: ${scene}/ftgspp/native_contract"
   fi
 }
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 
@@ -83,7 +82,7 @@ def main() -> None:
         if any(value not in (None, False) for value in forbidden):
             parser.error("--verify cannot be combined with finalization arguments")
         contract = verify_native_contract(args.verify)
-        digest = hashlib.sha256(args.verify.read_bytes()).hexdigest()
+        digest = contract["_manifest_sha256"]
     else:
         required = {
             "--model-kind": args.model_kind,
@@ -109,7 +108,7 @@ def main() -> None:
             train_log=args.train_log,
             seed_records=args.seed_record,
         )
-        digest = hashlib.sha256(args.output.read_bytes()).hexdigest()
+        digest = contract["_manifest_sha256"]
     print(
         json.dumps(
             {

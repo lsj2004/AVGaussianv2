@@ -104,9 +104,9 @@ prepare_and_train() {
       --upstream-root "${AUDIOGS_ROOT}" \
       --conversion-manifest "${data_root}/conversion_manifest.json" \
       --seed-record "${seed_record}" \
-      --output "${ROOT}/runs/cam38_strict/${source_scene}/audiogs/native_contract.json"
+      --output "${ROOT}/runs/cam38_strict/${source_scene}/audiogs/native_contract"
   else
-    echo "post-success native contract: ${source_scene}/audiogs/native_contract.json"
+    echo "post-success native contract: ${source_scene}/audiogs/native_contract"
   fi
 }
 

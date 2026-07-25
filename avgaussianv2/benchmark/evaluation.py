@@ -815,10 +815,6 @@ def audit_training_evidence(
         contract_path = Path(evidence.native_contract_path)
         try:
             _reject_symlink_components(contract_path)
-            if hashlib.sha256(contract_path.read_bytes()).hexdigest() != (
-                evidence.native_contract_sha256
-            ):
-                raise BenchmarkEvaluationError("native contract hash mismatch")
             kind = (
                 "audiogs"
                 if evidence.system_name == "native_audiogs"
@@ -829,6 +825,8 @@ def audit_training_evidence(
                 expected_scene=evidence.scene_id,
                 expected_model_kind=kind,
             )
+            if contract["_manifest_sha256"] != evidence.native_contract_sha256:
+                raise BenchmarkEvaluationError("native contract manifest hash mismatch")
         except Exception as error:
             if isinstance(error, BenchmarkEvaluationError):
                 raise
@@ -842,6 +840,12 @@ def audit_training_evidence(
             or contract["inputs"]["protocol_config"]["sha256"]
             != evidence.config_sha256
             or contract["upstream"]["source_sha256"] != evidence.source_sha256
+            or contract["derived_initialization"]["visual_initialization_sha256"]
+            != evidence.visual_initialization_sha256
+            or contract["derived_initialization"]["audio_initialization_sha256"]
+            != evidence.audio_initialization_sha256
+            or contract["derived_initialization"]["model_initialization_sha256"]
+            != evidence.model_initialization_sha256
         ):
             raise BenchmarkEvaluationError(
                 "native training contract/evaluation evidence mismatch"
