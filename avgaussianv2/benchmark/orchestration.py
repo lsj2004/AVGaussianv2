@@ -46,6 +46,104 @@ SCENES = ("scene1_opera", "Scene7playing")
 GPU_ORDER = ("joint_conditioned", "audio_only", "visual_only")
 SCHEMA = "avgaussianv2.cam38-scene-orchestration"
 MIN_FREE_BYTES = 300 * 1024**3
+FTGSPP_PYTHON = Path("/mnt/sda/lisujing/Dataset/FreeTimeGSPlusPlus/.venv/bin/python")
+
+
+def _cuda_probe_source(modules: Sequence[str]) -> str:
+    """Return a fail-closed CUDA/import probe for an isolated child runtime."""
+
+    return (
+        "import importlib,json,sys,torch;"
+        f"names={tuple(modules)!r};"
+        "loaded={};"
+        'exec("for name in names:\\n'
+        " module=importlib.import_module(name)\\n"
+        " loaded[name]=str(getattr(module,'__version__','unknown'))\");"
+        "assert torch.cuda.is_available(),'torch.cuda.is_available() is false';"
+        "assert torch.cuda.device_count()==1,"
+        "f'expected exactly one visible GPU, got {torch.cuda.device_count()}';"
+        "x=torch.arange(4096,device='cuda:0',dtype=torch.float32);"
+        "value=((x+1.0)*(x+2.0)).sum();"
+        "torch.cuda.synchronize();"
+        "assert bool(torch.isfinite(value).item()),'CUDA kernel returned non-finite';"
+        "print(json.dumps({'python':sys.executable,'torch':torch.__version__,"
+        "'cuda':torch.version.cuda,'device_count':torch.cuda.device_count(),"
+        "'device':torch.cuda.get_device_name(0),'modules':loaded},sort_keys=True))"
+    )
+
+
+def _runtime_probe_commands(
+    python_executable: str,
+) -> tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...]:
+    return (
+        (
+            "avgaussianv2",
+            (python_executable, "-c"),
+            ("numpy", "yaml", "soundfile", "gsplat", "tinycudann"),
+        ),
+        (
+            "ftgspp",
+            (str(FTGSPP_PYTHON), "-c"),
+            ("numpy", "gsplat", "tinycudann"),
+        ),
+        (
+            "audiogs",
+            ("conda", "run", "-n", "avcloud", "python", "-c"),
+            ("numpy", "yaml", "soundfile", "scipy", "librosa", "torchaudio"),
+        ),
+    )
+
+
+def _probe_gpu_runtimes(
+    gpus: Sequence[int], python_executable: str
+) -> dict[str, dict[str, object]]:
+    probes: dict[str, dict[str, object]] = {}
+    for gpu in gpus:
+        gpu_probes: dict[str, object] = {}
+        for name, prefix, modules in _runtime_probe_commands(python_executable):
+            command = [*prefix, _cuda_probe_source(modules)]
+            environment = dict(os.environ)
+            environment.update(
+                CUDA_DEVICE_ORDER="PCI_BUS_ID",
+                CUDA_VISIBLE_DEVICES=str(gpu),
+                PYTHONHASHSEED="42",
+                CUBLAS_WORKSPACE_CONFIG=":4096:8",
+            )
+            try:
+                completed = subprocess.run(
+                    command,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                )
+                lines = [line for line in completed.stdout.splitlines() if line.strip()]
+                payload = json.loads(lines[-1])
+                if (
+                    not isinstance(payload, dict)
+                    or payload.get("device_count") != 1
+                    or not isinstance(payload.get("modules"), dict)
+                    or set(payload["modules"]) != set(modules)
+                ):
+                    raise ValueError("probe returned an invalid dependency payload")
+            except (
+                IndexError,
+                OSError,
+                subprocess.CalledProcessError,
+                ValueError,
+            ) as error:
+                detail = (
+                    error.stderr.strip()
+                    if isinstance(error, subprocess.CalledProcessError)
+                    and isinstance(error.stderr, str)
+                    else str(error)
+                )
+                raise OrchestrationError(
+                    f"{name} CUDA preflight failed on physical GPU {gpu}: {detail}"
+                ) from error
+            gpu_probes[name] = payload
+        probes[str(gpu)] = gpu_probes
+    return probes
 
 
 class OrchestrationError(RuntimeError):
@@ -604,24 +702,8 @@ def _preflight(
         raise OrchestrationError(f"protocol config is missing: {config}")
     if shutil.which(python_executable) is None:
         raise OrchestrationError("selected Python executable is unavailable")
-    try:
-        dependency_probe = subprocess.run(
-            [
-                python_executable,
-                "-c",
-                "import json,numpy,torch,yaml;"
-                "print(json.dumps({'python':__import__('sys').executable,"
-                "'torch':torch.__version__,'cuda':torch.version.cuda}))",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-        dependencies = json.loads(dependency_probe)
-    except (OSError, subprocess.CalledProcessError, ValueError) as error:
-        raise OrchestrationError(
-            f"selected Python lacks production dependencies: {error}"
-        ) from error
+    if shutil.which("conda") is None:
+        raise OrchestrationError("conda is unavailable for the AudioGS preflight")
     try:
         query = subprocess.run(
             [
@@ -642,6 +724,7 @@ def _preflight(
         raise OrchestrationError(f"cannot verify assigned GPUs: {error}") from error
     if any(gpu not in available or available[gpu] <= 0 for gpu in gpus):
         raise OrchestrationError("assigned GPU is unavailable or has no free memory")
+    runtime_probes = _probe_gpu_runtimes(gpus, python_executable)
     free = shutil.disk_usage(output_parent).free
     if free < MIN_FREE_BYTES:
         raise OrchestrationError(
@@ -663,10 +746,7 @@ def _preflight(
         "gpus": list(gpus),
         "free_bytes": free,
         "minimum_free_bytes": MIN_FREE_BYTES,
-        "dependencies": {
-            **dependencies,
-            "modules": ["torch", "yaml", "numpy"],
-        },
+        "gpu_runtime_probes": runtime_probes,
         "gpu_free_mib": {str(gpu): available[gpu] for gpu in gpus},
         "source_sha256": {
             str(path.relative_to(repository)): sha256_file(path)

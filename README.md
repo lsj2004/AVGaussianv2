@@ -233,6 +233,12 @@ Before native training, both scene configurations complete dependency, disk,
 GPU, and source-hash preflight. With `--gpus A,B,C`, FreeTimeGS++ scene 1 runs
 on physical GPU `A`, FreeTimeGS++ Scene7 on `B`, and the two AudioGS scenes run
 serially on `C`; each isolated child addresses its assigned card as `cuda:0`.
+The fail-closed GPU preflight maps each of `A`, `B`, and `C` into an isolated
+child of the configured `AVGAUSSIANV2_PYTHON`, the FreeTimeGS++ virtualenv, and
+the AudioGS `avcloud` conda environment. Every child must import its production
+dependencies (including gsplat/tiny-cuda-nn or the audio stack), observe exactly
+one CUDA device, allocate a `cuda:0` tensor, execute a kernel, and synchronize.
+No native baseline process is launched unless all nine runtime probes succeed.
 Preflight, status, protocol, and attempt-log records use immutable,
 hash-chained generations. A partial resume validates these records and every
 committed worker contract before writing anything; only workers with a durable
