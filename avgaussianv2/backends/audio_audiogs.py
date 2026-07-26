@@ -21,6 +21,40 @@ ModelFactory = Callable[[object], nn.Module]
 ForwardOverride = Callable[[nn.Module, Tensor, Tensor], Tensor]
 
 
+def _deterministic_stft_magnitude(
+    waveform: Tensor,
+    fft_size: int,
+    hop_size: int,
+    win_length: int,
+    window: Tensor,
+) -> Tensor:
+    """Match centered reflect STFT without CUDA reflection-pad backward."""
+    waveform = torch.nan_to_num(
+        waveform, nan=0.0, posinf=0.0, neginf=0.0
+    )
+    padding = int(fft_size) // 2
+    if waveform.shape[-1] <= padding:
+        raise ValueError("waveform is too short for reflected STFT padding")
+    reflected = torch.cat(
+        (
+            waveform[..., 1 : padding + 1].flip(-1),
+            waveform,
+            waveform[..., -padding - 1 : -1].flip(-1),
+        ),
+        dim=-1,
+    )
+    spectrum = torch.stft(
+        reflected,
+        n_fft=int(fft_size),
+        hop_length=int(hop_size),
+        win_length=int(win_length),
+        window=window.to(waveform.device),
+        center=False,
+        return_complex=True,
+    )
+    return torch.sqrt(torch.clamp(spectrum.abs().square(), min=1e-7))
+
+
 def _install_lightweight_scene_package(upstream_root: Path) -> None:
     """Avoid importing AudioGS dataset readers when only model math is needed."""
     module_name = "libs.datasets.scene"
@@ -198,6 +232,7 @@ class AudioGSBackend(nn.Module):
             module_name, class_name = "libs.criterions.Criterion_2", "Criterion"
         with _temporary_import_root(self.upstream_root):
             module = importlib.import_module(module_name)
+            module.stft = _deterministic_stft_magnitude
             criterion_type = getattr(module, class_name)
             criterion = criterion_type(self.checkpoint_config)
         if not isinstance(criterion, nn.Module):

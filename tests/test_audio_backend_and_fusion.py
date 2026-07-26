@@ -9,6 +9,7 @@ from torch import nn
 from avgaussianv2.backends.audio_audiogs import (
     AudioCheckpointError,
     AudioGSBackend,
+    _deterministic_stft_magnitude,
     _upstream_model_factory,
 )
 from avgaussianv2.contracts import AlignedAVSample, RGBDRender
@@ -24,6 +25,34 @@ def layer(in_channels: int, out_channels: int) -> nn.Sequential:
         nn.Conv2d(out_channels, out_channels, 3, padding=1),
         nn.ReLU(),
     )
+
+
+def test_deterministic_stft_matches_upstream_reflect_forward_and_backpropagates():
+    waveform = torch.randn(2, 800, requires_grad=True)
+    window = torch.hamming_window(400)
+    expected = torch.sqrt(
+        torch.clamp(
+            torch.stft(
+                waveform,
+                n_fft=512,
+                hop_length=160,
+                win_length=400,
+                window=window,
+                return_complex=True,
+            ).abs()
+            ** 2,
+            min=1e-7,
+        )
+    )
+
+    actual = _deterministic_stft_magnitude(
+        waveform, 512, 160, 400, window
+    )
+    actual.sum().backward()
+
+    torch.testing.assert_close(actual, expected)
+    assert waveform.grad is not None
+    assert torch.isfinite(waveform.grad).all()
 
 
 class TinyAudioUNet(nn.Module):
@@ -189,9 +218,11 @@ def test_audio_backend_builds_the_same_criterion_as_upstream_trainer(
             super().__init__()
             self.cfg = cfg
 
+    imported_module = SimpleNamespace(**{expected_class: FakeCriterion})
+
     def fake_import(name):
         imported.append(name)
-        return SimpleNamespace(**{expected_class: FakeCriterion})
+        return imported_module
 
     monkeypatch.setattr("avgaussianv2.backends.audio_audiogs.importlib.import_module", fake_import)
 
@@ -199,6 +230,7 @@ def test_audio_backend_builds_the_same_criterion_as_upstream_trainer(
 
     assert imported == [expected_module]
     assert criterion.cfg is config
+    assert imported_module.stft is _deterministic_stft_magnitude
 
 
 def test_audio_backend_rejects_unimplemented_enhanced_criterion() -> None:
