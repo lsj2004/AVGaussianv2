@@ -11,7 +11,7 @@ import os
 import random
 import sys
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 
@@ -73,6 +73,8 @@ from avgaussianv2.benchmark.training import (
     BenchmarkMode,
     FixedBudgetTrainer,
 )
+from avgaussianv2.contracts import AlignedAVSample
+from avgaussianv2.experiment.evaluation import move_sample
 
 
 def _load_json(path: Path) -> object:
@@ -81,6 +83,24 @@ def _load_json(path: Path) -> object:
 
 
 RuntimeBuilder = Callable[..., BenchmarkRuntime]
+
+
+class _DeviceSampleSequence(Sequence[AlignedAVSample]):
+    def __init__(
+        self, samples: Sequence[AlignedAVSample], device: torch.device
+    ) -> None:
+        self.samples = samples
+        self.device = device
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [
+                move_sample(sample, self.device) for sample in self.samples[index]
+            ]
+        return move_sample(self.samples[index], self.device)
 
 
 def _atomic_runtime_contract(
@@ -220,9 +240,12 @@ def run_worker(
                 index < 0 or index >= len(runtime.train_samples) for index in indices
             ):
                 raise ValueError("shared sample index is outside the training dataset")
+            training_samples = _DeviceSampleSequence(
+                runtime.train_samples, torch.device(device)
+            )
             result = FixedBudgetTrainer(config).run(
                 model=runtime.model,
-                train_samples=runtime.train_samples,
+                train_samples=training_samples,
                 shared_indices=indices,
                 mode=mode,
                 train_config=runtime.train_config,

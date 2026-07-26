@@ -35,6 +35,39 @@ from avgaussianv2.config import (
 )
 from avgaussianv2.models.fusion import AVGaussianFusionV2
 from avgaussianv2.models.rgbd import RGBDConditionEncoder
+from avgaussianv2.contracts import AlignedAVSample
+
+
+def test_benchmark_worker_moves_every_training_sample_tensor_to_device() -> None:
+    sample = AlignedAVSample(
+        scene_id="scene1_opera",
+        camera="cam00",
+        frame_index=0,
+        time_seconds=0.25,
+        visual_time=torch.zeros(1, 1),
+        w2c=torch.eye(4).unsqueeze(0),
+        intrinsic=torch.eye(3).unsqueeze(0),
+        audio_cam_pose=torch.zeros(1, 12),
+        source_audio=torch.zeros(1, 2, 8),
+        target_audio=torch.zeros(1, 2, 8),
+        target_rgb=torch.zeros(1, 2, 3, 3),
+        image_size=(2, 3),
+    )
+
+    moved = benchmark_worker._DeviceSampleSequence(
+        (sample,), torch.device("meta")
+    )[0]
+
+    assert moved.scene_id == sample.scene_id
+    assert moved.camera == sample.camera
+    assert moved.frame_index == sample.frame_index
+    assert moved.time_seconds == sample.time_seconds
+    assert moved.image_size == sample.image_size
+    assert {
+        value.device.type
+        for value in vars(moved).values()
+        if isinstance(value, torch.Tensor)
+    } == {"meta"}
 
 
 class _Model(nn.Module):
