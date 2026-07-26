@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import os
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -239,55 +240,58 @@ def prepare_cross_attention_run(
             "AudioGS contract is not A's exact acoustic-Gaussian initialization"
         )
 
-    protocol = Path(output_dir) / "protocol"
-    if protocol.exists() and any(protocol.iterdir()):
-        raise FileExistsError(f"cross-attention protocol already exists: {protocol}")
-    protocol.mkdir(parents=True, exist_ok=True)
-    resolved = protocol / "resolved_project.yaml"
-    write_resolved_project_config(derived_config, resolved)
-
     torch.manual_seed(training.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(training.seed)
     torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-    runtime = runtime_builder(
-        config_path=resolved,
-        device=torch.device(device),
-        trusted_upstream_artifacts=trusted_upstream_artifacts,
-    )
-    if not isinstance(runtime, BenchmarkRuntime):
-        raise TypeError("cross-attention runtime builder must return BenchmarkRuntime")
-    with runtime:
-        if (
-            runtime.visual_initialization_sha256
-            != base_compatibility.visual_initialization_sha256
-            or tuple(runtime.dataset_sample_ids)
-            != tuple(base_runtime["dataset_sample_ids"])
-            or runtime.dataset_identity_sha256
-            != base_runtime.get("dataset_identity_sha256")
-        ):
-            raise RuntimeError(
-                "cross-attention visual initialization or ordered dataset differs from A"
+    with tempfile.TemporaryDirectory(prefix="avgaussianv2-cross-prepare-") as temporary:
+        runtime_resolved = Path(temporary) / "resolved_project.yaml"
+        write_resolved_project_config(derived_config, runtime_resolved)
+        runtime = runtime_builder(
+            config_path=runtime_resolved,
+            device=torch.device(device),
+            trusted_upstream_artifacts=trusted_upstream_artifacts,
+        )
+        if not isinstance(runtime, BenchmarkRuntime):
+            raise TypeError("cross-attention runtime builder must return BenchmarkRuntime")
+        with runtime:
+            if (
+                runtime.visual_initialization_sha256
+                != base_compatibility.visual_initialization_sha256
+                or tuple(runtime.dataset_sample_ids)
+                != tuple(base_runtime["dataset_sample_ids"])
+                or runtime.dataset_identity_sha256
+                != base_runtime.get("dataset_identity_sha256")
+            ):
+                raise RuntimeError(
+                    "cross-attention visual initialization or ordered dataset differs from A"
+                )
+            trainable_parameters = sum(
+                parameter.numel() for parameter in runtime.model.parameters()
             )
-        trainable_parameters = sum(
-            parameter.numel() for parameter in runtime.model.parameters()
-        )
-        audio_parameters = sum(
-            parameter.numel() for parameter in runtime.model.audio.parameters()
-        )
-        runtime_identity = {
-            "config_sha256": runtime.config_sha256,
-            "source_sha256": runtime.source_sha256,
-            "visual_initialization_sha256": runtime.visual_initialization_sha256,
-            "audio_initialization_sha256": runtime.audio_initialization_sha256,
-            "model_initialization_sha256": runtime.model_initialization_sha256,
-            "dataset_identity_sha256": runtime.dataset_identity_sha256,
-            "dataset_sample_ids": list(runtime.dataset_sample_ids),
-            "model_parameters": trainable_parameters,
-            "audio_parameters": audio_parameters,
-        }
+            audio_parameters = sum(
+                parameter.numel() for parameter in runtime.model.audio.parameters()
+            )
+            runtime_identity = {
+                "config_sha256": runtime.config_sha256,
+                "source_sha256": runtime.source_sha256,
+                "visual_initialization_sha256": runtime.visual_initialization_sha256,
+                "audio_initialization_sha256": runtime.audio_initialization_sha256,
+                "model_initialization_sha256": runtime.model_initialization_sha256,
+                "dataset_identity_sha256": runtime.dataset_identity_sha256,
+                "dataset_sample_ids": list(runtime.dataset_sample_ids),
+                "model_parameters": trainable_parameters,
+                "audio_parameters": audio_parameters,
+            }
+
+    protocol = Path(output_dir) / "protocol"
+    if protocol.exists() and any(protocol.iterdir()):
+        raise FileExistsError(f"cross-attention protocol already exists: {protocol}")
+    protocol.mkdir(parents=True, exist_ok=True)
+    resolved = protocol / "resolved_project.yaml"
+    write_resolved_project_config(derived_config, resolved)
 
     compatibility = BenchmarkCompatibility(
         scene_id=scene_id,

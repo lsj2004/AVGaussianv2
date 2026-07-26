@@ -36,7 +36,11 @@ PROTOCOL="${OUTPUT}/protocol"
 WORKER="${OUTPUT}/worker"
 EVALUATIONS="${OUTPUT}/evaluations"
 FILM_EVALUATIONS="${ROOT}/runs/cam38_benchmark/${SCENE}/evaluations/joint_conditioned"
-PYTHON="${ROOT}/.venv/bin/python"
+PYTHON="${AVGAUSSIANV2_PYTHON:-/mnt/sda/lisujing/Dataset/FreeTimeGSPlusPlus/.venv/bin/python}"
+if [[ ! -x "${PYTHON}" ]]; then
+  echo "missing AVGaussianFusionv2 Python: ${PYTHON}" >&2
+  exit 2
+fi
 
 export PYTHONHASHSEED=42
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
