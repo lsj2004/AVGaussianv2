@@ -1495,6 +1495,7 @@ def _partial_evaluation_artifacts(
 def _inspect_partial_resume(
     output: Path,
     *,
+    stable_output: Path,
     scene: str,
     config_path: Path,
 ) -> tuple[frozenset[str], str]:
@@ -1573,7 +1574,7 @@ def _inspect_partial_resume(
                         )
                     _verify_worker_for_resume(
                         pinned_worker,
-                        stable_worker=output / "workers" / mode,
+                        stable_worker=stable_output / "workers" / mode,
                         worker_manifest=manifest,
                         scene=scene,
                         mode=mode,
@@ -1722,6 +1723,7 @@ def _inspect_partial_suite(
             except Exception:
                 _inspect_partial_resume(
                     scene_root,
+                    stable_output=output / scene,
                     scene=scene,
                     config_path=repository
                     / "configs"
@@ -1866,7 +1868,10 @@ def run_scene_benchmark(
             return _verifier(output, repository=repository, scene=scene)
         except Exception:
             resume_modes, resume_snapshot = _inspect_partial_resume(
-                output, scene=scene, config_path=config_path
+                output,
+                stable_output=output,
+                scene=scene,
+                config_path=config_path,
             )
     devices = parse_gpus(gpus)
     if output.exists() and not resume and any(output.iterdir()):

@@ -856,6 +856,39 @@ def test_suite_partial_resume_rejects_extra_before_preflight_or_mutation(
     assert _tree_digest(output) == before
 
 
+def test_suite_partial_resume_passes_stable_scene_path_to_worker_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repo"
+    output = tmp_path / "suite"
+    with orchestration.BenchmarkOutputLock(output) as pinned:
+        (pinned / "scene1_opera").mkdir()
+    observed: list[tuple[Path, Path]] = []
+    monkeypatch.setattr(
+        orchestration,
+        "verify_scene_outputs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("partial")),
+    )
+
+    def inspect(
+        path: Path,
+        *,
+        stable_output: Path,
+        scene: str,
+        config_path: Path,
+    ) -> tuple[frozenset[str], str]:
+        del scene, config_path
+        observed.append((path, stable_output))
+        return frozenset(), "snapshot"
+
+    monkeypatch.setattr(orchestration, "_inspect_partial_resume", inspect)
+
+    orchestration._inspect_partial_suite(output, repository=repository)
+
+    assert str(observed[0][0]).startswith("/proc/self/fd/")
+    assert observed[0][1] == output / "scene1_opera"
+
+
 def test_failed_prepare_protocol_is_safe_to_retry_only_with_exact_evidence(
     tmp_path: Path,
 ) -> None:
