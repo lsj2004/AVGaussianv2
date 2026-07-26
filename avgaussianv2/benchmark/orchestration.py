@@ -27,6 +27,7 @@ from avgaussianv2.benchmark.evaluation import (
     CONTINUATION_SYSTEMS,
     NATIVE_SYSTEMS,
     REPORTING_STEPS,
+    audit_training_evidence,
     verify_evaluation,
 )
 from avgaussianv2.benchmark.artifacts import (
@@ -40,7 +41,11 @@ from avgaussianv2.benchmark.output import (
     BenchmarkOutputLock,
     validate_output_children,
 )
-from avgaussianv2.benchmark.production import expected_identity, sha256_file
+from avgaussianv2.benchmark.production import (
+    continuation_training_evidence,
+    expected_identity,
+    sha256_file,
+)
 from avgaussianv2.benchmark.report import verify_scene_report, verify_suite_report
 from avgaussianv2.benchmark.training import (
     hash_shared_indices,
@@ -1566,8 +1571,12 @@ def _inspect_partial_resume(
                         raise OrchestrationError(
                             f"{mode} partial output is incompatible"
                         )
-                    verify_resume_artifacts(
-                        pinned_worker, worker_manifest=manifest
+                    _verify_worker_for_resume(
+                        pinned_worker,
+                        stable_worker=output / "workers" / mode,
+                        worker_manifest=manifest,
+                        scene=scene,
+                        mode=mode,
                     )
                     resume_modes.add(mode)
         evaluations = pinned / "evaluations"
@@ -1588,6 +1597,31 @@ def _inspect_partial_resume(
         ):
             raise OrchestrationError("partial scene report cannot be resumed")
         return frozenset(resume_modes), _tree_snapshot_sha256(pinned)
+
+
+def _verify_worker_for_resume(
+    pinned_worker: Path,
+    *,
+    stable_worker: Path,
+    worker_manifest: Mapping[str, object],
+    scene: str,
+    mode: str,
+) -> None:
+    """Audit finalized outputs by immutable milestones; otherwise audit resume state."""
+    if (pinned_worker / "artifact_hashes.json").is_file():
+        for step in REPORTING_STEPS:
+            evidence = continuation_training_evidence(
+                stable_worker,
+                scene_id=scene,
+                system=mode,
+                step=step,
+            )
+            audit_training_evidence(
+                evidence,
+                expected_identity(scene, mode, step),
+            )
+        return
+    verify_resume_artifacts(pinned_worker, worker_manifest=worker_manifest)
 
 
 def _verify_failed_prepare_protocol(

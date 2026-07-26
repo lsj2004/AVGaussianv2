@@ -613,6 +613,52 @@ def test_worker_resume_flag_is_only_emitted_for_committed_modes(tmp_path: Path) 
     assert "--resume" not in by_mode["visual_only"]
 
 
+def test_completed_worker_resume_uses_final_evidence_not_rolling_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pinned_worker = tmp_path / "pinned"
+    stable_worker = tmp_path / "stable"
+    pinned_worker.mkdir()
+    stable_worker.mkdir()
+    (pinned_worker / "artifact_hashes.json").write_text("{}")
+    evidence_calls: list[tuple[Path, str, str, int]] = []
+    audit_calls: list[tuple[object, object]] = []
+
+    def evidence(worker: Path, *, scene_id: str, system: str, step: int) -> object:
+        evidence_calls.append((worker, scene_id, system, step))
+        return ("evidence", step)
+
+    monkeypatch.setattr(orchestration, "continuation_training_evidence", evidence)
+    monkeypatch.setattr(
+        orchestration,
+        "audit_training_evidence",
+        lambda item, identity: audit_calls.append((item, identity)),
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "verify_resume_artifacts",
+        lambda *_args, **_kwargs: pytest.fail(
+            "completed output used rolling resume inventory"
+        ),
+    )
+
+    orchestration._verify_worker_for_resume(
+        pinned_worker,
+        stable_worker=stable_worker,
+        worker_manifest={},
+        scene="scene1_opera",
+        mode="audio_only",
+    )
+
+    assert evidence_calls == [
+        (stable_worker, "scene1_opera", "audio_only", step)
+        for step in orchestration.REPORTING_STEPS
+    ]
+    assert [item[0] for item in audit_calls] == [
+        ("evidence", step) for step in orchestration.REPORTING_STEPS
+    ]
+
+
 def test_suite_runs_scenes_in_declared_order_then_builds_and_verifies_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
