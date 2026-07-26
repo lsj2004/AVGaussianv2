@@ -91,15 +91,9 @@ class ModelConfig:
     audio_time_patch: int = 4
     audio_transformer_layers: int = 4
     audio_transformer_heads: int = 4
-    audio_pose_tokens: int = 2
     audio_dropout: float = 0.0
     audio_cross_gate_init: float = 0.01
     audio_residual_scale: float = 0.05
-    audio_loss_l1_weight: float = 1.0
-    audio_loss_mse_weight: float = 0.1
-    audio_loss_ild_weight: float = 0.1
-    audio_loss_ipd_weight: float = 0.1
-    audio_loss_lre_weight: float = 0.1
     sample_rate: int = 16_000
     condition_height: int = 64
     condition_width: int = 96
@@ -126,28 +120,12 @@ class ModelConfig:
             audio_transformer_heads=int(
                 raw.get("audio_transformer_heads", defaults.audio_transformer_heads)
             ),
-            audio_pose_tokens=int(raw.get("audio_pose_tokens", defaults.audio_pose_tokens)),
             audio_dropout=float(raw.get("audio_dropout", defaults.audio_dropout)),
             audio_cross_gate_init=float(
                 raw.get("audio_cross_gate_init", defaults.audio_cross_gate_init)
             ),
             audio_residual_scale=float(
                 raw.get("audio_residual_scale", defaults.audio_residual_scale)
-            ),
-            audio_loss_l1_weight=float(
-                raw.get("audio_loss_l1_weight", defaults.audio_loss_l1_weight)
-            ),
-            audio_loss_mse_weight=float(
-                raw.get("audio_loss_mse_weight", defaults.audio_loss_mse_weight)
-            ),
-            audio_loss_ild_weight=float(
-                raw.get("audio_loss_ild_weight", defaults.audio_loss_ild_weight)
-            ),
-            audio_loss_ipd_weight=float(
-                raw.get("audio_loss_ipd_weight", defaults.audio_loss_ipd_weight)
-            ),
-            audio_loss_lre_weight=float(
-                raw.get("audio_loss_lre_weight", defaults.audio_loss_lre_weight)
             ),
             sample_rate=int(raw.get("sample_rate", defaults.sample_rate)),
             condition_height=int(raw.get("condition_height", defaults.condition_height)),
@@ -189,12 +167,16 @@ class ModelConfig:
                 "model.audio_render_strategy must remain native_residual"
             )
         if self.audio_backend == "cross_attention_tokens":
+            if self.audio_model_class != "Audio3DGSMonoDiffGSOnly":
+                raise ValueError(
+                    "cross_attention_tokens requires "
+                    "model.audio_model_class=Audio3DGSMonoDiffGSOnly"
+                )
             cross_positive = {
                 "audio_freq_patch": self.audio_freq_patch,
                 "audio_time_patch": self.audio_time_patch,
                 "audio_transformer_layers": self.audio_transformer_layers,
                 "audio_transformer_heads": self.audio_transformer_heads,
-                "audio_pose_tokens": self.audio_pose_tokens,
             }
             for name, value in cross_positive.items():
                 if value <= 0:
@@ -209,18 +191,6 @@ class ModelConfig:
                 raise ValueError("model.audio_cross_gate_init must be in [0,1]")
             if self.audio_residual_scale <= 0:
                 raise ValueError("model.audio_residual_scale must be positive")
-            loss_weights = {
-                "audio_loss_l1_weight": self.audio_loss_l1_weight,
-                "audio_loss_mse_weight": self.audio_loss_mse_weight,
-                "audio_loss_ild_weight": self.audio_loss_ild_weight,
-                "audio_loss_ipd_weight": self.audio_loss_ipd_weight,
-                "audio_loss_lre_weight": self.audio_loss_lre_weight,
-            }
-            for name, value in loss_weights.items():
-                if value < 0:
-                    raise ValueError(f"model.{name} must be non-negative")
-            if sum(loss_weights.values()) == 0:
-                raise ValueError("at least one model audio loss weight must be positive")
 
 
 @dataclass(frozen=True)

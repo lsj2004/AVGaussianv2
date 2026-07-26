@@ -176,9 +176,23 @@ def test_cross_attention_report_is_update_matched_and_reuses_causal_checkpoint(
         evaluations=values,
         expected_sample_count=2,
         output_dir=tmp_path,
+        preparation={
+            "scene_id": "scene1_opera",
+            "alignment": {
+                "comparison_scope": (
+                    "shared_audiogs_gaussians_postprocessor_ablation"
+                ),
+                "same_audiogs_checkpoint_as_a": True,
+                "audio_criterion": "native_audiogs_checkpoint_criterion",
+            },
+            "audiogs_contract": {"checkpoint_sha256": _sha("audiogs")},
+        },
     )
 
-    assert report["comparison_scope"] == "full_audio_system_update_matched"
+    assert (
+        report["comparison_scope"]
+        == "shared_audiogs_gaussians_postprocessor_update_matched"
+    )
     assert report["paired_by_step"]["30000"][
         "cross_attention_vs_film_unet"
     ]["audio_total"]["win_rate"] == 1.0

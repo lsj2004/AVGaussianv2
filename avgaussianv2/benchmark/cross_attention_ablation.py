@@ -1,4 +1,4 @@
-"""Strict preparation for the independent cross-attention audio backend."""
+"""Strict preparation for AudioGS-native cross-attention conditioning."""
 
 from __future__ import annotations
 
@@ -161,10 +161,11 @@ def prepare_cross_attention_run(
     device: torch.device | str,
     trusted_upstream_artifacts: bool,
     ftgspp_contract_dir: Path,
+    audiogs_contract_dir: Path,
     runtime_builder=build_production_runtime,
     native_verifier=verify_native_contract,
 ) -> dict[str, object]:
-    """Bind cross-attention to A's split, sample order, budget, and visual seed."""
+    """Bind cross-attention to A's data, budget, and both Gaussian checkpoints."""
     delta = validate_backend_only_delta(base_config, derived_config)
     audit_protocol_config(base_config)
     audit_protocol_config(derived_config)
@@ -220,6 +221,23 @@ def prepare_cross_attention_run(
         != sha256_file(derived_project.paths.visual_checkpoint)
     ):
         raise ValueError("FTGS++ contract is not A's exact visual initialization")
+    audio_contract_dir = Path(audiogs_contract_dir).absolute()
+    audio_contract = native_verifier(
+        audio_contract_dir,
+        expected_scene=scene_id,
+        expected_model_kind="audiogs",
+    )
+    if (
+        audio_contract["inputs"]["protocol_config"]["sha256"]
+        != delta["base_config_sha256"]
+        or Path(audio_contract["checkpoint"]["path"]).resolve()
+        != derived_project.paths.audio_checkpoint.resolve()
+        or audio_contract["checkpoint"]["sha256"]
+        != sha256_file(derived_project.paths.audio_checkpoint)
+    ):
+        raise ValueError(
+            "AudioGS contract is not A's exact acoustic-Gaussian initialization"
+        )
 
     protocol = Path(output_dir) / "protocol"
     if protocol.exists() and any(protocol.iterdir()):
@@ -323,15 +341,23 @@ def prepare_cross_attention_run(
             "manifest_sha256": contract["_manifest_sha256"],
             "checkpoint_sha256": contract["checkpoint"]["sha256"],
         },
+        "audiogs_contract": {
+            "path": str(audio_contract_dir),
+            "manifest_sha256": audio_contract["_manifest_sha256"],
+            "checkpoint_sha256": audio_contract["checkpoint"]["sha256"],
+        },
         "alignment": {
-            "comparison_scope": "full_audio_system",
+            "comparison_scope": "shared_audiogs_gaussians_postprocessor_ablation",
             "same_visual_initialization_as_a": True,
+            "same_audiogs_checkpoint_as_a": True,
             "same_ordered_dataset_as_a": True,
             "same_shared_indices_as_a": True,
             "same_update_budget_as_a": True,
             "shared_indices_sha256": base_compatibility.index_sha256,
             "only_raw_config_delta": "model.audio_backend",
             "audiogs_unet_used_by_cross_attention": False,
+            "cross_attention_input": "native_audiogs_gaussian_render",
+            "audio_criterion": "native_audiogs_checkpoint_criterion",
         },
         "token_protocol": {
             "audio_position": "deterministic_2d_sinusoidal_frequency_time",

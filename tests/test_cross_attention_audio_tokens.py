@@ -1,15 +1,49 @@
+from pathlib import Path
+
 import pytest
 import torch
+from torch import nn
 
+import avgaussianv2.models.cross_attention_audio as cross_module
+from avgaussianv2.backends.audio_audiogs import AudioCheckpointError
 from avgaussianv2.contracts import RGBDRender
 from avgaussianv2.models.audio_tokens import AudioSTFTTokenizer, AudioSpectrogramHead
 from avgaussianv2.models.cross_attention_audio import (
     AudioVisualTokenAudioBackend,
     GatedCrossAttentionBlock,
-    WaveformReconstructionLoss,
 )
 from avgaussianv2.models.positional import grid_position_encoding
 from avgaussianv2.models.visual_tokens import RGBDTokenEncoder
+
+
+class TinyNativeAudioGS(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.gaussian_gain = nn.Parameter(torch.tensor(0.75))
+        self.renderer = nn.Linear(1, 1)
+
+    def forward(self, cam_pose, source_audio):
+        del cam_pose
+        return source_audio * self.gaussian_gain
+
+
+def cross_backend(**kwargs) -> AudioVisualTokenAudioBackend:
+    defaults = {
+        "d_model": 32,
+        "num_layers": 1,
+        "num_heads": 4,
+        "n_fft": 32,
+        "hop_length": 8,
+        "win_length": 16,
+        "freq_patch": 4,
+        "time_patch": 2,
+    }
+    defaults.update(kwargs)
+    return AudioVisualTokenAudioBackend(
+        TinyNativeAudioGS(),
+        Path("native-audiogs.pth"),
+        **defaults,
+    )
 
 
 def test_audio_stft_tokenizer_returns_time_frequency_tokens() -> None:
@@ -136,18 +170,7 @@ def test_grid_position_encoding_identifies_every_row_and_column() -> None:
 
 
 def test_cross_attention_condition_path_has_gradient_on_first_step() -> None:
-    backend = AudioVisualTokenAudioBackend(
-        d_model=32,
-        num_layers=1,
-        num_heads=4,
-        n_fft=32,
-        hop_length=8,
-        win_length=16,
-        freq_patch=4,
-        time_patch=2,
-        pose_tokens=1,
-        cross_gate_init=0.01,
-    )
+    backend = cross_backend(cross_gate_init=0.01)
     condition = torch.randn(2, 6, 32, requires_grad=True)
     prediction = backend.render(
         torch.randn(2, 12),
@@ -183,18 +206,7 @@ def test_gated_cross_attention_block_reaches_memory_when_gate_opens() -> None:
 
 
 def test_audio_visual_token_backend_uses_condition_only_when_gate_opens() -> None:
-    backend = AudioVisualTokenAudioBackend(
-        d_model=32,
-        num_layers=1,
-        num_heads=4,
-        n_fft=32,
-        hop_length=8,
-        win_length=16,
-        freq_patch=4,
-        time_patch=2,
-        pose_tokens=1,
-        cross_gate_init=0.0,
-    )
+    backend = cross_backend(cross_gate_init=0.0)
     source_audio = torch.randn(2, 2, 160)
     cam_pose = torch.randn(2, 12)
     condition_a = torch.randn(2, 6, 32)
@@ -217,75 +229,48 @@ def test_audio_visual_token_backend_uses_condition_only_when_gate_opens() -> Non
     assert condition.grad.abs().sum() > 0
 
 
-def test_audio_visual_token_backend_builds_waveform_criterion() -> None:
-    backend = AudioVisualTokenAudioBackend(
-        d_model=32,
-        num_layers=1,
-        num_heads=4,
-        n_fft=32,
-        hop_length=8,
-        win_length=16,
-        freq_patch=4,
-        time_patch=2,
+def test_cross_backend_starts_from_native_audiogs_and_removes_unet() -> None:
+    backend = cross_backend(cross_gate_init=0.01)
+    source = torch.randn(2, 2, 160)
+    pose = torch.randn(2, 12)
+    native = source * backend.model.gaussian_gain
+
+    torch.testing.assert_close(backend.render(pose, source), native)
+    assert isinstance(backend.model.renderer, nn.Identity)
+
+    conditioned = backend.render(
+        pose,
+        source,
+        condition=torch.randn(2, 6, 32),
     )
-    criterion = backend.build_criterion()
-    predicted = torch.zeros(2, 2, 64)
-    target = torch.ones(2, 2, 64)
-
-    losses = criterion(predicted, target)
-
-    assert set(losses) == {
-        "total_loss",
-        "wave_l1",
-        "wave_mse",
-        "ild_loss",
-        "ipd_loss",
-        "lre_loss",
-    }
-    assert losses["total_loss"] > 0
-
-
-def test_waveform_reconstruction_loss_adds_differentiable_spatial_terms() -> None:
-    criterion = WaveformReconstructionLoss(
-        n_fft=32,
-        hop_length=8,
-        win_length=16,
-        l1_weight=0.0,
-        mse_weight=0.0,
-        ild_weight=1.0,
-        ipd_weight=1.0,
-        lre_weight=1.0,
+    assert conditioned.shape == native.shape
+    assert not torch.allclose(conditioned, source)
+    assert all(
+        parameter is not backend.model.gaussian_gain
+        for parameter in backend.film_parameters()
     )
-    time = torch.linspace(0.0, 1.0, 160)
-    left = torch.sin(2 * torch.pi * 4 * time)
-    right = 0.5 * torch.sin(2 * torch.pi * 4 * time + 0.4)
-    target = torch.stack([left, right], dim=0).unsqueeze(0)
-    predicted = torch.stack([right, left], dim=0).unsqueeze(0).detach().requires_grad_()
-
-    losses = criterion(predicted, target)
-
-    assert losses["ild_loss"] > 0
-    assert losses["ipd_loss"] > 0
-    assert losses["lre_loss"] > 0
-    losses["total_loss"].backward()
-    assert predicted.grad is not None
-    assert torch.isfinite(predicted.grad).all()
-    assert predicted.grad.abs().sum() > 0
+    assert backend.audio_unet_parameters() == []
 
 
-def test_waveform_reconstruction_loss_zero_spatial_terms_for_matching_audio() -> None:
-    criterion = WaveformReconstructionLoss(
-        n_fft=32,
-        hop_length=8,
-        win_length=16,
-        ild_weight=1.0,
-        ipd_weight=1.0,
-        lre_weight=1.0,
+def test_cross_backend_reuses_audiogs_checkpoint_criterion(monkeypatch) -> None:
+    backend = cross_backend()
+    backend.checkpoint_config = object()
+    backend.upstream_root = Path("/audio-upstream")
+    criterion = nn.L1Loss()
+    seen = []
+    monkeypatch.setattr(
+        cross_module,
+        "build_audiogs_criterion",
+        lambda config, root: seen.append((config, root)) or criterion,
     )
-    audio = torch.randn(2, 2, 160)
 
-    losses = criterion(audio, audio.clone())
+    assert backend.build_criterion() is criterion
+    assert seen == [(backend.checkpoint_config, backend.upstream_root)]
 
-    assert losses["ild_loss"] == 0
-    assert losses["ipd_loss"] == 0
-    assert losses["lre_loss"] == 0
+
+def test_cross_backend_loader_rejects_non_gs_only_model_before_io() -> None:
+    with pytest.raises(AudioCheckpointError, match="Audio3DGSMonoDiffGSOnly"):
+        AudioVisualTokenAudioBackend.load(
+            Path("/missing.pth"),
+            model_class="Audio3DGS",
+        )

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from avgaussianv2.benchmark.cross_attention_ablation import (
     CAUSAL_EVALUATION_SYSTEMS,
+    verify_cross_attention_preparation,
 )
 from avgaussianv2.benchmark.cross_attention_report import (
     build_cross_attention_scene_report,
@@ -21,6 +22,7 @@ def main() -> None:
     parser.add_argument("--scene-id", required=True)
     parser.add_argument("--film-eval-root", type=Path, required=True)
     parser.add_argument("--cross-eval-root", type=Path, required=True)
+    parser.add_argument("--protocol-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--expected-samples", type=int, required=True)
     args = parser.parse_args()
@@ -49,6 +51,7 @@ def main() -> None:
         evaluations=evaluations,
         expected_sample_count=args.expected_samples,
         output_dir=args.output_dir,
+        preparation=verify_cross_attention_preparation(args.protocol_dir),
     )
     print(
         json.dumps(

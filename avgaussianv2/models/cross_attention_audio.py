@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor, nn
 
+from avgaussianv2.backends.audio_audiogs import (
+    AudioCheckpointError,
+    ModelFactory,
+    _upstream_model_factory,
+    build_audiogs_criterion,
+)
 from avgaussianv2.models.audio_tokens import AudioSpectrogramHead, AudioSTFTTokenizer
-from avgaussianv2.models.visual_tokens import PoseTokenEncoder
 
 
 def _validate_token_tensor(name: str, value: Tensor, d_model: int) -> None:
@@ -160,14 +165,23 @@ class AudioVisualTokenTransformer(nn.Module):
 
 
 class AudioVisualTokenAudioBackend(nn.Module):
+    """AudioGS-native renderer followed by an RGBD cross-attention residual.
+
+    The upstream AudioGS model must be the GS-only variant. Its renderer U-Net
+    is removed after checkpoint loading, so every prediction necessarily starts
+    from the acoustic Gaussian render rather than the source waveform or U-Net.
+    """
+
     def __init__(
         self,
+        model: nn.Module,
+        source_path: Path,
         *,
+        checkpoint_config: object | None = None,
+        upstream_root: Path | None = None,
         d_model: int = 128,
         num_layers: int = 4,
         num_heads: int = 4,
-        pose_dim: int = 12,
-        pose_tokens: int = 2,
         n_fft: int = 512,
         hop_length: int = 160,
         win_length: int = 400,
@@ -177,19 +191,20 @@ class AudioVisualTokenAudioBackend(nn.Module):
         dropout: float = 0.0,
         cross_gate_init: float = 0.01,
         residual_scale: float = 0.05,
-        loss_l1_weight: float = 1.0,
-        loss_mse_weight: float = 0.1,
-        loss_ild_weight: float = 0.1,
-        loss_ipd_weight: float = 0.1,
-        loss_lre_weight: float = 0.1,
     ) -> None:
-        super().__init__()
+        nn.Module.__init__(self)
+        if not isinstance(model, nn.Module):
+            raise TypeError("AudioGS model must be a torch module")
+        if not hasattr(model, "renderer"):
+            raise TypeError("AudioGS model is missing renderer")
+        # The GS-only forward never calls renderer. Removing it makes accidental
+        # U-Net use impossible and avoids carrying unrelated trainable weights.
+        model.renderer = nn.Identity()
+        self.model = model
+        self.source_path = Path(source_path)
+        self.checkpoint_config = checkpoint_config
+        self.upstream_root = None if upstream_root is None else Path(upstream_root)
         self.d_model = int(d_model)
-        self.loss_l1_weight = float(loss_l1_weight)
-        self.loss_mse_weight = float(loss_mse_weight)
-        self.loss_ild_weight = float(loss_ild_weight)
-        self.loss_ipd_weight = float(loss_ipd_weight)
-        self.loss_lre_weight = float(loss_lre_weight)
         self.tokenizer = AudioSTFTTokenizer(
             d_model=d_model,
             n_fft=n_fft,
@@ -197,11 +212,6 @@ class AudioVisualTokenAudioBackend(nn.Module):
             win_length=win_length,
             freq_patch=freq_patch,
             time_patch=time_patch,
-        )
-        self.pose_encoder = PoseTokenEncoder(
-            pose_dim=pose_dim,
-            d_model=d_model,
-            num_tokens=pose_tokens,
         )
         self.transformer = AudioVisualTokenTransformer(
             d_model=d_model,
@@ -220,6 +230,60 @@ class AudioVisualTokenAudioBackend(nn.Module):
             time_patch=time_patch,
             residual_scale=residual_scale,
         )
+        nn.init.zeros_(self.head.projection.bias)
+
+    @classmethod
+    def load(
+        cls,
+        checkpoint: str | Path,
+        *,
+        model_factory: ModelFactory | None = None,
+        upstream_root: str | Path | None = None,
+        model_class: str = "Audio3DGSMonoDiffGSOnly",
+        **kwargs,
+    ) -> "AudioVisualTokenAudioBackend":
+        if model_class != "Audio3DGSMonoDiffGSOnly":
+            raise AudioCheckpointError(
+                "cross-attention backend requires Audio3DGSMonoDiffGSOnly "
+                "so its base prediction is guaranteed to come from AudioGS gaussians"
+            )
+        checkpoint_path = Path(checkpoint)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"AudioGS checkpoint does not exist: {checkpoint_path}"
+            )
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict) or "model_state_dict" not in payload:
+            raise AudioCheckpointError("AudioGS checkpoint is missing model_state_dict")
+        if model_factory is None:
+            if upstream_root is None:
+                raise AudioCheckpointError(
+                    "upstream_root is required when model_factory is not provided"
+                )
+            model_factory = _upstream_model_factory(Path(upstream_root), model_class)
+        checkpoint_config = payload.get("cfg")
+        model = model_factory(checkpoint_config)
+        if not isinstance(model, nn.Module):
+            raise AudioCheckpointError("AudioGS model factory must return a torch module")
+        if not hasattr(model, "renderer"):
+            raise AudioCheckpointError("AudioGS model is missing renderer")
+        checkpoint_state = dict(payload["model_state_dict"])
+        initialized_state = model.state_dict()
+        for cache_name in (
+            "static_source_mag",
+            "static_phase_L",
+            "static_phase_R",
+        ):
+            if cache_name in checkpoint_state and cache_name in initialized_state:
+                checkpoint_state[cache_name] = initialized_state[cache_name]
+        model.load_state_dict(checkpoint_state, strict=True)
+        return cls(
+            model,
+            checkpoint_path,
+            checkpoint_config=checkpoint_config,
+            upstream_root=None if upstream_root is None else Path(upstream_root),
+            **kwargs,
+        )
 
     def _condition_tokens(self, condition: Tensor, batch_size: int) -> Tensor:
         if condition.ndim == 2:
@@ -229,39 +293,31 @@ class AudioVisualTokenAudioBackend(nn.Module):
             raise ValueError("condition must match source_audio batch size")
         return condition
 
-    def _memory_tokens(
-        self,
-        cam_pose: Tensor,
-        audio_tokens: Tensor,
-        condition: Tensor | None,
-    ) -> Tensor:
-        if cam_pose.ndim != 2 or cam_pose.shape[0] != audio_tokens.shape[0]:
-            raise ValueError(
-                "cam_pose must have shape (B,features) and match source_audio batch size"
-            )
-        pose_tokens = self.pose_encoder(
-            cam_pose.to(device=audio_tokens.device, dtype=audio_tokens.dtype)
-        )
-        memory = [pose_tokens]
-        if condition is not None:
-            condition_tokens = self._condition_tokens(condition, audio_tokens.shape[0])
-            memory.insert(
-                0,
-                condition_tokens.to(device=audio_tokens.device, dtype=audio_tokens.dtype),
-            )
-        return torch.cat(memory, dim=1)
-
     def render(
         self,
         cam_pose: Tensor,
         source_audio: Tensor,
         condition: Tensor | None = None,
     ) -> Tensor:
-        batch = self.tokenizer(source_audio)
-        memory_tokens = self._memory_tokens(cam_pose, batch.tokens, condition)
-        tokens = self.transformer(batch.tokens, memory_tokens)
+        if source_audio.ndim != 3 or source_audio.shape[1] != 2:
+            raise ValueError("source_audio must have shape (B,2,samples)")
+        if cam_pose.ndim != 2 or cam_pose.shape[0] != source_audio.shape[0]:
+            raise ValueError(
+                "cam_pose must have shape (B,features) and match source audio"
+            )
+        native = self.model(cam_pose, source_audio)
+        if condition is None:
+            return native
+        batch = self.tokenizer(native)
+        memory_tokens = self._condition_tokens(condition, batch.tokens.shape[0])
+        memory_tokens = memory_tokens.to(
+            device=batch.tokens.device,
+            dtype=batch.tokens.dtype,
+        )
+        conditioned_tokens = self.transformer(batch.tokens, memory_tokens)
+        condition_delta = conditioned_tokens - batch.tokens
         return self.head(
-            tokens,
+            condition_delta,
             batch.grid_size,
             batch.source_stft,
             length=batch.original_samples,
@@ -276,26 +332,22 @@ class AudioVisualTokenAudioBackend(nn.Module):
         return self.render(cam_pose, source_audio, condition=condition)
 
     def build_criterion(self) -> nn.Module:
-        return WaveformReconstructionLoss(
-            n_fft=self.tokenizer.n_fft,
-            hop_length=self.tokenizer.hop_length,
-            win_length=self.tokenizer.win_length,
-            l1_weight=self.loss_l1_weight,
-            mse_weight=self.loss_mse_weight,
-            ild_weight=self.loss_ild_weight,
-            ipd_weight=self.loss_ipd_weight,
-            lre_weight=self.loss_lre_weight,
+        return build_audiogs_criterion(
+            self.checkpoint_config,
+            self.upstream_root,
         )
 
     def acoustic_parameters(self) -> list[nn.Parameter]:
         return [
-            *_parameters([self.tokenizer, self.head]),
-            *self.transformer.audio_parameters(),
+            parameter
+            for name, parameter in self.model.named_parameters()
+            if not name.startswith("renderer.")
         ]
 
     def conditioning_parameters(self) -> list[nn.Parameter]:
         return [
-            *_parameters([self.pose_encoder]),
+            *_parameters([self.tokenizer, self.head]),
+            *self.transformer.audio_parameters(),
             *self.transformer.conditioning_parameters(),
         ]
 
@@ -304,112 +356,3 @@ class AudioVisualTokenAudioBackend(nn.Module):
 
     def audio_unet_parameters(self) -> list[nn.Parameter]:
         return []
-
-
-class WaveformReconstructionLoss(nn.Module):
-    def __init__(
-        self,
-        *,
-        l1_weight: float = 1.0,
-        mse_weight: float = 0.1,
-        ild_weight: float = 0.1,
-        ipd_weight: float = 0.1,
-        lre_weight: float = 0.1,
-        n_fft: int = 512,
-        hop_length: int = 160,
-        win_length: int = 400,
-        eps: float = 1e-6,
-    ) -> None:
-        super().__init__()
-        weights = {
-            "l1_weight": l1_weight,
-            "mse_weight": mse_weight,
-            "ild_weight": ild_weight,
-            "ipd_weight": ipd_weight,
-            "lre_weight": lre_weight,
-        }
-        for name, value in weights.items():
-            if value < 0:
-                raise ValueError(f"{name} must be non-negative")
-        if sum(float(value) for value in weights.values()) == 0:
-            raise ValueError("at least one loss weight must be positive")
-        if n_fft <= 0 or hop_length <= 0 or win_length <= 0:
-            raise ValueError("STFT parameters must be positive")
-        if win_length > n_fft:
-            raise ValueError("win_length must not exceed n_fft")
-        if eps <= 0:
-            raise ValueError("eps must be positive")
-        self.l1_weight = float(l1_weight)
-        self.mse_weight = float(mse_weight)
-        self.ild_weight = float(ild_weight)
-        self.ipd_weight = float(ipd_weight)
-        self.lre_weight = float(lre_weight)
-        self.n_fft = int(n_fft)
-        self.hop_length = int(hop_length)
-        self.win_length = int(win_length)
-        self.eps = float(eps)
-        self.register_buffer("window", torch.hann_window(self.win_length), persistent=False)
-
-    def _stft(self, waveform: Tensor) -> Tensor:
-        if waveform.ndim != 3 or waveform.shape[1] != 2:
-            raise ValueError("waveform must have shape (B,2,samples)")
-        if waveform.shape[-1] < self.win_length:
-            raise ValueError("waveform is shorter than win_length")
-        batch, channels, samples = waveform.shape
-        flat = waveform.reshape(batch * channels, samples)
-        spectrum = torch.stft(
-            flat,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            window=self.window.to(device=waveform.device, dtype=waveform.dtype),
-            return_complex=True,
-        )
-        return spectrum.reshape(batch, channels, spectrum.shape[-2], spectrum.shape[-1])
-
-    def _spatial_losses(self, predicted: Tensor, target: Tensor) -> dict[str, Tensor]:
-        predicted_stft = self._stft(predicted)
-        target_stft = self._stft(target)
-        pred_left, pred_right = predicted_stft[:, 0], predicted_stft[:, 1]
-        target_left, target_right = target_stft[:, 0], target_stft[:, 1]
-
-        pred_left_mag = pred_left.abs().clamp_min(self.eps)
-        pred_right_mag = pred_right.abs().clamp_min(self.eps)
-        target_left_mag = target_left.abs().clamp_min(self.eps)
-        target_right_mag = target_right.abs().clamp_min(self.eps)
-
-        pred_ild = torch.log(pred_left_mag) - torch.log(pred_right_mag)
-        target_ild = torch.log(target_left_mag) - torch.log(target_right_mag)
-        ild_loss = F.l1_loss(pred_ild, target_ild)
-
-        pred_phase = (pred_left / pred_left_mag) * (pred_right / pred_right_mag).conj()
-        target_phase = (target_left / target_left_mag) * (target_right / target_right_mag).conj()
-        ipd_loss = F.mse_loss(pred_phase.real, target_phase.real) + F.mse_loss(
-            pred_phase.imag,
-            target_phase.imag,
-        )
-
-        pred_lre = self._left_right_energy_db(pred_left_mag, pred_right_mag)
-        target_lre = self._left_right_energy_db(target_left_mag, target_right_mag)
-        lre_loss = F.l1_loss(pred_lre, target_lre)
-        return {"ild_loss": ild_loss, "ipd_loss": ipd_loss, "lre_loss": lre_loss}
-
-    def _left_right_energy_db(self, left_mag: Tensor, right_mag: Tensor) -> Tensor:
-        left_energy = left_mag.square().mean(dim=(-2, -1)).clamp_min(self.eps)
-        right_energy = right_mag.square().mean(dim=(-2, -1)).clamp_min(self.eps)
-        return 10.0 * (torch.log(left_energy) - torch.log(right_energy)) / torch.log(
-            left_energy.new_tensor(10.0)
-        )
-
-    def forward(self, predicted: Tensor, target: Tensor) -> dict[str, Tensor]:
-        if predicted.shape != target.shape or predicted.ndim != 3 or predicted.shape[1] != 2:
-            raise ValueError("predicted and target must share shape (B,2,samples)")
-        target = target.to(predicted)
-        wave_l1 = F.l1_loss(predicted, target)
-        wave_mse = F.mse_loss(predicted, target)
-        spatial = self._spatial_losses(predicted, target)
-        total = self.l1_weight * wave_l1 + self.mse_weight * wave_mse
-        total = total + self.ild_weight * spatial["ild_loss"]
-        total = total + self.ipd_weight * spatial["ipd_loss"]
-        total = total + self.lre_weight * spatial["lre_loss"]
-        return {"total_loss": total, "wave_l1": wave_l1, "wave_mse": wave_mse, **spatial}

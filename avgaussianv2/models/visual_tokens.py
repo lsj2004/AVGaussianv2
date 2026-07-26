@@ -87,35 +87,3 @@ class RGBDTokenEncoder(nn.Module):
         ):
             raise ValueError("content permutation must contain every token index once")
         return add_grid_position_encoding(tokens[:, indices], grid_size)
-
-
-class PoseTokenEncoder(nn.Module):
-    def __init__(
-        self,
-        *,
-        pose_dim: int = 12,
-        d_model: int = 128,
-        num_tokens: int = 2,
-        hidden_dim: int | None = None,
-    ) -> None:
-        super().__init__()
-        if pose_dim <= 0:
-            raise ValueError("pose_dim must be positive")
-        if d_model <= 0:
-            raise ValueError("d_model must be positive")
-        if num_tokens <= 0:
-            raise ValueError("num_tokens must be positive")
-        hidden = int(hidden_dim or max(d_model, pose_dim * 2))
-        self.pose_dim = int(pose_dim)
-        self.d_model = int(d_model)
-        self.num_tokens = int(num_tokens)
-        self.network = nn.Sequential(
-            nn.Linear(self.pose_dim, hidden),
-            nn.SiLU(inplace=True),
-            nn.Linear(hidden, self.num_tokens * self.d_model),
-        )
-
-    def forward(self, cam_pose: Tensor) -> Tensor:
-        if cam_pose.ndim != 2 or cam_pose.shape[-1] != self.pose_dim:
-            raise ValueError(f"cam_pose must have shape (B,{self.pose_dim})")
-        return self.network(cam_pose).view(cam_pose.shape[0], self.num_tokens, self.d_model)

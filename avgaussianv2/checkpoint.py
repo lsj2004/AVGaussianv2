@@ -79,15 +79,9 @@ def _compatibility(config: ProjectConfig) -> dict[str, Any]:
                 "audio_time_patch": config.model.audio_time_patch,
                 "audio_transformer_layers": config.model.audio_transformer_layers,
                 "audio_transformer_heads": config.model.audio_transformer_heads,
-                "audio_pose_tokens": config.model.audio_pose_tokens,
                 "audio_dropout": config.model.audio_dropout,
                 "audio_cross_gate_init": config.model.audio_cross_gate_init,
                 "audio_residual_scale": config.model.audio_residual_scale,
-                "audio_loss_l1_weight": config.model.audio_loss_l1_weight,
-                "audio_loss_mse_weight": config.model.audio_loss_mse_weight,
-                "audio_loss_ild_weight": config.model.audio_loss_ild_weight,
-                "audio_loss_ipd_weight": config.model.audio_loss_ipd_weight,
-                "audio_loss_lre_weight": config.model.audio_loss_lre_weight,
             }
         )
     return compatibility

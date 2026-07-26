@@ -30,6 +30,7 @@ BASE_CONFIG="${ROOT}/configs/benchmark_cam38/${SCENE}.yaml"
 CROSS_CONFIG="${ROOT}/configs/benchmark_cam38/${SCENE}_cross_attention.yaml"
 BASE_PROTOCOL="${ROOT}/runs/cam38_benchmark/${SCENE}/protocol"
 FTGSPP_CONTRACT="${ROOT}/runs/cam38_strict/${SCENE}/ftgspp/native_contract"
+AUDIOGS_CONTRACT="${ROOT}/runs/cam38_strict/${SCENE}/audiogs/native_contract"
 OUTPUT="${ROOT}/runs/cross_attention_ablation/${SCENE}"
 PROTOCOL="${OUTPUT}/protocol"
 WORKER="${OUTPUT}/worker"
@@ -50,6 +51,7 @@ case "${ACTION}" in
       --output-dir "${OUTPUT}" \
       --device cuda:0 \
       --ftgspp-contract "${FTGSPP_CONTRACT}" \
+      --audiogs-contract "${AUDIOGS_CONTRACT}" \
       --trust-upstream-artifacts
     ;;
   train)
@@ -90,6 +92,7 @@ case "${ACTION}" in
       --scene-id "${SCENE}" \
       --film-eval-root "${FILM_EVALUATIONS}" \
       --cross-eval-root "${EVALUATIONS}" \
+      --protocol-dir "${PROTOCOL}" \
       --output-dir "${OUTPUT}/report" \
       --expected-samples "${EXPECTED_SAMPLES}"
     ;;

@@ -34,18 +34,12 @@ paths:
 model:
   audio_backend: cross_attention_tokens
   embedding_dim: 64
-  audio_model_class: Audio3DGS
+  audio_model_class: Audio3DGSMonoDiffGSOnly
   audio_render_strategy: native_residual
   audio_freq_patch: 8
   audio_time_patch: 2
   audio_transformer_layers: 2
   audio_transformer_heads: 4
-  audio_pose_tokens: 1
-  audio_loss_l1_weight: 0.9
-  audio_loss_mse_weight: 0.2
-  audio_loss_ild_weight: 0.3
-  audio_loss_ipd_weight: 0.4
-  audio_loss_lre_weight: 0.5
 train:
   crop_seconds: 0.5
 """.strip()
@@ -64,12 +58,6 @@ train:
     assert config.model.audio_time_patch == 2
     assert config.model.audio_transformer_layers == 2
     assert config.model.audio_transformer_heads == 4
-    assert config.model.audio_pose_tokens == 1
-    assert config.model.audio_loss_l1_weight == pytest.approx(0.9)
-    assert config.model.audio_loss_mse_weight == pytest.approx(0.2)
-    assert config.model.audio_loss_ild_weight == pytest.approx(0.3)
-    assert config.model.audio_loss_ipd_weight == pytest.approx(0.4)
-    assert config.model.audio_loss_lre_weight == pytest.approx(0.5)
     assert config.train.crop_seconds == pytest.approx(0.5)
 
 
@@ -166,7 +154,7 @@ train: {}
     assert config.paths.visual_memmap == config_dir / "cache/visual.dat"
 
 
-def test_load_project_config_rejects_negative_spatial_loss_weight(tmp_path: Path) -> None:
+def test_cross_attention_rejects_non_gaussian_audio_model(tmp_path: Path) -> None:
     path = tmp_path / "scene.yaml"
     path.write_text(
         """
@@ -184,13 +172,13 @@ paths:
   manifest: /runs/manifest.json
 model:
   audio_backend: cross_attention_tokens
-  audio_loss_ipd_weight: -0.1
+  audio_model_class: Audio3DGS
 train: {}
 """.strip()
         + "\n"
     )
 
-    with pytest.raises(ValueError, match="audio_loss_ipd_weight"):
+    with pytest.raises(ValueError, match="Audio3DGSMonoDiffGSOnly"):
         load_project_config(path)
 
 

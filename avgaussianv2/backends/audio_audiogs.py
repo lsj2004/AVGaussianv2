@@ -132,6 +132,52 @@ def _upstream_forward_override(
     return parent_type.forward
 
 
+def build_audiogs_criterion(
+    checkpoint_config: object | None,
+    upstream_root: Path | None,
+) -> nn.Module:
+    """Recreate the criterion selected by the upstream AudioGS checkpoint."""
+    if checkpoint_config is None:
+        raise AudioCheckpointError("AudioGS checkpoint is missing cfg for criterion creation")
+    if upstream_root is None:
+        raise AudioCheckpointError("AudioGS upstream_root is required for criterion creation")
+    train_config = getattr(checkpoint_config, "train", object())
+    enhanced_weight = float(getattr(train_config, "enhanced_weight", 0.0) or 0.0)
+    if enhanced_weight > 0:
+        raise AudioCheckpointError(
+            "AudioGS checkpoints with train.enhanced_weight > 0 are not supported"
+        )
+    model_config = getattr(checkpoint_config, "model", object())
+    model_file = str(getattr(model_config, "file", "") or "")
+    mono_diff_models = {
+        "audio_3dgs_mono_diff",
+        "audio_3dgs_mono_diff_gs_only",
+        "audio_3dgs_mono_diff_field",
+        "audio_3dgs_shared_gaussians_gs_only",
+    }
+    mono_only_models = {"audio_3dgs_mono_only", "audio_3dgs_mono_gs_only"}
+    if model_file in mono_diff_models:
+        module_name, class_name = (
+            "libs.criterions.MonoDiffMSECriterion",
+            "MonoDiffMSECriterion",
+        )
+    elif model_file in mono_only_models:
+        module_name, class_name = (
+            "libs.criterions.MonoOnlyMSECriterion",
+            "MonoOnlyMSECriterion",
+        )
+    else:
+        module_name, class_name = "libs.criterions.Criterion_2", "Criterion"
+    with _temporary_import_root(upstream_root):
+        module = importlib.import_module(module_name)
+        module.stft = _deterministic_stft_magnitude
+        criterion_type = getattr(module, class_name)
+        criterion = criterion_type(checkpoint_config)
+    if not isinstance(criterion, nn.Module):
+        raise AudioCheckpointError("AudioGS criterion must be a torch module")
+    return criterion
+
+
 class AudioGSBackend(nn.Module):
     def __init__(
         self,
@@ -216,46 +262,7 @@ class AudioGSBackend(nn.Module):
         )
 
     def build_criterion(self) -> nn.Module:
-        """Recreate the loss selected by Audio3DGSTrainer for this checkpoint."""
-        if self.checkpoint_config is None:
-            raise AudioCheckpointError("AudioGS checkpoint is missing cfg for criterion creation")
-        if self.upstream_root is None:
-            raise AudioCheckpointError("AudioGS upstream_root is required for criterion creation")
-        train_config = getattr(self.checkpoint_config, "train", object())
-        enhanced_weight = float(getattr(train_config, "enhanced_weight", 0.0) or 0.0)
-        if enhanced_weight > 0:
-            raise AudioCheckpointError(
-                "AudioGS checkpoints with train.enhanced_weight > 0 are not supported"
-            )
-        model_config = getattr(self.checkpoint_config, "model", object())
-        model_file = str(getattr(model_config, "file", "") or "")
-        mono_diff_models = {
-            "audio_3dgs_mono_diff",
-            "audio_3dgs_mono_diff_gs_only",
-            "audio_3dgs_mono_diff_field",
-            "audio_3dgs_shared_gaussians_gs_only",
-        }
-        mono_only_models = {"audio_3dgs_mono_only", "audio_3dgs_mono_gs_only"}
-        if model_file in mono_diff_models:
-            module_name, class_name = (
-                "libs.criterions.MonoDiffMSECriterion",
-                "MonoDiffMSECriterion",
-            )
-        elif model_file in mono_only_models:
-            module_name, class_name = (
-                "libs.criterions.MonoOnlyMSECriterion",
-                "MonoOnlyMSECriterion",
-            )
-        else:
-            module_name, class_name = "libs.criterions.Criterion_2", "Criterion"
-        with _temporary_import_root(self.upstream_root):
-            module = importlib.import_module(module_name)
-            module.stft = _deterministic_stft_magnitude
-            criterion_type = getattr(module, class_name)
-            criterion = criterion_type(self.checkpoint_config)
-        if not isinstance(criterion, nn.Module):
-            raise AudioCheckpointError("AudioGS criterion must be a torch module")
-        return criterion
+        return build_audiogs_criterion(self.checkpoint_config, self.upstream_root)
 
     def render(
         self,

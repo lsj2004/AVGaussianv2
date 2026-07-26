@@ -1,4 +1,4 @@
-"""Paired system-level report for cross-attention versus FiLM+AudioGS U-Net."""
+"""Paired AudioGS postprocessor report: cross-attention versus FiLM+U-Net."""
 
 from __future__ import annotations
 
@@ -81,8 +81,9 @@ def _markdown(report: Mapping[str, object]) -> str:
     lines = [
         f"# Cross-attention vs FiLM+U-Net: {report['scene_id']}",
         "",
-        "This is a full-system, update-matched comparison; the audio backbones "
-        "and initialization sources differ.",
+        "This is an update-matched postprocessor comparison. Both systems start "
+        "from the same audited AudioGS acoustic-Gaussian checkpoint and use its "
+        "criterion; only the RGBD-conditioned postprocessor differs.",
         "",
         "| Step | System | Audio total | PSNR | SSIM | RGB L1 |",
         "|---:|---|---:|---:|---:|---:|",
@@ -108,7 +109,24 @@ def build_cross_attention_scene_report(
     evaluations: Sequence[BenchmarkEvaluationResult],
     expected_sample_count: int,
     output_dir: Path | str,
+    preparation: Mapping[str, object],
 ) -> dict[str, object]:
+    alignment = preparation.get("alignment")
+    audio_contract = preparation.get("audiogs_contract")
+    if (
+        preparation.get("scene_id") != scene_id
+        or not isinstance(alignment, Mapping)
+        or alignment.get("comparison_scope")
+        != "shared_audiogs_gaussians_postprocessor_ablation"
+        or alignment.get("same_audiogs_checkpoint_as_a") is not True
+        or alignment.get("audio_criterion")
+        != "native_audiogs_checkpoint_criterion"
+        or not isinstance(audio_contract, Mapping)
+        or not isinstance(audio_contract.get("checkpoint_sha256"), str)
+    ):
+        raise BenchmarkReportError(
+            "report requires verified shared-AudioGS cross-attention preparation"
+        )
     indexed = {_key(result): result for result in evaluations}
     expected = {
         *((FILM_SYSTEM, step) for step in REPORTING_STEPS),
@@ -162,7 +180,7 @@ def build_cross_attention_scene_report(
         "scene_id": scene_id,
         "sample_count": expected_sample_count,
         "primary_step": PRIMARY_STEP,
-        "comparison_scope": "full_audio_system_update_matched",
+        "comparison_scope": "shared_audiogs_gaussians_postprocessor_update_matched",
         "shared": {
             "train_cameras": list(
                 indexed[(FILM_SYSTEM, PRIMARY_STEP)].provenance["train_cameras"]
@@ -176,12 +194,12 @@ def build_cross_attention_scene_report(
             "visual_initialization_sha256": indexed[
                 (FILM_SYSTEM, PRIMARY_STEP)
             ].provenance["visual_initialization_sha256"],
+            "audiogs_checkpoint_sha256": audio_contract["checkpoint_sha256"],
+            "audio_criterion": alignment["audio_criterion"],
         },
         "different_by_design": [
-            "audio_backend",
-            "audio_initialization",
-            "audio_model_parameters",
-            "audio_loss",
+            "rgbd_conditioned_postprocessor",
+            "postprocessor_parameterization",
         ],
         "scaling": scaling,
         "paired_by_step": paired_by_step,

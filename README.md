@@ -274,21 +274,27 @@ scene with `Scene7playing`. A failed worker terminates its live siblings while
 preserving checkpoints, atomic status events, and attempt logs for exact
 resume.
 
-## Cross-attention audio-system comparison
+## Cross-attention AudioGS postprocessor comparison
 
-The `cross_attention_tokens` backend is an independent STFT-token Transformer
-and does not construct or call the AudioGS U-Net. It uses deterministic 2-D
-sinusoidal position encodings for both frequency/time audio patches and
-row/column RGBD patches. The comparison against `FiLM+AudioGS U-Net` is
-therefore a full-system comparison, not an isolated conditioning-layer
-ablation.
+The `cross_attention_tokens` backend first renders binaural audio with the
+audited `Audio3DGSMonoDiffGSOnly` acoustic Gaussians. It tokenizes that native
+Gaussian render, cross-attends to RGBD tokens, and decodes only a bounded
+condition-dependent residual. The upstream AudioGS U-Net is removed from this
+runtime and cannot be called. Deterministic 2-D sinusoidal position encodings
+identify frequency/time audio patches and row/column RGBD patches.
+
+The comparison against `FiLM+AudioGS U-Net` is therefore a postprocessor
+ablation: both systems share the AudioGS Gaussian checkpoint, AudioGS
+criterion, FTGS++ checkpoint, split, sample order, seed, warmup, and update
+budget. They differ in the RGBD-conditioned postprocessor and its parameter
+count.
 
 The strict derived configs differ from the published FiLM configs only at
 `model.audio_backend`. Preparation reuses the exact cam00–37/cam38 split,
 ordered 30,000-sample sequence, seed 42, 2,000-step conditioner warmup,
-30,000-step main budget, and FTGS++ visual initialization. The AudioGS
-checkpoint remains in the project config as audited baseline provenance but is
-not loaded by the cross-attention runtime.
+30,000-step main budget, FTGS++ visual initialization, and AudioGS
+acoustic-Gaussian initialization. Preparation verifies both immutable native
+contracts and rejects a changed checkpoint or a non-GS-only AudioGS model.
 
 Run one independently schedulable stage with:
 

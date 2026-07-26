@@ -125,11 +125,13 @@ def build_runtime(
         )
         from avgaussianv2.models.visual_tokens import RGBDTokenEncoder
 
-        audio = AudioVisualTokenAudioBackend(
+        audio = AudioVisualTokenAudioBackend.load(
+            config.paths.audio_checkpoint,
+            upstream_root=config.paths.audio_upstream_root,
+            model_class=config.model.audio_model_class,
             d_model=config.model.embedding_dim,
             num_layers=config.model.audio_transformer_layers,
             num_heads=config.model.audio_transformer_heads,
-            pose_tokens=config.model.audio_pose_tokens,
             n_fft=config.model.n_fft,
             hop_length=config.model.hop_length,
             win_length=config.model.win_length,
@@ -138,11 +140,6 @@ def build_runtime(
             dropout=config.model.audio_dropout,
             cross_gate_init=config.model.audio_cross_gate_init,
             residual_scale=config.model.audio_residual_scale,
-            loss_l1_weight=config.model.audio_loss_l1_weight,
-            loss_mse_weight=config.model.audio_loss_mse_weight,
-            loss_ild_weight=config.model.audio_loss_ild_weight,
-            loss_ipd_weight=config.model.audio_loss_ipd_weight,
-            loss_lre_weight=config.model.audio_loss_lre_weight,
         )
         condition = RGBDTokenEncoder(
             d_model=config.model.embedding_dim,

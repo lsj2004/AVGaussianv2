@@ -19,6 +19,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--ftgspp-contract", type=Path, required=True)
+    parser.add_argument("--audiogs-contract", type=Path, required=True)
     parser.add_argument("--trust-upstream-artifacts", action="store_true")
     args = parser.parse_args()
     result = prepare_cross_attention_run(
@@ -29,6 +30,7 @@ def main() -> None:
         device=args.device,
         trusted_upstream_artifacts=args.trust_upstream_artifacts,
         ftgspp_contract_dir=args.ftgspp_contract,
+        audiogs_contract_dir=args.audiogs_contract,
     )
     print(
         json.dumps(
