@@ -1975,9 +1975,9 @@ def run_scene_benchmark(
             "--scene",
             scene,
             "--evaluations-root",
-            str(child_output / "evaluations"),
+            str(stable_output / "evaluations"),
             "--output-dir",
-            str(child_output / "report"),
+            str(stable_output / "report"),
         ]
         if resume and (output / "report" / "current.json").is_file():
             report.append("--resume")

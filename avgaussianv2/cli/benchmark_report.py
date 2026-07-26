@@ -43,8 +43,11 @@ def main() -> None:
     parser.add_argument("--evaluations-root", type=Path)
     parser.add_argument("--scene-report", type=Path, action="append", default=[])
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--verify-only", action="store_true")
     args = parser.parse_args()
+    if args.resume and args.overwrite:
+        parser.error("--resume and --overwrite are mutually exclusive")
     if args.kind == "scene":
         if not args.scene or args.evaluations_root is None:
             parser.error("scene report requires --scene and --evaluations-root")
@@ -56,6 +59,7 @@ def main() -> None:
                 evaluations=_scene_evaluations(args.scene, args.evaluations_root),
                 output_dir=args.output_dir,
                 resume=args.resume,
+                overwrite=args.overwrite,
             )
     else:
         if args.verify_only:
@@ -68,6 +72,7 @@ def main() -> None:
                 scene_reports=reports,
                 output_dir=args.output_dir,
                 resume=args.resume,
+                overwrite=args.overwrite,
             )
     print(json.dumps({"content_sha256": result["content_sha256"]}, sort_keys=True))
 
