@@ -7,6 +7,9 @@ render from the same timestamp and camera. RGB, robustly normalized depth, and a
 are encoded by a small CNN; zero-initialized multi-scale FiLM adapters inject the embedding at
 the AudioGS U-Net encoder and decoder stages.
 
+For a module-by-module explanation with architecture, data-flow, training, and gradient
+diagrams, see the [Chinese architecture and code walkthrough](docs/architecture-and-code-walkthrough.zh-CN.md).
+
 ## Upstream models and environment
 
 The checked-in scene files expect these local upstream projects:
