@@ -22,6 +22,7 @@ class AVGaussianFusionV2(nn.Module):
         self.condition_encoder = condition_encoder
         self.audio = audio
         self.condition_enabled = True
+        self.condition_content_permutation: tuple[int, ...] | None = None
 
     def forward(self, sample: AlignedAVSample) -> FusionOutput:
         rgbd = self.visual.render_rgbd(
@@ -30,7 +31,22 @@ class AVGaussianFusionV2(nn.Module):
             sample.intrinsic,
             sample.image_size,
         )
-        condition = self.condition_encoder(rgbd)
+        if self.condition_content_permutation is None:
+            condition = self.condition_encoder(rgbd)
+        else:
+            permuted_encoder = getattr(
+                self.condition_encoder,
+                "forward_with_content_permutation",
+                None,
+            )
+            if permuted_encoder is None:
+                raise TypeError(
+                    "condition encoder does not support content permutation"
+                )
+            condition = permuted_encoder(
+                rgbd,
+                self.condition_content_permutation,
+            )
         predicted_audio = self.audio.render(
             sample.audio_cam_pose,
             sample.source_audio,

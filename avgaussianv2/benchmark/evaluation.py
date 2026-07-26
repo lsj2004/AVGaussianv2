@@ -73,6 +73,14 @@ REPORTING_STEPS = (5_000, 10_000, 30_000)
 # them at 100 dB so every published value remains finite and JSON-portable.
 PSNR_CAP_DB = 100.0
 CONTINUATION_SYSTEMS = {"joint_conditioned", "audio_only", "visual_only"}
+CROSS_ATTENTION_CONTINUATION_SYSTEMS = {
+    "cross_attention",
+    "cross_attention_no_rgbd",
+    "cross_attention_shuffled_rgbd",
+}
+EVALUATION_CONTINUATION_SYSTEMS = (
+    CONTINUATION_SYSTEMS | CROSS_ATTENTION_CONTINUATION_SYSTEMS
+)
 NATIVE_SYSTEMS = {"native_audiogs", "native_ftgspp"}
 NATIVE_AUDIO_UPDATES = {"scene1_opera": 2_318, "Scene7playing": 6_954}
 _ROW_METADATA = {"sample_id", "scene_id", "camera", "frame_index", "time_seconds"}
@@ -170,7 +178,7 @@ class TrainingEvidence:
                 raise BenchmarkEvaluationError(
                     "continuation must not carry native training evidence"
                 )
-            if self.system_name not in CONTINUATION_SYSTEMS:
+            if self.system_name not in EVALUATION_CONTINUATION_SYSTEMS:
                 raise BenchmarkEvaluationError("unknown continuation system")
             if (
                 identity.reporting_step not in REPORTING_STEPS
@@ -793,7 +801,17 @@ def _audit_continuation_snapshot(
         or checkpoint_payload.get("compatibility") != compatibility.to_mapping()
         or checkpoint_payload.get("stage") != "main"
         or checkpoint_payload.get("warmup_step")
-        != (2_000 if evidence.system_name == "joint_conditioned" else 0)
+        != (
+            2_000
+            if evidence.system_name
+            in {
+                "joint_conditioned",
+                "cross_attention",
+                "cross_attention_no_rgbd",
+                "cross_attention_shuffled_rgbd",
+            }
+            else 0
+        )
         or checkpoint_payload.get("main_step") != identity.reporting_step
     ):
         raise BenchmarkEvaluationError(

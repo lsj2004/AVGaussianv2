@@ -60,7 +60,7 @@ def _mapping_hash(mapping: Mapping[str, int]) -> str:
 
 
 def _compatibility(config: ProjectConfig) -> dict[str, Any]:
-    return {
+    compatibility = {
         "scene_id": config.scene.scene_id,
         "camera_mapping": _mapping_hash(config.scene.camera_mapping),
         "embedding_dim": config.model.embedding_dim,
@@ -69,8 +69,28 @@ def _compatibility(config: ProjectConfig) -> dict[str, Any]:
         "win_length": config.model.win_length,
         "sample_rate": config.model.sample_rate,
         "audio_model_class": config.model.audio_model_class,
+        "audio_backend": config.model.audio_backend,
         "audio_render_strategy": config.model.audio_render_strategy,
     }
+    if config.model.audio_backend == "cross_attention_tokens":
+        compatibility.update(
+            {
+                "audio_freq_patch": config.model.audio_freq_patch,
+                "audio_time_patch": config.model.audio_time_patch,
+                "audio_transformer_layers": config.model.audio_transformer_layers,
+                "audio_transformer_heads": config.model.audio_transformer_heads,
+                "audio_pose_tokens": config.model.audio_pose_tokens,
+                "audio_dropout": config.model.audio_dropout,
+                "audio_cross_gate_init": config.model.audio_cross_gate_init,
+                "audio_residual_scale": config.model.audio_residual_scale,
+                "audio_loss_l1_weight": config.model.audio_loss_l1_weight,
+                "audio_loss_mse_weight": config.model.audio_loss_mse_weight,
+                "audio_loss_ild_weight": config.model.audio_loss_ild_weight,
+                "audio_loss_ipd_weight": config.model.audio_loss_ipd_weight,
+                "audio_loss_lre_weight": config.model.audio_loss_lre_weight,
+            }
+        )
+    return compatibility
 
 
 def _film_module(model: nn.Module) -> nn.Module | None:
@@ -151,7 +171,12 @@ def _validate_payload(payload: object, expected: ProjectConfig) -> dict[str, Any
     for key in required:
         if key not in payload:
             raise CheckpointCompatibilityError(f"checkpoint is missing {key}")
-    actual_compatibility = payload["compatibility"]
+    if not isinstance(payload["compatibility"], Mapping):
+        raise CheckpointCompatibilityError("checkpoint compatibility must be a mapping")
+    actual_compatibility = dict(payload["compatibility"])
+    # Schema-v1 checkpoints created before selectable audio backends are
+    # unambiguously AudioGS checkpoints.
+    actual_compatibility.setdefault("audio_backend", "audiogs")
     expected_compatibility = _compatibility(expected)
     for key, expected_value in expected_compatibility.items():
         actual_value = actual_compatibility.get(key)

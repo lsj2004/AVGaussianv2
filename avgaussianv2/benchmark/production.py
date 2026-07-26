@@ -54,6 +54,7 @@ from avgaussianv2.benchmark.training import (
     make_shared_indices,
 )
 from avgaussianv2.config import load_project_config
+from avgaussianv2.experiment.evaluation import move_sample
 from avgaussianv2.runtime import build_runtime
 
 
@@ -1192,7 +1193,38 @@ def build_evaluation_adapters(
                     weights_only=True,
                 )
                 model.load_state_dict(raw["model"], strict=True)
-                model.condition_enabled = evidence.system_name == "joint_conditioned"
+                model.condition_enabled = evidence.system_name in {
+                    "joint_conditioned",
+                    "cross_attention",
+                    "cross_attention_shuffled_rgbd",
+                }
+                model.condition_content_permutation = None
+                if evidence.system_name == "cross_attention_shuffled_rgbd":
+                    condition_encoder = model.condition_encoder
+                    d_model = getattr(condition_encoder, "d_model", None)
+                    if d_model is None:
+                        raise TypeError(
+                            "shuffled RGBD evaluation requires token condition encoder"
+                        )
+                    with torch.no_grad():
+                        sample = bundle.eval_samples[0]
+                        sample = move_sample(sample, torch.device(device))
+                        rgbd = model.visual.render_rgbd(
+                            sample.visual_time,
+                            sample.w2c,
+                            sample.intrinsic,
+                            sample.image_size,
+                        )
+                        token_count = int(condition_encoder(rgbd).shape[1])
+                    generator = torch.Generator(device="cpu")
+                    generator.manual_seed(42)
+                    model.condition_content_permutation = tuple(
+                        int(index)
+                        for index in torch.randperm(
+                            token_count,
+                            generator=generator,
+                        ).tolist()
+                    )
             else:
                 model.condition_enabled = False
             model.eval()

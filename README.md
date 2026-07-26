@@ -274,6 +274,44 @@ scene with `Scene7playing`. A failed worker terminates its live siblings while
 preserving checkpoints, atomic status events, and attempt logs for exact
 resume.
 
+## Cross-attention audio-system comparison
+
+The `cross_attention_tokens` backend is an independent STFT-token Transformer
+and does not construct or call the AudioGS U-Net. It uses deterministic 2-D
+sinusoidal position encodings for both frequency/time audio patches and
+row/column RGBD patches. The comparison against `FiLM+AudioGS U-Net` is
+therefore a full-system comparison, not an isolated conditioning-layer
+ablation.
+
+The strict derived configs differ from the published FiLM configs only at
+`model.audio_backend`. Preparation reuses the exact cam00–37/cam38 split,
+ordered 30,000-sample sequence, seed 42, 2,000-step conditioner warmup,
+30,000-step main budget, and FTGS++ visual initialization. The AudioGS
+checkpoint remains in the project config as audited baseline provenance but is
+not loaded by the cross-attention runtime.
+
+Run one independently schedulable stage with:
+
+```bash
+scripts/run_cross_attention_cam38.sh scene1_opera prepare 0
+scripts/run_cross_attention_cam38.sh scene1_opera train 0
+scripts/run_cross_attention_cam38.sh scene1_opera eval 0 cross_attention 5000
+scripts/run_cross_attention_cam38.sh scene1_opera eval 1 cross_attention_no_rgbd 5000
+scripts/run_cross_attention_cam38.sh scene1_opera eval 2 cross_attention_shuffled_rgbd 5000
+```
+
+Repeat evaluation for steps 10,000 and 30,000, then run:
+
+```bash
+scripts/run_cross_attention_cam38.sh scene1_opera report
+```
+
+Replace `scene1_opera` with `Scene7playing` for the second dataset. Evaluation
+jobs are read-only with respect to the shared checkpoint and may run concurrently
+or share a GPU when memory permits. RGBD-on, RGBD-off, and shuffled-RGBD use the
+same trained checkpoint; shuffled-RGBD permutes visual content with seed 42
+while retaining destination position encodings.
+
 ## Outputs
 
 Every run writes `resolved_config.json`, `loss_history.json`, `gradient_norms.json`,

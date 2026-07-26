@@ -119,21 +119,48 @@ def build_runtime(
         config.paths.visual_checkpoint,
         config.paths.visual_upstream_root,
     )
-    audio = audio_backend.load(
-        config.paths.audio_checkpoint,
-        embedding_dim=config.model.embedding_dim,
-        upstream_root=config.paths.audio_upstream_root,
-        model_class=config.model.audio_model_class,
-        render_strategy=config.model.audio_render_strategy,
-    )
-    model = fusion_model(
-        visual=visual,
-        condition_encoder=condition_encoder(
+    if config.model.audio_backend == "cross_attention_tokens":
+        from avgaussianv2.models.cross_attention_audio import (
+            AudioVisualTokenAudioBackend,
+        )
+        from avgaussianv2.models.visual_tokens import RGBDTokenEncoder
+
+        audio = AudioVisualTokenAudioBackend(
+            d_model=config.model.embedding_dim,
+            num_layers=config.model.audio_transformer_layers,
+            num_heads=config.model.audio_transformer_heads,
+            pose_tokens=config.model.audio_pose_tokens,
+            n_fft=config.model.n_fft,
+            hop_length=config.model.hop_length,
+            win_length=config.model.win_length,
+            freq_patch=config.model.audio_freq_patch,
+            time_patch=config.model.audio_time_patch,
+            dropout=config.model.audio_dropout,
+            cross_gate_init=config.model.audio_cross_gate_init,
+            residual_scale=config.model.audio_residual_scale,
+            loss_l1_weight=config.model.audio_loss_l1_weight,
+            loss_mse_weight=config.model.audio_loss_mse_weight,
+            loss_ild_weight=config.model.audio_loss_ild_weight,
+            loss_ipd_weight=config.model.audio_loss_ipd_weight,
+            loss_lre_weight=config.model.audio_loss_lre_weight,
+        )
+        condition = RGBDTokenEncoder(
+            d_model=config.model.embedding_dim,
+            alpha_threshold=config.model.alpha_threshold,
+        )
+    else:
+        audio = audio_backend.load(
+            config.paths.audio_checkpoint,
+            embedding_dim=config.model.embedding_dim,
+            upstream_root=config.paths.audio_upstream_root,
+            model_class=config.model.audio_model_class,
+            render_strategy=config.model.audio_render_strategy,
+        )
+        condition = condition_encoder(
             embedding_dim=config.model.embedding_dim,
             alpha_threshold=config.model.alpha_threshold,
-        ),
-        audio=audio,
-    )
+        )
+    model = fusion_model(visual=visual, condition_encoder=condition, audio=audio)
     criterion = audio.build_criterion()
     train_samples = aligned_dataset(config, split="train")
     eval_samples = (

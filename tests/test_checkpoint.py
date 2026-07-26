@@ -108,6 +108,38 @@ def test_checkpoint_rejects_camera_mapping_change(tmp_path: Path) -> None:
         load_checkpoint(path, TinyCheckpointModel(), replace(original, scene=changed_scene))
 
 
+def test_checkpoint_rejects_cross_attention_protocol_change(tmp_path: Path) -> None:
+    path = tmp_path / "cross.pt"
+    original = config(tmp_path)
+    original = replace(
+        original,
+        model=replace(
+            original.model,
+            audio_backend="cross_attention_tokens",
+            audio_cross_gate_init=0.01,
+        ),
+    )
+    save_checkpoint(
+        path,
+        build_checkpoint_state(
+            TinyCheckpointModel(),
+            None,
+            original,
+            {},
+            "joint",
+            2,
+            [],
+        ),
+    )
+    changed = replace(
+        original,
+        model=replace(original.model, audio_cross_gate_init=0.1),
+    )
+
+    with pytest.raises(CheckpointCompatibilityError, match="audio_cross_gate_init"):
+        load_checkpoint(path, TinyCheckpointModel(), changed)
+
+
 def test_checkpoint_rejects_missing_required_state(tmp_path: Path) -> None:
     path = tmp_path / "broken.pt"
     torch.save({"schema_version": 1}, path)

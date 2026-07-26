@@ -11,6 +11,12 @@ from avgaussianv2.benchmark.evaluation import (
     EvaluationIdentity,
 )
 from avgaussianv2.benchmark.artifacts import canonical_json, sha256
+from avgaussianv2.benchmark.cross_attention_ablation import (
+    CAUSAL_EVALUATION_SYSTEMS,
+)
+from avgaussianv2.benchmark.cross_attention_report import (
+    build_cross_attention_scene_report,
+)
 from avgaussianv2.benchmark.report import (
     BenchmarkReportError,
     build_scene_report,
@@ -145,6 +151,38 @@ def _scene_inputs(scene, count):
         ]
     )
     return values
+
+
+def test_cross_attention_report_is_update_matched_and_reuses_causal_checkpoint(
+    tmp_path,
+):
+    values = []
+    for step in (5_000, 10_000, 30_000):
+        values.append(_result("scene1_opera", "joint_conditioned", step, 2, 0.2))
+        checkpoint = _sha(f"cross-{step}")
+        for offset, system in enumerate(CAUSAL_EVALUATION_SYSTEMS):
+            result = _result(
+                "scene1_opera",
+                system,
+                step,
+                2,
+                offset * 0.1,
+            )
+            result.provenance["checkpoint_sha256"] = checkpoint
+            values.append(result)
+
+    report = build_cross_attention_scene_report(
+        scene_id="scene1_opera",
+        evaluations=values,
+        expected_sample_count=2,
+        output_dir=tmp_path,
+    )
+
+    assert report["comparison_scope"] == "full_audio_system_update_matched"
+    assert report["paired_by_step"]["30000"][
+        "cross_attention_vs_film_unet"
+    ]["audio_total"]["win_rate"] == 1.0
+    assert (tmp_path / "current.json").is_file()
 
 
 def test_scene_report_has_scaling_paired_deltas_win_rates_and_native_labels(tmp_path):
