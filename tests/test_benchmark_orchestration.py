@@ -676,6 +676,7 @@ def test_suite_runs_scenes_in_declared_order_then_builds_and_verifies_report(
         assert kwargs["runner"] is runner
         root = Path(kwargs["output_dir"])
         assert str(root).startswith(f"/proc/{os.getpid()}/fd/")
+        assert kwargs["_stable_output_dir"] == output.absolute() / scene
         return SceneBenchmarkResult(scene, root, root / "report", True)
 
     def suite_verifier(path: Path) -> Mapping[str, object]:

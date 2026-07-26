@@ -1845,6 +1845,7 @@ def run_scene_benchmark(
     _preflight_fn: Callable[..., Mapping[str, object]] = _preflight,
     _skip_preflight: bool = False,
     _preflight_payload: Mapping[str, object] | None = None,
+    _stable_output_dir: Path | None = None,
 ) -> SceneBenchmarkResult:
     config_path = Path(config_path).absolute()
     repository = config_path.parent.parent.parent
@@ -1852,6 +1853,11 @@ def run_scene_benchmark(
     if scene not in SCENES:
         raise ValueError("strict suite supports only scene1_opera and Scene7playing")
     output = Path(output_dir).absolute()
+    stable_output = (
+        output
+        if _stable_output_dir is None
+        else Path(_stable_output_dir).absolute()
+    )
     resume_modes: frozenset[str] = frozenset()
     resume_snapshot: str | None = None
     if verify_only:
@@ -1869,7 +1875,7 @@ def run_scene_benchmark(
         except Exception:
             resume_modes, resume_snapshot = _inspect_partial_resume(
                 output,
-                stable_output=output,
+                stable_output=stable_output,
                 scene=scene,
                 config_path=config_path,
             )
@@ -1935,7 +1941,7 @@ def run_scene_benchmark(
         prepare, workers, evaluations = _scene_commands(
             repository=repository,
             output=child_output,
-            stable_output=output,
+            stable_output=stable_output,
             log_root=attempt_logs,
             config=config_path,
             python=python_executable,
@@ -2142,6 +2148,7 @@ def run_benchmark_suite(
                 / "benchmark_cam38"
                 / f"{scene}.yaml",
                 output_dir=child_output / scene,
+                _stable_output_dir=output / scene,
                 gpus=devices,
                 python_executable=python_executable,
                 resume=resume,
