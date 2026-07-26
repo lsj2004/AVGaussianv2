@@ -258,6 +258,16 @@ process, and writes no files:
 scripts/run_cam38_benchmark_suite.sh --verify-only
 ```
 
+### Published benchmark result
+
+The completed 2026-07-26 two-scene result, including the human-readable
+analysis, machine-readable aggregate JSON, and long-form metrics CSV, is
+versioned at
+[`results/cam38_benchmark/2026-07-26`](results/cam38_benchmark/2026-07-26/README.md).
+The result covers 423 held-out cam38 samples and is bound to suite content
+SHA-256
+`cc57caeaa1ab7e170c27b57be9eae80d5b11d4965d978b4eeee21a835e483c4a`.
+
 For one scene, use
 `scripts/run_cam38_benchmark_scene.sh scene1_opera --gpus 0,1,2` or replace the
 scene with `Scene7playing`. A failed worker terminates its live siblings while
