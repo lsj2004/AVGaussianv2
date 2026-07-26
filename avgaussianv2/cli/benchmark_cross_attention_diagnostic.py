@@ -60,6 +60,15 @@ def _stats(rows) -> list[dict[str, object]]:
     return [asdict(row) for row in rows]
 
 
+def _audio_loss_value(criterion, prediction, target) -> float:
+    value = criterion(prediction, target)
+    if isinstance(value, dict):
+        value = value["total_loss"]
+    if not isinstance(value, torch.Tensor) or value.ndim != 0:
+        raise TypeError("diagnostic AudioGS criterion must return a scalar loss")
+    return float(value.detach().cpu())
+
+
 def run_diagnostic(
     *,
     protocol_dir: Path,
@@ -90,7 +99,16 @@ def run_diagnostic(
         samples = _DeviceSampleSequence(runtime.train_samples, device)
         warmup_indices = make_shared_indices(len(samples), steps, seed)
         main_indices = tuple(worker_manifest["shared_indices"][:steps])
+        probe = samples[main_indices[0]]
+        runtime.model.eval()
+        with torch.no_grad():
+            initial_probe_loss = _audio_loss_value(
+                runtime.audio_loss_fn,
+                runtime.model(probe).predicted_audio,
+                probe.target_audio,
+            )
 
+        runtime.model.train()
         runtime.model.freeze_pretrained()
         warmup_optimizer = build_warmup_optimizer(
             runtime.model,
@@ -122,9 +140,13 @@ def run_diagnostic(
             for index in main_indices
         ]
 
-        probe = samples[main_indices[-1]]
         runtime.model.eval()
         with torch.no_grad():
+            final_probe_loss = _audio_loss_value(
+                runtime.audio_loss_fn,
+                runtime.model(probe).predicted_audio,
+                probe.target_audio,
+            )
             runtime.model.condition_enabled = True
             conditioned = runtime.model(probe).predicted_audio
             runtime.model.condition_enabled = False
@@ -142,6 +164,11 @@ def run_diagnostic(
             "condition_effect": {
                 "mean_absolute": float(difference.mean().cpu()),
                 "max_absolute": float(difference.max().cpu()),
+            },
+            "fixed_probe_audio_loss": {
+                "initial": initial_probe_loss,
+                "final": final_probe_loss,
+                "delta": final_probe_loss - initial_probe_loss,
             },
             "peak_cuda_memory_bytes": (
                 int(torch.cuda.max_memory_allocated())
