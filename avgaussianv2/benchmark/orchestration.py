@@ -1706,6 +1706,7 @@ def _scene_commands(
     *,
     repository: Path,
     output: Path,
+    stable_output: Path,
     log_root: Path,
     config: Path,
     python: str,
@@ -1756,7 +1757,7 @@ def _scene_commands(
     sources = _native_dirs(repository, config.stem)
     specs = [(name, None, sources[name]) for name in sorted(NATIVE_SYSTEMS)]
     specs += [
-        (name, step, output / "workers" / name)
+        (name, step, stable_output / "workers" / name)
         for name in sorted(CONTINUATION_SYSTEMS)
         for step in REPORTING_STEPS
     ]
@@ -1895,6 +1896,7 @@ def run_scene_benchmark(
         prepare, workers, evaluations = _scene_commands(
             repository=repository,
             output=child_output,
+            stable_output=output,
             log_root=attempt_logs,
             config=config_path,
             python=python_executable,

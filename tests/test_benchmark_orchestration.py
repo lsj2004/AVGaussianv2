@@ -170,6 +170,25 @@ def test_scene_assigns_three_workers_and_evaluations_to_three_gpus(
         )
         for item in workers + evaluations
     )
+    continuation_evaluations = [
+        item
+        for item in evaluations
+        if item[0][item[0].index("--system") + 1]
+        in {"joint_conditioned", "audio_only", "visual_only"}
+    ]
+    assert all(
+        item[0][item[0].index("--source") + 1]
+        == str(
+            output.absolute()
+            / "workers"
+            / item[0][item[0].index("--system") + 1]
+        )
+        for item in continuation_evaluations
+    )
+    assert all(
+        not item[0][item[0].index("--source") + 1].startswith("/proc/")
+        for item in continuation_evaluations
+    )
     first_evaluation = runner.events.index(("start", "avgaussianv2.cli.benchmark_eval"))
     worker_completions = [
         index
@@ -580,6 +599,7 @@ def test_worker_resume_flag_is_only_emitted_for_committed_modes(tmp_path: Path) 
     _, workers, _ = orchestration._scene_commands(
         repository=repository,
         output=tmp_path / "result",
+        stable_output=tmp_path / "result",
         log_root=tmp_path / "logs",
         config=config,
         python="python",
