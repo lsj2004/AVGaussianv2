@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
+import avgaussianv2.data.aligned as aligned
 from avgaussianv2.config import ModelConfig, PathConfig, ProjectConfig, SceneConfig, TrainConfig
 from avgaussianv2.data.aligned import AlignedAVDataset
 
@@ -127,6 +128,46 @@ def test_training_dataset_excludes_windows_requiring_padding(tmp_path: Path) -> 
     dataset = AlignedAVDataset(make_scene(tmp_path), split="train")
 
     assert [record.frame_index for record in dataset.records] == [1, 2, 3, 4]
+
+
+def test_eval_reads_heldout_video_when_train_memmap_excludes_camera(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_scene(tmp_path)
+    config.scene.camera_mapping["cam10"] = 2
+    video = tmp_path / "cam10.mp4"
+    video.write_bytes(b"heldout")
+    manifest = json.loads(config.paths.manifest.read_text())
+    manifest["cameras"]["cam10"]["video_path"] = str(video)
+    config.paths.manifest.write_text(json.dumps(manifest))
+    intrinsic = np.array(
+        [[24.0, 0.0, 12.0], [0.0, 16.0, 8.0], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    monkeypatch.setattr(
+        aligned,
+        "_load_heldout_calibration",
+        lambda *_args: (
+            aligned.torch.eye(4, dtype=aligned.torch.float32),
+            aligned.torch.tensor(intrinsic),
+        ),
+    )
+    monkeypatch.setattr(
+        aligned,
+        "_read_heldout_frame",
+        lambda _path, frame: aligned.torch.full(
+            (8, 12, 3), frame, dtype=aligned.torch.uint8
+        ),
+    )
+
+    dataset = AlignedAVDataset(config, split="eval")
+    sample = dataset[0]
+
+    assert dataset.records[0].camera_index == -1
+    assert sample.camera == "cam10"
+    assert sample.frame_index == 1
+    assert sample.visual_time.item() == pytest.approx(0.1)
+    assert sample.target_rgb.mean().item() == pytest.approx(1.0 / 255.0)
 
 
 def test_missing_camera_mapping_is_fatal(tmp_path: Path) -> None:

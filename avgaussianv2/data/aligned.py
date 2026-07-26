@@ -30,6 +30,40 @@ class AlignedRecord:
     target_audio_path: Path
 
 
+def _load_heldout_calibration(video_path: Path, camera: str) -> tuple[Tensor, Tensor]:
+    calibration_path = video_path.parent / "cameras.npz"
+    if not calibration_path.is_file() or calibration_path.is_symlink():
+        raise ValueError(f"held-out calibration is missing or unsafe: {calibration_path}")
+    with np.load(calibration_path, allow_pickle=False) as calibration:
+        names = tuple(str(value) for value in calibration["names"])
+        if camera not in names:
+            raise ValueError(f"{camera} is missing from held-out calibration")
+        index = names.index(camera)
+        w2c = torch.tensor(calibration["w2c"][index], dtype=torch.float32)
+        intrinsic = torch.tensor(calibration["intrinsics"][index], dtype=torch.float32)
+    return w2c, intrinsic
+
+
+def _read_heldout_frame(video_path: Path, frame_index: int) -> Tensor:
+    try:
+        import cv2
+    except ImportError as error:  # pragma: no cover - production dependency probe
+        raise RuntimeError("OpenCV is required for held-out RGB evaluation") from error
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        if not capture.isOpened():
+            raise ValueError(f"cannot open held-out video: {video_path}")
+        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            raise ValueError(
+                f"cannot decode held-out frame {frame_index}: {video_path}"
+            )
+    finally:
+        capture.release()
+    return torch.from_numpy(np.ascontiguousarray(frame[:, :, ::-1]))
+
+
 def _open_memmaps(root: Path) -> dict[str, np.memmap]:
     meta_path = root / "meta.json"
     if not meta_path.exists():
@@ -125,6 +159,7 @@ class AlignedAVDataset(Dataset[AlignedAVSample]):
             int(config.model.condition_height),
             int(config.model.condition_width),
         )
+        self.heldout_sources: dict[str, tuple[Path, Tensor, Tensor]] = {}
 
         camera_names = config.scene.train_cameras if split == "train" else config.scene.eval_cameras
         manifest_cameras = manifest["cameras"]
@@ -158,7 +193,20 @@ class AlignedAVDataset(Dataset[AlignedAVSample]):
                     continue
                 camera_index = int(config.scene.camera_mapping[camera])
                 if camera_index < 0 or camera_index >= self.arrays["rgb"].shape[1]:
-                    raise ValueError(f"{camera} camera mapping index {camera_index} is out of range")
+                    if split != "eval":
+                        raise ValueError(
+                            f"{camera} camera mapping index {camera_index} is out of range"
+                        )
+                    camera_record = manifest_cameras[camera]
+                    video_path = Path(camera_record["video_path"])
+                    if not video_path.is_file() or video_path.is_symlink():
+                        raise ValueError(
+                            f"{camera} held-out video is missing or unsafe: {video_path}"
+                        )
+                    if camera not in self.heldout_sources:
+                        w2c, intrinsic = _load_heldout_calibration(video_path, camera)
+                        self.heldout_sources[camera] = (video_path, w2c, intrinsic)
+                    camera_index = -1
                 records.append(
                     AlignedRecord(
                         camera=camera,
@@ -193,16 +241,39 @@ class AlignedAVDataset(Dataset[AlignedAVSample]):
         )
         frame = record.frame_index
         camera = record.camera_index
-        rgb = torch.tensor(np.array(self.arrays["rgb"][frame, camera]), dtype=torch.float32) / 255.0
-        w2c = torch.tensor(np.array(self.arrays["w2c"][frame, camera]), dtype=torch.float32)
-        intrinsic = torch.tensor(
-            np.array(self.arrays["intrinsic"][frame, camera]), dtype=torch.float32
-        )
+        if camera >= 0:
+            rgb = (
+                torch.tensor(
+                    np.array(self.arrays["rgb"][frame, camera]), dtype=torch.float32
+                )
+                / 255.0
+            )
+            w2c = torch.tensor(
+                np.array(self.arrays["w2c"][frame, camera]), dtype=torch.float32
+            )
+            intrinsic = torch.tensor(
+                np.array(self.arrays["intrinsic"][frame, camera]), dtype=torch.float32
+            )
+            visual_time = torch.tensor(
+                np.array(self.arrays["time"][frame, camera]).reshape(1, 1),
+                dtype=torch.float32,
+            )
+        else:
+            video_path, w2c, intrinsic = self.heldout_sources[record.camera]
+            rgb = _read_heldout_frame(video_path, frame).to(torch.float32) / 255.0
+            source_height, source_width = int(rgb.shape[0]), int(rgb.shape[1])
+            calibration_width = float(intrinsic[0, 2]) * 2.0
+            calibration_height = float(intrinsic[1, 2]) * 2.0
+            if calibration_width <= 0.0 or calibration_height <= 0.0:
+                raise ValueError("held-out intrinsic has invalid principal point")
+            intrinsic = intrinsic.clone()
+            intrinsic[0] *= source_width / calibration_width
+            intrinsic[1] *= source_height / calibration_height
+            intrinsic[2, 2] = 1.0
+            visual_time = torch.tensor(
+                [[frame / float(self.config.scene.fps)]], dtype=torch.float32
+            )
         rgb, intrinsic = _resize_rgb_and_intrinsic(rgb, intrinsic, self.image_size)
-        visual_time = torch.tensor(
-            np.array(self.arrays["time"][frame, camera]).reshape(1, 1),
-            dtype=torch.float32,
-        )
         return AlignedAVSample(
             scene_id=self.config.scene.scene_id,
             camera=record.camera,
