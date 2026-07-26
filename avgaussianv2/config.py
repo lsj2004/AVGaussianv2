@@ -79,12 +79,24 @@ class PathConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
+    audio_backend: str = "audiogs"
     embedding_dim: int = 128
     alpha_threshold: float = 1e-3
     audio_model_class: str = "Audio3DGS"
     n_fft: int = 512
     hop_length: int = 160
     win_length: int = 400
+    audio_freq_patch: int = 16
+    audio_time_patch: int = 4
+    audio_transformer_layers: int = 4
+    audio_transformer_heads: int = 4
+    audio_pose_tokens: int = 2
+    audio_dropout: float = 0.0
+    audio_loss_l1_weight: float = 1.0
+    audio_loss_mse_weight: float = 0.1
+    audio_loss_ild_weight: float = 0.1
+    audio_loss_ipd_weight: float = 0.1
+    audio_loss_lre_weight: float = 0.1
     sample_rate: int = 16_000
     condition_height: int = 64
     condition_width: int = 96
@@ -93,12 +105,38 @@ class ModelConfig:
     def from_dict(cls, raw: Mapping[str, Any]) -> "ModelConfig":
         defaults = cls()
         return cls(
+            audio_backend=str(raw.get("audio_backend", defaults.audio_backend)),
             embedding_dim=int(raw.get("embedding_dim", defaults.embedding_dim)),
             alpha_threshold=float(raw.get("alpha_threshold", defaults.alpha_threshold)),
             audio_model_class=str(raw.get("audio_model_class", defaults.audio_model_class)),
             n_fft=int(raw.get("n_fft", defaults.n_fft)),
             hop_length=int(raw.get("hop_length", defaults.hop_length)),
             win_length=int(raw.get("win_length", defaults.win_length)),
+            audio_freq_patch=int(raw.get("audio_freq_patch", defaults.audio_freq_patch)),
+            audio_time_patch=int(raw.get("audio_time_patch", defaults.audio_time_patch)),
+            audio_transformer_layers=int(
+                raw.get("audio_transformer_layers", defaults.audio_transformer_layers)
+            ),
+            audio_transformer_heads=int(
+                raw.get("audio_transformer_heads", defaults.audio_transformer_heads)
+            ),
+            audio_pose_tokens=int(raw.get("audio_pose_tokens", defaults.audio_pose_tokens)),
+            audio_dropout=float(raw.get("audio_dropout", defaults.audio_dropout)),
+            audio_loss_l1_weight=float(
+                raw.get("audio_loss_l1_weight", defaults.audio_loss_l1_weight)
+            ),
+            audio_loss_mse_weight=float(
+                raw.get("audio_loss_mse_weight", defaults.audio_loss_mse_weight)
+            ),
+            audio_loss_ild_weight=float(
+                raw.get("audio_loss_ild_weight", defaults.audio_loss_ild_weight)
+            ),
+            audio_loss_ipd_weight=float(
+                raw.get("audio_loss_ipd_weight", defaults.audio_loss_ipd_weight)
+            ),
+            audio_loss_lre_weight=float(
+                raw.get("audio_loss_lre_weight", defaults.audio_loss_lre_weight)
+            ),
             sample_rate=int(raw.get("sample_rate", defaults.sample_rate)),
             condition_height=int(raw.get("condition_height", defaults.condition_height)),
             condition_width=int(raw.get("condition_width", defaults.condition_width)),
@@ -110,6 +148,11 @@ class ModelConfig:
             "n_fft": self.n_fft,
             "hop_length": self.hop_length,
             "win_length": self.win_length,
+            "audio_freq_patch": self.audio_freq_patch,
+            "audio_time_patch": self.audio_time_patch,
+            "audio_transformer_layers": self.audio_transformer_layers,
+            "audio_transformer_heads": self.audio_transformer_heads,
+            "audio_pose_tokens": self.audio_pose_tokens,
             "sample_rate": self.sample_rate,
             "condition_height": self.condition_height,
             "condition_width": self.condition_width,
@@ -119,6 +162,24 @@ class ModelConfig:
                 raise ValueError(f"model.{name} must be positive")
         if not 0 <= self.alpha_threshold <= 1:
             raise ValueError("model.alpha_threshold must be in [0, 1]")
+        if self.audio_backend not in {"audiogs", "cross_attention_tokens"}:
+            raise ValueError("model.audio_backend must be 'audiogs' or 'cross_attention_tokens'")
+        if self.embedding_dim % self.audio_transformer_heads != 0:
+            raise ValueError("model.embedding_dim must be divisible by audio_transformer_heads")
+        if self.audio_dropout < 0:
+            raise ValueError("model.audio_dropout must be non-negative")
+        loss_weights = {
+            "audio_loss_l1_weight": self.audio_loss_l1_weight,
+            "audio_loss_mse_weight": self.audio_loss_mse_weight,
+            "audio_loss_ild_weight": self.audio_loss_ild_weight,
+            "audio_loss_ipd_weight": self.audio_loss_ipd_weight,
+            "audio_loss_lre_weight": self.audio_loss_lre_weight,
+        }
+        for name, value in loss_weights.items():
+            if value < 0:
+                raise ValueError(f"model.{name} must be non-negative")
+        if sum(loss_weights.values()) == 0:
+            raise ValueError("at least one model audio loss weight must be positive")
 
 
 @dataclass(frozen=True)

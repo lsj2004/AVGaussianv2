@@ -19,8 +19,10 @@ from avgaussianv2.config import ProjectConfig, load_project_config
 from avgaussianv2.contracts import AlignedAVSample
 from avgaussianv2.data.aligned import AlignedAVDataset
 from avgaussianv2.losses import AudioLoss
+from avgaussianv2.models.cross_attention_audio import AudioVisualTokenAudioBackend
 from avgaussianv2.models.fusion import AVGaussianFusionV2
 from avgaussianv2.models.rgbd import RGBDConditionEncoder
+from avgaussianv2.models.visual_tokens import RGBDTokenEncoder
 from avgaussianv2.train import TrainStepStats, run_condition_warmup, run_joint_finetune
 
 
@@ -174,18 +176,42 @@ def _default_backend_factory(config: ProjectConfig, device: torch.device) -> Tra
         config.paths.visual_checkpoint,
         config.paths.visual_upstream_root,
     )
-    audio = AudioGSBackend.load(
-        config.paths.audio_checkpoint,
-        embedding_dim=config.model.embedding_dim,
-        upstream_root=config.paths.audio_upstream_root,
-        model_class=config.model.audio_model_class,
-    )
-    model = AVGaussianFusionV2(
-        visual=visual,
-        condition_encoder=RGBDConditionEncoder(
+    if config.model.audio_backend == "cross_attention_tokens":
+        audio = AudioVisualTokenAudioBackend(
+            d_model=config.model.embedding_dim,
+            num_layers=config.model.audio_transformer_layers,
+            num_heads=config.model.audio_transformer_heads,
+            pose_tokens=config.model.audio_pose_tokens,
+            n_fft=config.model.n_fft,
+            hop_length=config.model.hop_length,
+            win_length=config.model.win_length,
+            freq_patch=config.model.audio_freq_patch,
+            time_patch=config.model.audio_time_patch,
+            dropout=config.model.audio_dropout,
+            loss_l1_weight=config.model.audio_loss_l1_weight,
+            loss_mse_weight=config.model.audio_loss_mse_weight,
+            loss_ild_weight=config.model.audio_loss_ild_weight,
+            loss_ipd_weight=config.model.audio_loss_ipd_weight,
+            loss_lre_weight=config.model.audio_loss_lre_weight,
+        )
+        condition_encoder = RGBDTokenEncoder(
+            d_model=config.model.embedding_dim,
+            alpha_threshold=config.model.alpha_threshold,
+        )
+    else:
+        audio = AudioGSBackend.load(
+            config.paths.audio_checkpoint,
+            embedding_dim=config.model.embedding_dim,
+            upstream_root=config.paths.audio_upstream_root,
+            model_class=config.model.audio_model_class,
+        )
+        condition_encoder = RGBDConditionEncoder(
             embedding_dim=config.model.embedding_dim,
             alpha_threshold=config.model.alpha_threshold,
-        ),
+        )
+    model = AVGaussianFusionV2(
+        visual=visual,
+        condition_encoder=condition_encoder,
         audio=audio,
     ).to(device)
     dataset = AlignedAVDataset(config, split="train")

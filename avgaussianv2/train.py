@@ -62,6 +62,10 @@ def _explicit_gradient_norm(gradients: Sequence[Tensor | None]) -> float:
     return math.sqrt(total)
 
 
+def _optimizer_group(parameters: list[nn.Parameter], lr: float) -> dict | None:
+    return None if not parameters else {"params": parameters, "lr": lr}
+
+
 def _weights(config: TrainConfig) -> JointLossWeights:
     return JointLossWeights(
         audio=config.lambda_audio,
@@ -178,15 +182,14 @@ def run_joint_finetune(
         raise ValueError("joint samples must not be empty")
     model.unfreeze_all()
     groups = model.named_parameter_groups()
-    optimizer = torch.optim.Adam(
-        [
-            {"params": groups["visual"], "lr": config.visual_lr},
-            {"params": groups["acoustic"], "lr": config.audio_lr},
-            {"params": groups["audio_unet"], "lr": config.audio_lr},
-            {"params": groups["condition_encoder"], "lr": config.condition_lr},
-            {"params": groups["film"], "lr": config.condition_lr},
-        ]
-    )
+    param_groups = [
+        _optimizer_group(groups["visual"], config.visual_lr),
+        _optimizer_group(groups["acoustic"], config.audio_lr),
+        _optimizer_group(groups["audio_unet"], config.audio_lr),
+        _optimizer_group(groups["condition_encoder"], config.condition_lr),
+        _optimizer_group(groups["film"], config.condition_lr),
+    ]
+    optimizer = torch.optim.Adam([group for group in param_groups if group is not None])
     anchor = capture_visual_anchor(model.visual)
     history = []
     consecutive_zero = 0
