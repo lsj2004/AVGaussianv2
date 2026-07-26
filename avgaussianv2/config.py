@@ -82,6 +82,7 @@ class ModelConfig:
     embedding_dim: int = 128
     alpha_threshold: float = 1e-3
     audio_model_class: str = "Audio3DGS"
+    audio_render_strategy: str = "native_residual"
     n_fft: int = 512
     hop_length: int = 160
     win_length: int = 400
@@ -96,6 +97,9 @@ class ModelConfig:
             embedding_dim=int(raw.get("embedding_dim", defaults.embedding_dim)),
             alpha_threshold=float(raw.get("alpha_threshold", defaults.alpha_threshold)),
             audio_model_class=str(raw.get("audio_model_class", defaults.audio_model_class)),
+            audio_render_strategy=str(
+                raw.get("audio_render_strategy", defaults.audio_render_strategy)
+            ),
             n_fft=int(raw.get("n_fft", defaults.n_fft)),
             hop_length=int(raw.get("hop_length", defaults.hop_length)),
             win_length=int(raw.get("win_length", defaults.win_length)),
@@ -119,6 +123,15 @@ class ModelConfig:
                 raise ValueError(f"model.{name} must be positive")
         if not 0 <= self.alpha_threshold <= 1:
             raise ValueError("model.alpha_threshold must be in [0, 1]")
+        if self.audio_render_strategy not in {
+            "native_residual",
+            "direct_conditioned_unet",
+            "gated_native_residual",
+        }:
+            raise ValueError(
+                "model.audio_render_strategy must be native_residual, "
+                "direct_conditioned_unet, or gated_native_residual"
+            )
 
 
 @dataclass(frozen=True)

@@ -9,6 +9,7 @@ from torch import nn
 from avgaussianv2.backends.audio_audiogs import (
     AudioCheckpointError,
     AudioGSBackend,
+    AudioRenderStrategy,
     _deterministic_stft_magnitude,
     _upstream_model_factory,
 )
@@ -290,6 +291,84 @@ def test_gs_only_bridge_forces_inherited_unet_forward() -> None:
 
     torch.testing.assert_close(backend.render(pose, source), native_gs_only)
     assert not torch.allclose(conditioned_unet, native_gs_only)
+
+
+def _gs_only_backend(strategy: AudioRenderStrategy) -> AudioGSBackend:
+    model = TinyGSOnlyAudioModel()
+    model.renderer = FiLMConditionedAudioUNet(model.renderer, embedding_dim=8)
+    return AudioGSBackend(
+        model,
+        source_path=Path("audio.pth"),
+        forward_override=TinyGSOnlyAudioModel.inherited_unet_forward,
+        render_strategy=strategy,
+    )
+
+
+def test_direct_conditioned_unet_replaces_gs_only_output() -> None:
+    backend = _gs_only_backend(AudioRenderStrategy.DIRECT_CONDITIONED_UNET)
+    source = torch.randn(1, 2, 32)
+    pose = torch.zeros(1, 12)
+    condition = torch.ones(1, 8)
+
+    expected_plain = TinyGSOnlyAudioModel.inherited_unet_forward(
+        backend.model, pose, source
+    )
+    native = backend.model(pose, source)
+
+    torch.testing.assert_close(backend.render(pose, source), expected_plain)
+    torch.testing.assert_close(
+        backend.render(pose, source, condition=condition), expected_plain
+    )
+    assert not torch.allclose(expected_plain, native)
+
+    with torch.no_grad():
+        backend.conditioned_renderer.film["e1"].to_scale_shift.weight.fill_(0.02)
+    assert not torch.allclose(
+        backend.render(pose, source, condition=condition), expected_plain
+    )
+
+
+def test_gated_native_residual_initializes_as_unit_bounded_gate() -> None:
+    backend = _gs_only_backend(AudioRenderStrategy.GATED_NATIVE_RESIDUAL)
+    source = torch.randn(1, 2, 32)
+    pose = torch.zeros(1, 12)
+    condition = torch.ones(1, 8)
+    native = backend.model(pose, source)
+
+    assert backend.residual_gate_scale().item() == pytest.approx(1.0)
+    torch.testing.assert_close(
+        backend.render(pose, source, condition=condition), native
+    )
+
+    with torch.no_grad():
+        backend.conditioned_renderer.film["e1"].to_scale_shift.weight.fill_(0.02)
+    plain = TinyGSOnlyAudioModel.inherited_unet_forward(backend.model, pose, source)
+    with backend.conditioned_renderer.use_condition(condition):
+        conditioned = TinyGSOnlyAudioModel.inherited_unet_forward(
+            backend.model, pose, source
+        )
+    expected = native + (conditioned - plain)
+    actual = backend.render(pose, source, condition=condition)
+    torch.testing.assert_close(actual, expected)
+
+    actual.square().mean().backward()
+    assert backend.residual_gate_logit is not None
+    assert backend.residual_gate_logit.grad is not None
+    assert 0.0 < backend.residual_gate_scale().item() < 2.0
+    assert any(
+        parameter is backend.residual_gate_logit
+        for parameter in backend.film_parameters()
+    )
+
+
+def test_non_gated_strategies_do_not_add_gate_state() -> None:
+    for strategy in (
+        AudioRenderStrategy.NATIVE_RESIDUAL,
+        AudioRenderStrategy.DIRECT_CONDITIONED_UNET,
+    ):
+        backend = _gs_only_backend(strategy)
+        assert backend.residual_gate_logit is None
+        assert not any("residual_gate" in name for name in backend.state_dict())
 
 
 class FakeVisualBackend(nn.Module):

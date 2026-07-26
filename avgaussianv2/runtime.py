@@ -124,6 +124,7 @@ def build_runtime(
         embedding_dim=config.model.embedding_dim,
         upstream_root=config.paths.audio_upstream_root,
         model_class=config.model.audio_model_class,
+        render_strategy=config.model.audio_render_strategy,
     )
     model = fusion_model(
         visual=visual,

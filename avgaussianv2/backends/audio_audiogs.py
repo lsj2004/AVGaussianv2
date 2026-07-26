@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+from enum import Enum
 from types import ModuleType
 from contextlib import contextmanager
 from pathlib import Path
@@ -19,6 +20,14 @@ class AudioCheckpointError(RuntimeError):
 
 ModelFactory = Callable[[object], nn.Module]
 ForwardOverride = Callable[[nn.Module, Tensor, Tensor], Tensor]
+
+
+class AudioRenderStrategy(str, Enum):
+    """How RGBD-conditioned U-Net output is combined with AudioGS."""
+
+    NATIVE_RESIDUAL = "native_residual"
+    DIRECT_CONDITIONED_UNET = "direct_conditioned_unet"
+    GATED_NATIVE_RESIDUAL = "gated_native_residual"
 
 
 def _deterministic_stft_magnitude(
@@ -131,6 +140,7 @@ class AudioGSBackend(nn.Module):
         checkpoint_config: object | None = None,
         upstream_root: Path | None = None,
         forward_override: ForwardOverride | None = None,
+        render_strategy: AudioRenderStrategy | str = AudioRenderStrategy.NATIVE_RESIDUAL,
     ) -> None:
         super().__init__()
         if not isinstance(getattr(model, "renderer", None), FiLMConditionedAudioUNet):
@@ -140,6 +150,12 @@ class AudioGSBackend(nn.Module):
         self.checkpoint_config = checkpoint_config
         self.upstream_root = None if upstream_root is None else Path(upstream_root)
         self.forward_override = forward_override
+        self.render_strategy = AudioRenderStrategy(render_strategy)
+        self.residual_gate_logit = (
+            nn.Parameter(torch.zeros(()))
+            if self.render_strategy is AudioRenderStrategy.GATED_NATIVE_RESIDUAL
+            else None
+        )
 
     @property
     def conditioned_renderer(self) -> FiLMConditionedAudioUNet:
@@ -156,6 +172,7 @@ class AudioGSBackend(nn.Module):
         embedding_dim: int = 128,
         upstream_root: str | Path | None = None,
         model_class: str = "Audio3DGS",
+        render_strategy: AudioRenderStrategy | str = AudioRenderStrategy.NATIVE_RESIDUAL,
     ) -> "AudioGSBackend":
         checkpoint_path = Path(checkpoint)
         if not checkpoint_path.exists():
@@ -195,6 +212,7 @@ class AudioGSBackend(nn.Module):
             checkpoint_config=checkpoint_config,
             upstream_root=None if upstream_root is None else Path(upstream_root),
             forward_override=forward_override,
+            render_strategy=render_strategy,
         )
 
     def build_criterion(self) -> nn.Module:
@@ -250,21 +268,40 @@ class AudioGSBackend(nn.Module):
         if cam_pose.ndim != 2 or cam_pose.shape[0] != source_audio.shape[0]:
             raise ValueError("cam_pose must have shape (B,features) and match source audio")
         if self.forward_override is None:
+            plain = self.model(cam_pose, source_audio)
             if condition is None:
-                return self.model(cam_pose, source_audio)
+                return plain
             with self.conditioned_renderer.use_condition(condition):
-                return self.model(cam_pose, source_audio)
+                conditioned = self.model(cam_pose, source_audio)
+            if self.render_strategy is AudioRenderStrategy.GATED_NATIVE_RESIDUAL:
+                return plain + self.residual_gate_scale() * (conditioned - plain)
+            return conditioned
+
+        if self.render_strategy is AudioRenderStrategy.DIRECT_CONDITIONED_UNET:
+            if condition is None:
+                return self.forward_override(self.model, cam_pose, source_audio)
+            with self.conditioned_renderer.use_condition(condition):
+                return self.forward_override(self.model, cam_pose, source_audio)
 
         native = self.model(cam_pose, source_audio)
         if condition is None:
             return native
-        # GS-only checkpoints bypass their saved renderer. Use the inherited
-        # U-Net only as a conditional residual so zero-init FiLM preserves the
-        # native pretrained function exactly.
+        # GS-only checkpoints bypass their saved renderer. For residual
+        # strategies, isolate only the visual-condition delta so zero-init
+        # FiLM preserves the native pretrained function exactly.
         plain_unet = self.forward_override(self.model, cam_pose, source_audio)
         with self.conditioned_renderer.use_condition(condition):
             conditioned_unet = self.forward_override(self.model, cam_pose, source_audio)
-        return native + (conditioned_unet - plain_unet)
+        residual = conditioned_unet - plain_unet
+        if self.render_strategy is AudioRenderStrategy.GATED_NATIVE_RESIDUAL:
+            residual = self.residual_gate_scale() * residual
+        return native + residual
+
+    def residual_gate_scale(self) -> Tensor:
+        """Return a bounded (0, 2) gate initialized exactly to one."""
+        if self.residual_gate_logit is None:
+            raise RuntimeError("audio render strategy has no learnable residual gate")
+        return 2.0 * torch.sigmoid(self.residual_gate_logit)
 
     def acoustic_parameters(self) -> list[nn.Parameter]:
         return [
@@ -274,7 +311,10 @@ class AudioGSBackend(nn.Module):
         ]
 
     def film_parameters(self) -> list[nn.Parameter]:
-        return list(self.conditioned_renderer.film.parameters())
+        parameters = list(self.conditioned_renderer.film.parameters())
+        if self.residual_gate_logit is not None:
+            parameters.append(self.residual_gate_logit)
+        return parameters
 
     def audio_unet_parameters(self) -> list[nn.Parameter]:
         return list(self.conditioned_renderer.base.parameters())

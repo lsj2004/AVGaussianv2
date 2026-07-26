@@ -69,6 +69,7 @@ def _compatibility(config: ProjectConfig) -> dict[str, Any]:
         "win_length": config.model.win_length,
         "sample_rate": config.model.sample_rate,
         "audio_model_class": config.model.audio_model_class,
+        "audio_render_strategy": config.model.audio_render_strategy,
     }
 
 

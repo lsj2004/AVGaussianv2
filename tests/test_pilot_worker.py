@@ -1331,11 +1331,12 @@ def test_public_runtime_factory_loads_configured_backends_and_both_splits(
             "audio",
             config.paths.audio_checkpoint,
             {
-                "embedding_dim": config.model.embedding_dim,
-                "upstream_root": config.paths.audio_upstream_root,
-                "model_class": config.model.audio_model_class,
-            },
-        ),
+                    "embedding_dim": config.model.embedding_dim,
+                    "upstream_root": config.paths.audio_upstream_root,
+                    "model_class": config.model.audio_model_class,
+                    "render_strategy": config.model.audio_render_strategy,
+                },
+            ),
     ]
     assert [call[-1] for call in calls if call[0] == "dataset"] == ["train", "eval"]
 
