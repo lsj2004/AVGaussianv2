@@ -6,7 +6,10 @@ import argparse
 import json
 from pathlib import Path
 
-from avgaussianv2.benchmark.production import prepare_worker_manifests
+from avgaussianv2.benchmark.production import (
+    materialize_strict_scene_manifest,
+    prepare_worker_manifests,
+)
 
 
 def main() -> None:
@@ -21,15 +24,20 @@ def main() -> None:
     devices = tuple(item.strip() for item in args.devices.split(","))
     if len(devices) != 3:
         parser.error("--devices requires exactly three comma-separated devices")
+    native_contract_dirs = {
+        "audiogs": args.native_audiogs_contract,
+        "ftgspp": args.native_ftgspp_contract,
+    }
+    materialize_strict_scene_manifest(
+        config_path=args.config,
+        native_contract_dirs=native_contract_dirs,
+    )
     result = prepare_worker_manifests(
         config_path=args.config,
         output_dir=args.output_dir,
         devices=devices,  # type: ignore[arg-type]
         trusted_upstream_artifacts=args.trust_upstream_artifacts,
-        native_contract_dirs={
-            "audiogs": args.native_audiogs_contract,
-            "ftgspp": args.native_ftgspp_contract,
-        },
+        native_contract_dirs=native_contract_dirs,
     )
     print(json.dumps(result, sort_keys=True))
 

@@ -5,6 +5,7 @@ import importlib
 import json
 import os
 import sys
+import wave
 from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
@@ -20,6 +21,7 @@ from avgaussianv2.benchmark.production import (
     _SnapshotSourceFinder,
     _snapshot_source_imports,
     build_evaluation_adapters,
+    materialize_strict_scene_manifest,
     prepare_worker_manifests,
     write_resolved_project_config,
 )
@@ -27,10 +29,128 @@ from avgaussianv2.benchmark.runtime import BenchmarkRuntime
 from avgaussianv2.benchmark.runtime import state_sha256
 from avgaussianv2.benchmark.training import TRAIN_CAMERAS
 from avgaussianv2.config import load_project_config
+from avgaussianv2.config import (
+    ModelConfig,
+    PathConfig,
+    ProjectConfig,
+    SceneConfig,
+    TrainConfig,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DIGEST = "a" * 64
+
+
+def test_materialize_strict_manifest_uses_verified_cam38_native_inputs(
+    tmp_path, monkeypatch
+):
+    scene = "scene1_opera"
+    config_path = tmp_path / "configs/benchmark_cam38/scene1_opera.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_bytes(b"strict protocol\n")
+    visual_root = tmp_path / "visual"
+    audio_root = tmp_path / "audio"
+    aligned_audio = audio_root / "aligned_16k_stereo"
+    visual_root.mkdir()
+    aligned_audio.mkdir(parents=True)
+    cameras = tuple(f"cam{index:02d}" for index in range(39))
+    for camera in cameras:
+        (visual_root / f"{camera}.mp4").write_bytes(b"video")
+    os.link(visual_root / "cam00.mp4", tmp_path / "train-only-cam00.mp4")
+    (visual_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "fps": 30,
+                "num_cameras": 39,
+                "num_frames": 150,
+                "camera_names": list(cameras),
+            }
+        )
+    )
+    for name in ("near", *cameras):
+        with wave.open(str(aligned_audio / f"{name}.wav"), "wb") as stream:
+            stream.setnchannels(2)
+            stream.setsampwidth(2)
+            stream.setframerate(1_000)
+            stream.writeframes(b"\0" * (5_000 * 2 * 2))
+    memmap = tmp_path / "memmap"
+    memmap.mkdir()
+    (memmap / "meta.json").write_text(
+        json.dumps({"rgb": {"shape": [130, 38, 8, 12, 3]}})
+    )
+    manifest = tmp_path / "runs/cam38_strict/scene1_opera/protocol/scene_manifest.json"
+    config = ProjectConfig(
+        scene=SceneConfig(
+            scene_id=scene,
+            fps=30.0,
+            train_cameras=cameras[:-1],
+            eval_cameras=("cam38",),
+            camera_mapping={camera: index for index, camera in enumerate(cameras)},
+        ),
+        paths=PathConfig(
+            visual_upstream_root=tmp_path / "ftgspp",
+            audio_upstream_root=tmp_path / "audiogs",
+            visual_checkpoint=tmp_path / "visual.pt",
+            audio_checkpoint=tmp_path / "audio.pt",
+            manifest=manifest,
+            visual_memmap=memmap,
+        ),
+        model=ModelConfig(sample_rate=1_000),
+        train=TrainConfig(crop_seconds=0.5),
+    )
+    conversion = tmp_path / "conversion.json"
+    conversion.write_text(json.dumps({"audio_root": str(audio_root)}))
+    config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
+
+    def verify(_path, *, expected_scene, expected_model_kind):
+        assert expected_scene == scene
+        inputs = {
+            "protocol_config": {"sha256": config_sha256},
+        }
+        if expected_model_kind == "audiogs":
+            inputs["conversion_manifest"] = {"path": str(conversion)}
+        else:
+            inputs["sampled_scene_root"] = str(visual_root)
+        return {"inputs": inputs}
+
+    monkeypatch.setattr(
+        "avgaussianv2.benchmark.production.audit_protocol_config",
+        lambda _path: {"benchmark": {"expected_test_samples": 130}},
+    )
+    monkeypatch.setattr(
+        "avgaussianv2.benchmark.production.load_project_config",
+        lambda _path: config,
+    )
+
+    result = materialize_strict_scene_manifest(
+        config_path=config_path,
+        native_contract_dirs={
+            "audiogs": tmp_path / "audiogs-contract",
+            "ftgspp": tmp_path / "ftgspp-contract",
+        },
+        native_verifier=verify,
+    )
+
+    payload = json.loads(manifest.read_text())
+    assert result == manifest
+    assert payload["train_cameras"] == list(cameras[:-1])
+    assert payload["eval_cameras"] == ["cam38"]
+    assert payload["num_frames"] == 130
+    assert payload["frame_times"][0] == pytest.approx(0.25)
+    assert payload["frame_times"][-1] == pytest.approx(0.25 + 129 / 30)
+    assert payload["cameras"]["cam38"]["audio_path"].endswith("/cam38.wav")
+
+    before = manifest.read_bytes()
+    materialize_strict_scene_manifest(
+        config_path=config_path,
+        native_contract_dirs={
+            "audiogs": tmp_path / "audiogs-contract",
+            "ftgspp": tmp_path / "ftgspp-contract",
+        },
+        native_verifier=verify,
+    )
+    assert manifest.read_bytes() == before
 
 
 @pytest.fixture(autouse=True)

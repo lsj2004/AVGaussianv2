@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import tempfile
+import wave
 from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
@@ -218,6 +219,201 @@ class _PinnedInput:
         finally:
             self.close()
         return False
+
+
+def _strict_regular_file(
+    path: Path, label: str, *, allow_hardlinks: bool = False
+) -> Path:
+    path = Path(path)
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ValueError(f"{label} is missing: {path}") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or (not allow_hardlinks and metadata.st_nlink != 1)
+    ):
+        raise ValueError(f"{label} is unsafe: {path}")
+    return path
+
+
+def _wave_metadata(path: Path) -> tuple[int, int, int]:
+    with wave.open(str(path), "rb") as stream:
+        return (
+            int(stream.getframerate()),
+            int(stream.getnchannels()),
+            int(stream.getnframes()),
+        )
+
+
+def materialize_strict_scene_manifest(
+    *,
+    config_path: Path,
+    native_contract_dirs: Mapping[str, Path],
+    native_verifier=verify_native_contract,
+) -> Path:
+    """Create the missing cam38 scene manifest from verified native inputs.
+
+    The strict FTGS cache contains only cam00..cam37, so its exact frame count
+    defines the shared train/evaluation timeline.  Audio windows are centered
+    half a crop after time zero to avoid padding while preserving every strict
+    benchmark frame.
+    """
+    if set(native_contract_dirs) != {"audiogs", "ftgspp"}:
+        raise ValueError("scene manifest requires exact AudioGS/FTGS++ contracts")
+    config_path = Path(config_path).absolute()
+    raw = audit_protocol_config(config_path)
+    config = load_project_config(config_path)
+    scene = config.scene.scene_id
+    expected_frames = SCENE_COUNTS[scene]
+    if raw["benchmark"]["expected_test_samples"] != expected_frames:
+        raise ValueError("strict scene manifest frame count contract mismatch")
+    config_sha256 = sha256_file(config_path)
+    contracts = {
+        kind: native_verifier(
+            Path(native_contract_dirs[kind]).absolute(),
+            expected_scene=scene,
+            expected_model_kind=kind,
+        )
+        for kind in ("audiogs", "ftgspp")
+    }
+    for kind, contract in contracts.items():
+        if (
+            contract["inputs"]["protocol_config"]["sha256"]
+            != config_sha256
+        ):
+            raise ValueError(f"{kind} native contract does not bind protocol config")
+
+    visual_root = Path(
+        contracts["ftgspp"]["inputs"]["sampled_scene_root"]
+    ).absolute()
+    conversion_record = contracts["audiogs"]["inputs"]["conversion_manifest"]
+    conversion_path = _strict_regular_file(
+        Path(conversion_record["path"]).absolute(),
+        "AudioGS conversion manifest",
+    )
+    with _PinnedInput(
+        conversion_path, conversion_record.get("sha256")
+    ) as conversion_pin:
+        conversion = json.loads(conversion_pin.data)
+    audio_root = Path(conversion["audio_root"]).absolute()
+    aligned_audio = audio_root / "aligned_16k_stereo"
+
+    visual_metadata_path = _strict_regular_file(
+        visual_root / "manifest.json", "visual source manifest"
+    )
+    with _PinnedInput(visual_metadata_path, None) as visual_pin:
+        visual_metadata = json.loads(visual_pin.data)
+    cameras = tuple(f"cam{index:02d}" for index in range(39))
+    if (
+        visual_metadata.get("fps") != config.scene.fps
+        or visual_metadata.get("num_cameras") != 39
+        or visual_metadata.get("camera_names") != list(cameras)
+        or int(visual_metadata.get("num_frames", -1)) < expected_frames
+    ):
+        raise ValueError("visual source manifest is incompatible with cam38 protocol")
+
+    memmap_metadata_path = _strict_regular_file(
+        Path(config.paths.visual_memmap) / "meta.json",
+        "strict FTGS memmap metadata",
+    )
+    with _PinnedInput(memmap_metadata_path, None) as memmap_pin:
+        memmap_metadata = json.loads(memmap_pin.data)
+    rgb_shape = memmap_metadata.get("rgb", {}).get("shape")
+    if (
+        not isinstance(rgb_shape, list)
+        or len(rgb_shape) != 5
+        or rgb_shape[:2] != [expected_frames, 38]
+    ):
+        raise ValueError("strict FTGS memmap must contain exact train frames/cameras")
+
+    for camera in cameras:
+        _strict_regular_file(
+            visual_root / f"{camera}.mp4",
+            f"{camera} visual source",
+            allow_hardlinks=True,
+        )
+    source_audio = _strict_regular_file(
+        aligned_audio / "near.wav", "AudioGS source audio"
+    )
+    sample_rate, channels, source_frames = _wave_metadata(source_audio)
+    if sample_rate != config.model.sample_rate:
+        raise ValueError("strict scene manifest audio sample rate mismatch")
+    crop_samples = int(round(config.train.crop_seconds * sample_rate))
+    if crop_samples <= 0:
+        raise ValueError("strict scene manifest crop has zero samples")
+    camera_audio: dict[str, Path] = {}
+    for camera in cameras:
+        path = _strict_regular_file(
+            aligned_audio / f"{camera}.wav", f"{camera} target audio"
+        )
+        rate, camera_channels, frames = _wave_metadata(path)
+        if (rate, camera_channels, frames) != (
+            sample_rate,
+            channels,
+            source_frames,
+        ):
+            raise ValueError(f"{camera} target audio metadata mismatch")
+        camera_audio[camera] = path
+
+    offset = crop_samples / (2.0 * sample_rate)
+    frame_times = [
+        offset + frame_index / config.scene.fps
+        for frame_index in range(expected_frames)
+    ]
+    last_end = int(round(frame_times[-1] * sample_rate)) + (
+        crop_samples - crop_samples // 2
+    )
+    if last_end > source_frames:
+        raise ValueError("strict scene manifest audio is shorter than benchmark timeline")
+    payload = {
+        "scene_id": scene,
+        "visual_root": str(visual_root),
+        "audio_root": str(audio_root),
+        "fps": config.scene.fps,
+        "num_frames": expected_frames,
+        "frame_times": frame_times,
+        "cameras": {
+            camera: {
+                "name": camera,
+                "index": index,
+                "video_path": str(visual_root / f"{camera}.mp4"),
+                "audio_path": str(camera_audio[camera]),
+            }
+            for index, camera in enumerate(cameras)
+        },
+        "train_cameras": list(config.scene.train_cameras),
+        "eval_cameras": list(config.scene.eval_cameras),
+        "audio": {
+            "sample_rate": sample_rate,
+            "channels": channels,
+            "crop_seconds": config.train.crop_seconds,
+            "crop_samples": crop_samples,
+            "source_path": str(source_audio),
+        },
+    }
+    data = canonical_json(payload)
+    destination = Path(config.paths.manifest).absolute()
+    if destination.exists():
+        if _strict_regular_file(destination, "strict scene manifest").read_bytes() != data:
+            raise ValueError("existing strict scene manifest changes protocol semantics")
+        return destination
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".scene_manifest.", suffix=".tmp", dir=destination.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return destination
 
 
 class _SnapshotSourceLoader(importlib.abc.Loader):
@@ -1046,6 +1242,7 @@ __all__ = [
     "build_evaluation_adapters",
     "continuation_training_evidence",
     "expected_identity",
+    "materialize_strict_scene_manifest",
     "native_training_evidence",
     "prepare_worker_manifests",
     "sha256_file",
