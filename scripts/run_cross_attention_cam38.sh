@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
-  echo "usage: $0 <scene1_opera|Scene7playing> <prepare|train|eval|report> [gpu] [system] [step]" >&2
+  echo "usage: $0 <scene1_opera|Scene7playing> <prepare|diagnose|train|eval|report> [gpu] [system] [step]" >&2
   exit 2
 fi
 
@@ -56,6 +56,15 @@ case "${ACTION}" in
       --device cuda:0 \
       --ftgspp-contract "${FTGSPP_CONTRACT}" \
       --audiogs-contract "${AUDIOGS_CONTRACT}" \
+      --trust-upstream-artifacts
+    ;;
+  diagnose)
+    CUDA_VISIBLE_DEVICES="${GPU}" "${PYTHON}" \
+      -m avgaussianv2.cli.benchmark_cross_attention_diagnostic \
+      --protocol-dir "${PROTOCOL}" \
+      --output "${OUTPUT}/diagnostic.json" \
+      --device cuda:0 \
+      --steps "${DIAGNOSTIC_STEPS:-8}" \
       --trust-upstream-artifacts
     ;;
   train)
