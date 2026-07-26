@@ -77,7 +77,8 @@ def run_diagnostic(
     seed = int(worker_manifest["training"]["seed"])
     _seed(seed)
     if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.set_device(device)
+        torch.cuda.reset_peak_memory_stats()
     runtime = build_production_runtime(
         config_path=protocol_dir / "resolved_project.yaml",
         device=device,
@@ -143,7 +144,7 @@ def run_diagnostic(
                 "max_absolute": float(difference.max().cpu()),
             },
             "peak_cuda_memory_bytes": (
-                int(torch.cuda.max_memory_allocated(device))
+                int(torch.cuda.max_memory_allocated())
                 if device.type == "cuda"
                 else 0
             ),
