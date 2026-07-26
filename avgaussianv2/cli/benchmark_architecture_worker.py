@@ -71,8 +71,8 @@ def main() -> None:
             {
                 "scene_id": evidence["scene_id"],
                 "strategy": evidence["strategy"],
-                "warmup_step": result["warmup_step"],
-                "main_step": result["main_step"],
+                "warmup_step": result["completed_warmup_steps"],
+                "main_step": result["completed_main_updates"],
                 "runtime_contract_sha256": result["runtime_contract_sha256"],
             },
             sort_keys=True,

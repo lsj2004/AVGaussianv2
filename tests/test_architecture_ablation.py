@@ -147,3 +147,17 @@ def test_aligned_manifest_reuses_exact_a_sample_sequence() -> None:
     assert manifest["compatibility"] == compatibility.to_mapping()
     assert manifest["mode"] == "joint_conditioned"
     assert json.dumps(manifest, sort_keys=True)
+
+
+def test_architecture_worker_prints_generic_worker_result_keys() -> None:
+    worker = (
+        Path(__file__).resolve().parents[1]
+        / "avgaussianv2"
+        / "cli"
+        / "benchmark_architecture_worker.py"
+    ).read_text()
+
+    assert 'result["completed_warmup_steps"]' in worker
+    assert 'result["completed_main_updates"]' in worker
+    assert 'result["warmup_step"]' not in worker
+    assert 'result["main_step"]' not in worker
