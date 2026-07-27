@@ -77,6 +77,8 @@ CROSS_ATTENTION_CONTINUATION_SYSTEMS = {
     "cross_attention",
     "cross_attention_no_rgbd",
     "cross_attention_shuffled_rgbd",
+    "cross_attention_no_gaussians",
+    "cross_attention_no_pose",
 }
 EVALUATION_CONTINUATION_SYSTEMS = (
     CONTINUATION_SYSTEMS | CROSS_ATTENTION_CONTINUATION_SYSTEMS
@@ -809,6 +811,8 @@ def _audit_continuation_snapshot(
                 "cross_attention",
                 "cross_attention_no_rgbd",
                 "cross_attention_shuffled_rgbd",
+                "cross_attention_no_gaussians",
+                "cross_attention_no_pose",
             }
             else 0
         )

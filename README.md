@@ -276,12 +276,14 @@ resume.
 
 ## Cross-attention AudioGS postprocessor comparison
 
-The `cross_attention_tokens` backend first renders binaural audio with the
-audited `Audio3DGSMonoDiffGSOnly` acoustic Gaussians. It tokenizes that native
-Gaussian render, cross-attends to RGBD tokens, and decodes only a bounded
-condition-dependent residual. The upstream AudioGS U-Net is removed from this
-runtime and cannot be called. Deterministic 2-D sinusoidal position encodings
-identify frequency/time audio patches and row/column RGBD patches.
+The `cross_attention_tokens` backend exposes the audited
+`Audio3DGSMonoDiffGSOnly` attributes (`xyz`, quaternion, mono/diff SH fields,
+native TF coordinate and pose-relative responses) through a versioned schema.
+Their 89,436-point TF field is structurally pooled to a 16x16 acoustic-token
+grid. Source-audio TF tokens cross-attend RGBD, pose and acoustic-Gaussian
+tokens, then decode a bounded complex-spectrogram residual. The residual is
+added to the native AudioGS render so the comparison with FiLM+U-Net has the
+same anchor. The upstream AudioGS U-Net is removed and cannot be called.
 
 The comparison against `FiLM+AudioGS U-Net` is therefore a postprocessor
 ablation: both systems share the AudioGS Gaussian checkpoint, AudioGS
@@ -304,6 +306,8 @@ scripts/run_cross_attention_cam38.sh scene1_opera train 0
 scripts/run_cross_attention_cam38.sh scene1_opera eval 0 cross_attention 5000
 scripts/run_cross_attention_cam38.sh scene1_opera eval 1 cross_attention_no_rgbd 5000
 scripts/run_cross_attention_cam38.sh scene1_opera eval 2 cross_attention_shuffled_rgbd 5000
+scripts/run_cross_attention_cam38.sh scene1_opera eval 0 cross_attention_no_gaussians 5000
+scripts/run_cross_attention_cam38.sh scene1_opera eval 1 cross_attention_no_pose 5000
 ```
 
 Repeat evaluation for steps 10,000 and 30,000, then run:
@@ -314,9 +318,9 @@ scripts/run_cross_attention_cam38.sh scene1_opera report
 
 Replace `scene1_opera` with `Scene7playing` for the second dataset. Evaluation
 jobs are read-only with respect to the shared checkpoint and may run concurrently
-or share a GPU when memory permits. RGBD-on, RGBD-off, and shuffled-RGBD use the
-same trained checkpoint; shuffled-RGBD permutes visual content with seed 42
-while retaining destination position encodings.
+or share a GPU when memory permits. The five causal evaluations reuse the same
+trained checkpoint. They measure inference-time reliance; they are not
+retrained capacity ablations.
 
 ## Outputs
 

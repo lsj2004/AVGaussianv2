@@ -77,7 +77,7 @@ case "${ACTION}" in
     ;;
   eval)
     case "${SYSTEM}" in
-      cross_attention|cross_attention_no_rgbd|cross_attention_shuffled_rgbd) ;;
+      cross_attention|cross_attention_no_rgbd|cross_attention_shuffled_rgbd|cross_attention_no_gaussians|cross_attention_no_pose) ;;
       *)
         echo "unsupported causal system: ${SYSTEM}" >&2
         exit 2

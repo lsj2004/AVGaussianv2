@@ -94,6 +94,10 @@ class ModelConfig:
     audio_dropout: float = 0.0
     audio_cross_gate_init: float = 0.01
     audio_residual_scale: float = 0.05
+    audio_gaussian_token_rows: int = 16
+    audio_gaussian_token_columns: int = 16
+    audio_gaussian_token_hidden_dim: int = 32
+    audio_pose_tokens: int = 2
     sample_rate: int = 16_000
     condition_height: int = 64
     condition_width: int = 96
@@ -126,6 +130,27 @@ class ModelConfig:
             ),
             audio_residual_scale=float(
                 raw.get("audio_residual_scale", defaults.audio_residual_scale)
+            ),
+            audio_gaussian_token_rows=int(
+                raw.get(
+                    "audio_gaussian_token_rows",
+                    defaults.audio_gaussian_token_rows,
+                )
+            ),
+            audio_gaussian_token_columns=int(
+                raw.get(
+                    "audio_gaussian_token_columns",
+                    defaults.audio_gaussian_token_columns,
+                )
+            ),
+            audio_gaussian_token_hidden_dim=int(
+                raw.get(
+                    "audio_gaussian_token_hidden_dim",
+                    defaults.audio_gaussian_token_hidden_dim,
+                )
+            ),
+            audio_pose_tokens=int(
+                raw.get("audio_pose_tokens", defaults.audio_pose_tokens)
             ),
             sample_rate=int(raw.get("sample_rate", defaults.sample_rate)),
             condition_height=int(raw.get("condition_height", defaults.condition_height)),
@@ -177,6 +202,10 @@ class ModelConfig:
                 "audio_time_patch": self.audio_time_patch,
                 "audio_transformer_layers": self.audio_transformer_layers,
                 "audio_transformer_heads": self.audio_transformer_heads,
+                "audio_gaussian_token_rows": self.audio_gaussian_token_rows,
+                "audio_gaussian_token_columns": self.audio_gaussian_token_columns,
+                "audio_gaussian_token_hidden_dim": self.audio_gaussian_token_hidden_dim,
+                "audio_pose_tokens": self.audio_pose_tokens,
             }
             for name, value in cross_positive.items():
                 if value <= 0:

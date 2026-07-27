@@ -140,6 +140,10 @@ def build_runtime(
             dropout=config.model.audio_dropout,
             cross_gate_init=config.model.audio_cross_gate_init,
             residual_scale=config.model.audio_residual_scale,
+            gaussian_token_rows=config.model.audio_gaussian_token_rows,
+            gaussian_token_columns=config.model.audio_gaussian_token_columns,
+            gaussian_token_hidden_dim=config.model.audio_gaussian_token_hidden_dim,
+            pose_tokens=config.model.audio_pose_tokens,
         )
         condition = RGBDTokenEncoder(
             d_model=config.model.embedding_dim,

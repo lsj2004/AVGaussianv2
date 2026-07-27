@@ -8,6 +8,10 @@ import avgaussianv2.models.cross_attention_audio as cross_module
 from avgaussianv2.backends.audio_audiogs import AudioCheckpointError
 from avgaussianv2.contracts import RGBDRender
 from avgaussianv2.models.audio_tokens import AudioSTFTTokenizer, AudioSpectrogramHead
+from avgaussianv2.models.acoustic_gaussian_tokens import (
+    AudioGSGaussianAttributeAdapter,
+    GaussianTokenEncoder,
+)
 from avgaussianv2.models.cross_attention_audio import (
     AudioVisualTokenAudioBackend,
     GatedCrossAttentionBlock,
@@ -21,10 +25,65 @@ class TinyNativeAudioGS(nn.Module):
         super().__init__()
         self.gaussian_gain = nn.Parameter(torch.tensor(0.75))
         self.renderer = nn.Linear(1, 1)
+        self.freq_num = 4
+        self.time_num = 5
+        self.n_points = self.freq_num * self.time_num
+        self.max_norm = 2.0
+        self.normalize_world_coords = False
+        self.use_cam_rotation = True
+        self.flip_cam_y_for_sh = False
+        self._xyz = nn.Parameter(torch.randn(self.n_points, 3) * 0.1)
+        self._rotation = nn.Parameter(
+            torch.tensor([1.0, 0.0, 0.0, 0.0]).repeat(self.n_points, 1)
+        )
+        self._sh_mono = nn.Parameter(torch.randn(self.n_points, 1, 4) * 0.1)
+        self._sh_diff = nn.Parameter(torch.randn(self.n_points, 1, 4) * 0.1)
+        freq, time = torch.meshgrid(
+            torch.arange(self.freq_num),
+            torch.arange(self.time_num),
+            indexing="ij",
+        )
+        self.register_buffer(
+            "tf_coords",
+            torch.stack([freq.flatten(), time.flatten()], dim=-1).float(),
+        )
 
     def forward(self, cam_pose, source_audio):
         del cam_pose
         return source_audio * self.gaussian_gain
+
+    def _safe_xyz(self):
+        return self._xyz
+
+    def _safe_rotation_quaternions(self):
+        return torch.nn.functional.normalize(self._rotation, dim=-1)
+
+    def _safe_sh_mono(self):
+        return self._sh_mono
+
+    def _safe_sh_diff(self):
+        return self._sh_diff
+
+    def compute_relative_positions(self, cam_pose):
+        rel_world = (
+            cam_pose[:, None, :3] - self._xyz[None]
+        ) / self.max_norm
+        if cam_pose.shape[1] == 12:
+            rotation = cam_pose[:, 3:].reshape(-1, 3, 3)
+            rel_cam = torch.matmul(rel_world, rotation.transpose(1, 2))
+        else:
+            rel_cam = rel_world
+        return rel_world, -rel_world * self.max_norm, rel_cam
+
+    def eval_mono_diff_fields(self, relative_pos):
+        direction = torch.nn.functional.normalize(relative_pos, dim=-1)
+        basis = torch.cat(
+            [torch.ones_like(direction[..., :1]), direction],
+            dim=-1,
+        )
+        mono = (basis * self._sh_mono[:, 0][None]).sum(dim=-1)
+        diff = (basis * self._sh_diff[:, 0][None]).sum(dim=-1)
+        return mono, diff
 
 
 def cross_backend(**kwargs) -> AudioVisualTokenAudioBackend:
@@ -66,6 +125,34 @@ def test_audio_stft_tokenizer_returns_time_frequency_tokens() -> None:
     assert batch.source_stft.shape[:2] == (2, 2)
     assert batch.source_stft.is_complex()
     assert torch.isfinite(batch.tokens).all()
+
+
+def test_gaussian_encoder_uses_real_attributes_and_compresses_tf_grid() -> None:
+    model = TinyNativeAudioGS()
+    adapter = AudioGSGaussianAttributeAdapter(model)
+    encoder = GaussianTokenEncoder(
+        adapter.feature_dim,
+        d_model=32,
+        hidden_dim=8,
+        token_grid=(2, 3),
+    )
+    pose = torch.eye(3).reshape(1, 9)
+    pose = torch.cat([torch.tensor([[0.2, -0.1, 0.3]]), pose], dim=1)
+
+    batch = adapter(pose)
+    tokens = encoder(batch)
+
+    assert batch.features.shape == (1, model.n_points, 29)
+    assert tokens.shape == (1, 6, 32)
+    tokens.square().mean().backward()
+    for parameter in (
+        model._xyz,
+        model._rotation,
+        model._sh_mono,
+        model._sh_diff,
+    ):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
 
 
 def test_spectrogram_head_returns_binaural_waveform() -> None:
@@ -230,7 +317,7 @@ def test_audio_visual_token_backend_uses_condition_only_when_gate_opens() -> Non
 
 
 def test_cross_backend_starts_from_native_audiogs_and_removes_unet() -> None:
-    backend = cross_backend(cross_gate_init=0.01)
+    backend = cross_backend(cross_gate_init=0.0)
     source = torch.randn(2, 2, 160)
     pose = torch.randn(2, 12)
     native = source * backend.model.gaussian_gain
@@ -250,6 +337,56 @@ def test_cross_backend_starts_from_native_audiogs_and_removes_unet() -> None:
         for parameter in backend.film_parameters()
     )
     assert backend.audio_unet_parameters() == []
+
+
+def test_cross_backend_queries_source_and_attends_visual_pose_gaussians() -> None:
+    backend = cross_backend(
+        cross_gate_init=1.0,
+        gaussian_token_rows=2,
+        gaussian_token_columns=3,
+        gaussian_token_hidden_dim=8,
+    )
+    source = torch.randn(1, 2, 160)
+    pose = torch.cat(
+        [torch.randn(1, 3), torch.eye(3).reshape(1, 9)],
+        dim=1,
+    )
+    condition = torch.randn(1, 7, 32, requires_grad=True)
+
+    prediction = backend.render(pose, source, condition)
+    prediction.square().mean().backward()
+
+    assert prediction.shape == source.shape
+    assert condition.grad is not None and condition.grad.abs().sum() > 0
+    assert backend.model._xyz.grad is not None
+    assert backend.model._xyz.grad.abs().sum() > 0
+    assert backend.pose_encoder.encoder[1].weight.grad is not None
+
+
+def test_cross_backend_component_toggles_are_same_checkpoint_ablations() -> None:
+    backend = cross_backend(
+        cross_gate_init=1.0,
+        gaussian_token_rows=2,
+        gaussian_token_columns=3,
+    )
+    source = torch.randn(1, 2, 160)
+    pose = torch.cat(
+        [torch.randn(1, 3), torch.eye(3).reshape(1, 9)],
+        dim=1,
+    )
+    condition = torch.randn(1, 7, 32)
+    state_keys = set(backend.state_dict())
+    assert not any(key.startswith("gaussian_adapter.model.") for key in state_keys)
+
+    full = backend.render(pose, source, condition)
+    backend.gaussian_tokens_enabled = False
+    no_gaussians = backend.render(pose, source, condition)
+    backend.gaussian_tokens_enabled = True
+    backend.pose_tokens_enabled = False
+    no_pose = backend.render(pose, source, condition)
+
+    assert not torch.allclose(full, no_gaussians)
+    assert not torch.allclose(full, no_pose)
 
 
 def test_cross_backend_reuses_audiogs_checkpoint_criterion(monkeypatch) -> None:

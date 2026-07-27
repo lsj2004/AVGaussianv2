@@ -12,6 +12,11 @@ from avgaussianv2.backends.audio_audiogs import (
     _upstream_model_factory,
     build_audiogs_criterion,
 )
+from avgaussianv2.models.acoustic_gaussian_tokens import (
+    AudioGSGaussianAttributeAdapter,
+    GaussianTokenEncoder,
+    PoseTokenEncoder,
+)
 from avgaussianv2.models.audio_tokens import AudioSpectrogramHead, AudioSTFTTokenizer
 
 
@@ -165,11 +170,11 @@ class AudioVisualTokenTransformer(nn.Module):
 
 
 class AudioVisualTokenAudioBackend(nn.Module):
-    """AudioGS-native renderer followed by an RGBD cross-attention residual.
+    """Primitive-aware RGBD/pose/AudioGS cross-attention residual.
 
-    The upstream AudioGS model must be the GS-only variant. Its renderer U-Net
-    is removed after checkpoint loading, so every prediction necessarily starts
-    from the acoustic Gaussian render rather than the source waveform or U-Net.
+    Source-audio TF tokens query visual, pose and explicit acoustic-Gaussian
+    tokens. The predicted complex-spectrogram residual is anchored on the
+    native AudioGS Gaussian render. The upstream U-Net is never used.
     """
 
     def __init__(
@@ -191,6 +196,10 @@ class AudioVisualTokenAudioBackend(nn.Module):
         dropout: float = 0.0,
         cross_gate_init: float = 0.01,
         residual_scale: float = 0.05,
+        gaussian_token_rows: int = 16,
+        gaussian_token_columns: int = 16,
+        gaussian_token_hidden_dim: int = 32,
+        pose_tokens: int = 2,
     ) -> None:
         nn.Module.__init__(self)
         if not isinstance(model, nn.Module):
@@ -205,6 +214,21 @@ class AudioVisualTokenAudioBackend(nn.Module):
         self.checkpoint_config = checkpoint_config
         self.upstream_root = None if upstream_root is None else Path(upstream_root)
         self.d_model = int(d_model)
+        self.gaussian_adapter = AudioGSGaussianAttributeAdapter(self.model)
+        self.gaussian_encoder = GaussianTokenEncoder(
+            self.gaussian_adapter.feature_dim,
+            d_model=d_model,
+            hidden_dim=gaussian_token_hidden_dim,
+            token_grid=(gaussian_token_rows, gaussian_token_columns),
+        )
+        self.pose_encoder = PoseTokenEncoder(
+            d_model=d_model,
+            num_tokens=pose_tokens,
+        )
+        # visual, pose, acoustic Gaussian
+        self.memory_modality_embedding = nn.Parameter(torch.zeros(3, self.d_model))
+        self.gaussian_tokens_enabled = True
+        self.pose_tokens_enabled = True
         self.tokenizer = AudioSTFTTokenizer(
             d_model=d_model,
             n_fft=n_fft,
@@ -293,6 +317,34 @@ class AudioVisualTokenAudioBackend(nn.Module):
             raise ValueError("condition must match source_audio batch size")
         return condition
 
+    def _memory_tokens(
+        self,
+        cam_pose: Tensor,
+        condition: Tensor | None,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tensor:
+        batch_size = int(cam_pose.shape[0])
+        memory: list[Tensor] = []
+        if condition is not None:
+            visual = self._condition_tokens(condition, batch_size).to(
+                device=device, dtype=dtype
+            )
+            memory.append(visual + self.memory_modality_embedding[0])
+        if self.pose_tokens_enabled:
+            pose = self.pose_encoder(cam_pose).to(device=device, dtype=dtype)
+            memory.append(pose + self.memory_modality_embedding[1])
+        if self.gaussian_tokens_enabled:
+            gaussian_batch = self.gaussian_adapter(cam_pose)
+            gaussian = self.gaussian_encoder(gaussian_batch).to(
+                device=device, dtype=dtype
+            )
+            memory.append(gaussian + self.memory_modality_embedding[2])
+        if not memory:
+            raise RuntimeError("cross-attention requires at least one memory modality")
+        return torch.cat(memory, dim=1)
+
     def render(
         self,
         cam_pose: Tensor,
@@ -306,20 +358,22 @@ class AudioVisualTokenAudioBackend(nn.Module):
                 "cam_pose must have shape (B,features) and match source audio"
             )
         native = self.model(cam_pose, source_audio)
-        if condition is None:
-            return native
-        batch = self.tokenizer(native)
-        memory_tokens = self._condition_tokens(condition, batch.tokens.shape[0])
-        memory_tokens = memory_tokens.to(
-            device=batch.tokens.device,
+        # Queries come from the source audio; the native Gaussian render is only
+        # the shared residual anchor used for a fair comparison with FiLM+U-Net.
+        batch = self.tokenizer(source_audio)
+        memory_tokens = self._memory_tokens(
+            cam_pose,
+            condition,
             dtype=batch.tokens.dtype,
+            device=batch.tokens.device,
         )
         conditioned_tokens = self.transformer(batch.tokens, memory_tokens)
         condition_delta = conditioned_tokens - batch.tokens
+        native_stft = self.tokenizer.stft(native)
         return self.head(
             condition_delta,
             batch.grid_size,
-            batch.source_stft,
+            native_stft,
             length=batch.original_samples,
         )
 
@@ -346,7 +400,15 @@ class AudioVisualTokenAudioBackend(nn.Module):
 
     def conditioning_parameters(self) -> list[nn.Parameter]:
         return [
-            *_parameters([self.tokenizer, self.head]),
+            self.memory_modality_embedding,
+            *_parameters(
+                [
+                    self.tokenizer,
+                    self.head,
+                    self.gaussian_encoder,
+                    self.pose_encoder,
+                ]
+            ),
             *self.transformer.audio_parameters(),
             *self.transformer.conditioning_parameters(),
         ]

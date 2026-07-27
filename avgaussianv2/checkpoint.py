@@ -82,6 +82,13 @@ def _compatibility(config: ProjectConfig) -> dict[str, Any]:
                 "audio_dropout": config.model.audio_dropout,
                 "audio_cross_gate_init": config.model.audio_cross_gate_init,
                 "audio_residual_scale": config.model.audio_residual_scale,
+                "audio_gaussian_schema": "audiogs_mono_diff_v1",
+                "audio_gaussian_token_rows": config.model.audio_gaussian_token_rows,
+                "audio_gaussian_token_columns": config.model.audio_gaussian_token_columns,
+                "audio_gaussian_token_hidden_dim": (
+                    config.model.audio_gaussian_token_hidden_dim
+                ),
+                "audio_pose_tokens": config.model.audio_pose_tokens,
             }
         )
     return compatibility

@@ -166,6 +166,16 @@ def build_cross_attention_scene_report(
                 indexed[("cross_attention_shuffled_rgbd", step)],
                 ALL_METRICS,
             ),
+            "gaussians_on_vs_off": _paired(
+                cross,
+                indexed[("cross_attention_no_gaussians", step)],
+                ALL_METRICS,
+            ),
+            "pose_on_vs_off": _paired(
+                cross,
+                indexed[("cross_attention_no_pose", step)],
+                ALL_METRICS,
+            ),
         }
     scaling = {
         str(step): {

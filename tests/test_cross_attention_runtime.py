@@ -19,12 +19,47 @@ from avgaussianv2.models.fusion import AVGaussianFusionV2
 from avgaussianv2.models.visual_tokens import RGBDTokenEncoder
 
 
+class TinyRuntimeAudioGS(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.renderer = nn.Linear(1, 1)
+        self.gaussian_gain = nn.Parameter(torch.tensor(1.0))
+        self.freq_num = 2
+        self.time_num = 3
+        self.n_points = 6
+        self.max_norm = 1.0
+        self.normalize_world_coords = False
+        self.use_cam_rotation = False
+        self.flip_cam_y_for_sh = False
+        self._xyz = nn.Parameter(torch.zeros(6, 3))
+        self._rotation = nn.Parameter(
+            torch.tensor([1.0, 0.0, 0.0, 0.0]).repeat(6, 1)
+        )
+        self._sh_mono = nn.Parameter(torch.zeros(6, 1, 4))
+        self._sh_diff = nn.Parameter(torch.zeros(6, 1, 4))
+        self.register_buffer(
+            "tf_coords",
+            torch.tensor(
+                [[0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [1, 2]],
+                dtype=torch.float32,
+            ),
+        )
+
+    def forward(self, _pose, source):
+        return source * self.gaussian_gain
+
+    def compute_relative_positions(self, pose):
+        relative = pose[:, None, :3] - self._xyz[None]
+        return relative, -relative, relative
+
+    def eval_mono_diff_fields(self, relative):
+        zeros = relative[..., 0] * 0
+        return zeros, zeros
+
+
 def test_cross_attention_runtime_loads_native_audiogs_without_unet(monkeypatch) -> None:
     visual = nn.Linear(1, 1)
-    native_model = nn.Module()
-    native_model.renderer = nn.Linear(1, 1)
-    native_model.gaussian = nn.Parameter(torch.tensor(1.0))
-    native_model.forward = lambda _pose, source: source * native_model.gaussian
+    native_model = TinyRuntimeAudioGS()
     backend = AudioVisualTokenAudioBackend(
         native_model,
         Path("/audio.pt"),
@@ -93,7 +128,7 @@ def test_cross_attention_runtime_loads_native_audiogs_without_unet(monkeypatch) 
 
     assert isinstance(bundle.model.audio, AudioVisualTokenAudioBackend)
     assert isinstance(bundle.model.audio.model.renderer, nn.Identity)
-    assert hasattr(bundle.model.audio.model, "gaussian")
+    assert hasattr(bundle.model.audio.model, "_sh_mono")
     assert isinstance(bundle.model.condition_encoder, RGBDTokenEncoder)
     assert bundle.train_samples == ("train-sample",)
     assert bundle.eval_samples == ("eval-sample",)

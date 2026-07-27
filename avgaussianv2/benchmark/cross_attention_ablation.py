@@ -47,6 +47,8 @@ CAUSAL_EVALUATION_SYSTEMS = (
     "cross_attention",
     "cross_attention_no_rgbd",
     "cross_attention_shuffled_rgbd",
+    "cross_attention_no_gaussians",
+    "cross_attention_no_pose",
 )
 
 
@@ -360,12 +362,24 @@ def prepare_cross_attention_run(
             "shared_indices_sha256": base_compatibility.index_sha256,
             "only_raw_config_delta": "model.audio_backend",
             "audiogs_unet_used_by_cross_attention": False,
-            "cross_attention_input": "native_audiogs_gaussian_render",
+            "audio_query_input": "source_audio_stft_tokens",
+            "residual_anchor": "native_audiogs_gaussian_render",
+            "cross_attention_memory": [
+                "rgbd_tokens",
+                "pose_tokens",
+                "explicit_audiogs_gaussian_attribute_tokens",
+            ],
             "audio_criterion": "native_audiogs_checkpoint_criterion",
         },
         "token_protocol": {
             "audio_position": "deterministic_2d_sinusoidal_frequency_time",
             "visual_position": "deterministic_2d_sinusoidal_row_column",
+            "acoustic_gaussian_schema": "audiogs_mono_diff_v1",
+            "acoustic_gaussian_position": (
+                "native_frequency_time_grid_then_16x16_structural_pooling"
+            ),
+            "pose_tokens": 2,
+            "memory_modality_embeddings": True,
         },
         "causal_evaluation_systems": list(CAUSAL_EVALUATION_SYSTEMS),
     }
