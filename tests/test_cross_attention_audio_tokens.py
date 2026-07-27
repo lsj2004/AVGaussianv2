@@ -155,6 +155,24 @@ def test_gaussian_encoder_uses_real_attributes_and_compresses_tf_grid() -> None:
         assert torch.isfinite(parameter.grad).all()
 
 
+def test_gaussian_grid_pool_preserves_constant_boundaries() -> None:
+    encoder = GaussianTokenEncoder(
+        3,
+        d_model=8,
+        hidden_dim=4,
+        token_grid=(3, 4),
+    )
+    hidden = torch.full((2, 4, 7, 11), 2.5, requires_grad=True)
+
+    pooled = encoder._deterministic_grid_pool(hidden)
+
+    assert pooled.shape == (2, 4, 3, 4)
+    torch.testing.assert_close(pooled, torch.full_like(pooled, 2.5))
+    pooled.sum().backward()
+    assert hidden.grad is not None
+    assert torch.isfinite(hidden.grad).all()
+
+
 def test_spectrogram_head_returns_binaural_waveform() -> None:
     tokenizer = AudioSTFTTokenizer(
         d_model=24,

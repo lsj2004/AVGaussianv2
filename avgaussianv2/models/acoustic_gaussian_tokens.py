@@ -199,6 +199,35 @@ class GaussianTokenEncoder(nn.Module):
             nn.Conv2d(self.d_model, self.d_model, kernel_size=1),
         )
 
+    def _deterministic_grid_pool(self, hidden: Tensor) -> Tensor:
+        """Pool to the configured grid without CUDA adaptive-pool atomics."""
+        rows, columns = self.token_grid
+        height, width = int(hidden.shape[-2]), int(hidden.shape[-1])
+        block_height = (height + rows - 1) // rows
+        block_width = (width + columns - 1) // columns
+        padded_height = block_height * rows
+        padded_width = block_width * columns
+        pad_height = padded_height - height
+        pad_width = padded_width - width
+        padded = F.pad(hidden, (0, pad_width, 0, pad_height))
+        kernel = (block_height, block_width)
+        area = block_height * block_width
+        pooled_sum = F.avg_pool2d(
+            padded,
+            kernel_size=kernel,
+            stride=kernel,
+        ) * area
+        # Correct boundary cells so constant-zero padding does not attenuate
+        # valid Gaussian attributes. This mask carries no gradient.
+        valid = hidden.new_ones((1, 1, height, width))
+        valid = F.pad(valid, (0, pad_width, 0, pad_height))
+        counts = F.avg_pool2d(
+            valid,
+            kernel_size=kernel,
+            stride=kernel,
+        ) * area
+        return pooled_sum / counts.clamp_min(1.0)
+
     def forward(self, batch: AcousticGaussianBatch) -> Tensor:
         if batch.schema != ACOUSTIC_GAUSSIAN_SCHEMA:
             raise ValueError(f"unsupported acoustic Gaussian schema: {batch.schema}")
@@ -214,7 +243,7 @@ class GaussianTokenEncoder(nn.Module):
         hidden = hidden.transpose(1, 2).reshape(
             features.shape[0], -1, freq_num, time_num
         )
-        pooled = F.adaptive_avg_pool2d(hidden, self.token_grid)
+        pooled = self._deterministic_grid_pool(hidden)
         encoded = self.grid_projection(pooled)
         tokens = encoded.flatten(2).transpose(1, 2).contiguous()
         return add_grid_position_encoding(tokens, self.token_grid)
