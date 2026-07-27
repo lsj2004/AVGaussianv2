@@ -2,15 +2,33 @@
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
-  echo "usage: $0 <scene1_opera|Scene7playing> <prepare|diagnose|train|eval|report> [gpu] [system] [step]" >&2
+  echo "usage: $0 <scene1_opera|Scene7playing> <prepare|diagnose|train|eval|report> [gpu] [system] [step] [cross_attention_tokens|cross_attention_masks]" >&2
   exit 2
 fi
 
 SCENE="$1"
 ACTION="$2"
 GPU="${3:-0}"
-SYSTEM="${4:-cross_attention}"
 STEP="${5:-30000}"
+BACKEND="${6:-${CROSS_ATTENTION_BACKEND:-cross_attention_tokens}}"
+
+case "${BACKEND}" in
+  cross_attention_tokens)
+    CONFIG_SUFFIX="cross_attention"
+    OUTPUT_NAME="cross_attention_ablation"
+    DEFAULT_SYSTEM="cross_attention"
+    ;;
+  cross_attention_masks)
+    CONFIG_SUFFIX="cross_attention_masks"
+    OUTPUT_NAME="cross_attention_masks_ablation"
+    DEFAULT_SYSTEM="cross_attention_masks"
+    ;;
+  *)
+    echo "unsupported cross-attention backend: ${BACKEND}" >&2
+    exit 2
+    ;;
+esac
+SYSTEM="${4:-${DEFAULT_SYSTEM}}"
 
 case "${SCENE}" in
   scene1_opera)
@@ -27,11 +45,11 @@ esac
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BASE_CONFIG="${ROOT}/configs/benchmark_cam38/${SCENE}.yaml"
-CROSS_CONFIG="${ROOT}/configs/benchmark_cam38/${SCENE}_cross_attention.yaml"
+CROSS_CONFIG="${ROOT}/configs/benchmark_cam38/${SCENE}_${CONFIG_SUFFIX}.yaml"
 BASE_PROTOCOL="${ROOT}/runs/cam38_benchmark/${SCENE}/protocol"
 FTGSPP_CONTRACT="${ROOT}/runs/cam38_strict/${SCENE}/ftgspp/native_contract"
 AUDIOGS_CONTRACT="${ROOT}/runs/cam38_strict/${SCENE}/audiogs/native_contract"
-OUTPUT="${ROOT}/runs/cross_attention_ablation/${SCENE}"
+OUTPUT="${ROOT}/runs/${OUTPUT_NAME}/${SCENE}"
 PROTOCOL="${OUTPUT}/protocol"
 WORKER="${OUTPUT}/worker"
 EVALUATIONS="${OUTPUT}/evaluations"
@@ -77,7 +95,7 @@ case "${ACTION}" in
     ;;
   eval)
     case "${SYSTEM}" in
-      cross_attention|cross_attention_no_rgbd|cross_attention_shuffled_rgbd|cross_attention_no_gaussians|cross_attention_no_pose) ;;
+      cross_attention|cross_attention_no_rgbd|cross_attention_shuffled_rgbd|cross_attention_no_gaussians|cross_attention_no_pose|cross_attention_masks|cross_attention_masks_no_rgbd|cross_attention_masks_shuffled_rgbd) ;;
       *)
         echo "unsupported causal system: ${SYSTEM}" >&2
         exit 2

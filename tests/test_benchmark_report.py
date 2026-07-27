@@ -13,6 +13,7 @@ from avgaussianv2.benchmark.evaluation import (
 from avgaussianv2.benchmark.artifacts import canonical_json, sha256
 from avgaussianv2.benchmark.cross_attention_ablation import (
     CAUSAL_EVALUATION_SYSTEMS,
+    MASK_CAUSAL_EVALUATION_SYSTEMS,
 )
 from avgaussianv2.benchmark.cross_attention_report import (
     build_cross_attention_scene_report,
@@ -153,14 +154,23 @@ def _scene_inputs(scene, count):
     return values
 
 
+@pytest.mark.parametrize(
+    ("main_system", "evaluation_systems"),
+    [
+        ("cross_attention", CAUSAL_EVALUATION_SYSTEMS),
+        ("cross_attention_masks", MASK_CAUSAL_EVALUATION_SYSTEMS),
+    ],
+)
 def test_cross_attention_report_is_update_matched_and_reuses_causal_checkpoint(
     tmp_path,
+    main_system,
+    evaluation_systems,
 ):
     values = []
     for step in (5_000, 10_000, 30_000):
         values.append(_result("scene1_opera", "joint_conditioned", step, 2, 0.2))
         checkpoint = _sha(f"cross-{step}")
-        for offset, system in enumerate(CAUSAL_EVALUATION_SYSTEMS):
+        for offset, system in enumerate(evaluation_systems):
             result = _result(
                 "scene1_opera",
                 system,
@@ -178,6 +188,8 @@ def test_cross_attention_report_is_update_matched_and_reuses_causal_checkpoint(
         output_dir=tmp_path,
         preparation={
             "scene_id": "scene1_opera",
+            "system": main_system,
+            "causal_evaluation_systems": list(evaluation_systems),
             "alignment": {
                 "comparison_scope": (
                     "shared_audiogs_gaussians_postprocessor_ablation"
@@ -194,7 +206,7 @@ def test_cross_attention_report_is_update_matched_and_reuses_causal_checkpoint(
         == "shared_audiogs_gaussians_postprocessor_update_matched"
     )
     assert report["paired_by_step"]["30000"][
-        "cross_attention_vs_film_unet"
+        f"{main_system}_vs_film_unet"
     ]["audio_total"]["win_rate"] == 1.0
     assert (tmp_path / "current.json").is_file()
 

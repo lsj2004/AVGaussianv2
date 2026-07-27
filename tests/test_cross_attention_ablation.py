@@ -4,7 +4,9 @@ import pytest
 import yaml
 
 from avgaussianv2.benchmark.cross_attention_ablation import (
+    ALL_CROSS_ATTENTION_EVALUATION_SYSTEMS,
     CAUSAL_EVALUATION_SYSTEMS,
+    MASK_CAUSAL_EVALUATION_SYSTEMS,
     validate_backend_only_delta,
 )
 from avgaussianv2.benchmark.evaluation import EVALUATION_CONTINUATION_SYSTEMS
@@ -58,12 +60,28 @@ def test_cross_attention_delta_rejects_every_other_change(tmp_path: Path) -> Non
     with pytest.raises(ValueError, match="only model.audio_backend"):
         validate_backend_only_delta(base, derived)
 
+    _write(derived, _config("cross_attention_masks"))
+    result = validate_backend_only_delta(
+        base,
+        derived,
+        expected_backend="cross_attention_masks",
+    )
+    assert result["audio_backend"] == "cross_attention_masks"
+
 
 @pytest.mark.parametrize(
     ("base_name", "derived_name"),
     [
         ("scene1_opera.yaml", "scene1_opera_cross_attention.yaml"),
         ("Scene7playing.yaml", "Scene7playing_cross_attention.yaml"),
+        (
+            "scene1_opera.yaml",
+            "scene1_opera_cross_attention_masks.yaml",
+        ),
+        (
+            "Scene7playing.yaml",
+            "Scene7playing_cross_attention_masks.yaml",
+        ),
     ],
 )
 def test_repository_cross_configs_are_backend_only_deltas(
@@ -76,9 +94,19 @@ def test_repository_cross_configs_are_backend_only_deltas(
         config_dir / derived_name,
     )
     config = load_project_config(config_dir / derived_name)
-    assert config.model.audio_backend == "cross_attention_tokens"
+    assert config.model.audio_backend in {
+        "cross_attention_tokens",
+        "cross_attention_masks",
+    }
     assert config.model.audio_render_strategy == "native_residual"
 
 
 def test_causal_evaluation_systems_are_registered_continuations() -> None:
-    assert set(CAUSAL_EVALUATION_SYSTEMS) <= EVALUATION_CONTINUATION_SYSTEMS
+    assert (
+        set(CAUSAL_EVALUATION_SYSTEMS)
+        | set(MASK_CAUSAL_EVALUATION_SYSTEMS)
+    ) == set(ALL_CROSS_ATTENTION_EVALUATION_SYSTEMS)
+    assert (
+        set(ALL_CROSS_ATTENTION_EVALUATION_SYSTEMS)
+        <= EVALUATION_CONTINUATION_SYSTEMS
+    )

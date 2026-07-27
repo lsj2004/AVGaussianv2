@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from avgaussianv2.benchmark.cross_attention_ablation import (
-    CAUSAL_EVALUATION_SYSTEMS,
+    ALL_CROSS_ATTENTION_EVALUATION_SYSTEMS,
     verify_cross_attention_preparation,
 )
 from avgaussianv2.benchmark.evaluation import BenchmarkEvaluator
@@ -25,7 +25,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--system",
-        choices=CAUSAL_EVALUATION_SYSTEMS,
+        choices=ALL_CROSS_ATTENTION_EVALUATION_SYSTEMS,
         default="cross_attention",
     )
     parser.add_argument(
@@ -47,6 +47,12 @@ def main() -> None:
         args.protocol_dir,
         require_repository_match=False,
     )
+    allowed_systems = tuple(preparation["causal_evaluation_systems"])
+    if args.system not in allowed_systems:
+        parser.error(
+            f"--system {args.system!r} is incompatible with prepared backend; "
+            f"choose one of {allowed_systems}"
+        )
     scene_id = str(preparation["scene_id"])
     identity = expected_identity(scene_id, args.system, args.step)
     evidence = continuation_training_evidence(

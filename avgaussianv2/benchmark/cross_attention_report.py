@@ -11,9 +11,6 @@ from avgaussianv2.benchmark.artifacts import (
     publish_generation,
     sha256,
 )
-from avgaussianv2.benchmark.cross_attention_ablation import (
-    CAUSAL_EVALUATION_SYSTEMS,
-)
 from avgaussianv2.benchmark.evaluation import (
     ALL_METRICS,
     REPORTING_STEPS,
@@ -37,11 +34,14 @@ def _key(result: BenchmarkEvaluationResult) -> tuple[str, int | None]:
 
 def _require_fair_protocol(
     indexed: Mapping[tuple[str, int | None], BenchmarkEvaluationResult],
+    *,
+    main_system: str,
+    evaluation_systems: Sequence[str],
 ) -> None:
     reference = indexed[(FILM_SYSTEM, REPORTING_STEPS[0])]
     for step in REPORTING_STEPS:
         film = indexed[(FILM_SYSTEM, step)]
-        cross = indexed[("cross_attention", step)]
+        cross = indexed[(main_system, step)]
         for field in (
             "index_sha256",
             "visual_initialization_sha256",
@@ -57,7 +57,7 @@ def _require_fair_protocol(
                 )
         causal = [
             indexed[(system, step)]
-            for system in CAUSAL_EVALUATION_SYSTEMS
+            for system in evaluation_systems
         ]
         checkpoint_hashes = {
             result.provenance.get("checkpoint_sha256") for result in causal
@@ -89,7 +89,7 @@ def _markdown(report: Mapping[str, object]) -> str:
         "|---:|---|---:|---:|---:|---:|",
     ]
     for step in REPORTING_STEPS:
-        for system in (FILM_SYSTEM, *CAUSAL_EVALUATION_SYSTEMS):
+        for system in report["systems"]:
             summary = report["scaling"][str(step)][system]
 
             def mean(name: str) -> object:
@@ -113,6 +113,8 @@ def build_cross_attention_scene_report(
 ) -> dict[str, object]:
     alignment = preparation.get("alignment")
     audio_contract = preparation.get("audiogs_contract")
+    main_system = preparation.get("system")
+    evaluation_systems = tuple(preparation.get("causal_evaluation_systems", ()))
     if (
         preparation.get("scene_id") != scene_id
         or not isinstance(alignment, Mapping)
@@ -123,6 +125,10 @@ def build_cross_attention_scene_report(
         != "native_audiogs_checkpoint_criterion"
         or not isinstance(audio_contract, Mapping)
         or not isinstance(audio_contract.get("checkpoint_sha256"), str)
+        or not isinstance(main_system, str)
+        or not evaluation_systems
+        or evaluation_systems[0] != main_system
+        or any(not isinstance(system, str) for system in evaluation_systems)
     ):
         raise BenchmarkReportError(
             "report requires verified shared-AudioGS cross-attention preparation"
@@ -132,7 +138,7 @@ def build_cross_attention_scene_report(
         *((FILM_SYSTEM, step) for step in REPORTING_STEPS),
         *(
             (system, step)
-            for system in CAUSAL_EVALUATION_SYSTEMS
+            for system in evaluation_systems
             for step in REPORTING_STEPS
         ),
     }
@@ -145,42 +151,40 @@ def build_cross_attention_scene_report(
     sample_ids = indexed[(FILM_SYSTEM, PRIMARY_STEP)].identity.expected_sample_ids
     if any(result.identity.expected_sample_ids != sample_ids for result in indexed.values()):
         raise BenchmarkReportError("all comparison systems require identical sample IDs")
-    _require_fair_protocol(indexed)
+    _require_fair_protocol(
+        indexed,
+        main_system=main_system,
+        evaluation_systems=evaluation_systems,
+    )
 
     paired_by_step = {}
     for step in REPORTING_STEPS:
-        cross = indexed[("cross_attention", step)]
-        paired_by_step[str(step)] = {
-            "cross_attention_vs_film_unet": _paired(
+        cross = indexed[(main_system, step)]
+        paired = {
+            f"{main_system}_vs_film_unet": _paired(
                 cross,
                 indexed[(FILM_SYSTEM, step)],
                 ALL_METRICS,
-            ),
-            "rgbd_on_vs_off": _paired(
-                cross,
-                indexed[("cross_attention_no_rgbd", step)],
-                ALL_METRICS,
-            ),
-            "rgbd_on_vs_shuffled": _paired(
-                cross,
-                indexed[("cross_attention_shuffled_rgbd", step)],
-                ALL_METRICS,
-            ),
-            "gaussians_on_vs_off": _paired(
-                cross,
-                indexed[("cross_attention_no_gaussians", step)],
-                ALL_METRICS,
-            ),
-            "pose_on_vs_off": _paired(
-                cross,
-                indexed[("cross_attention_no_pose", step)],
-                ALL_METRICS,
-            ),
+            )
         }
+        optional_comparisons = {
+            "rgbd_on_vs_off": f"{main_system}_no_rgbd",
+            "rgbd_on_vs_shuffled": f"{main_system}_shuffled_rgbd",
+            "gaussians_on_vs_off": f"{main_system}_no_gaussians",
+            "pose_on_vs_off": f"{main_system}_no_pose",
+        }
+        for label, system in optional_comparisons.items():
+            if system in evaluation_systems:
+                paired[label] = _paired(
+                    cross,
+                    indexed[(system, step)],
+                    ALL_METRICS,
+                )
+        paired_by_step[str(step)] = paired
     scaling = {
         str(step): {
             system: indexed[(system, step)].summary
-            for system in (FILM_SYSTEM, *CAUSAL_EVALUATION_SYSTEMS)
+            for system in (FILM_SYSTEM, *evaluation_systems)
         }
         for step in REPORTING_STEPS
     }
@@ -190,6 +194,8 @@ def build_cross_attention_scene_report(
         "scene_id": scene_id,
         "sample_count": expected_sample_count,
         "primary_step": PRIMARY_STEP,
+        "main_system": main_system,
+        "systems": [FILM_SYSTEM, *evaluation_systems],
         "comparison_scope": "shared_audiogs_gaussians_postprocessor_update_matched",
         "shared": {
             "train_cameras": list(

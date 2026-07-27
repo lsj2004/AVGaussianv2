@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 
 from avgaussianv2.benchmark.cross_attention_ablation import (
-    CAUSAL_EVALUATION_SYSTEMS,
     verify_cross_attention_preparation,
 )
 from avgaussianv2.benchmark.cross_attention_report import (
@@ -27,6 +26,8 @@ def main() -> None:
     parser.add_argument("--expected-samples", type=int, required=True)
     args = parser.parse_args()
 
+    preparation = verify_cross_attention_preparation(args.protocol_dir)
+    evaluation_systems = tuple(preparation["causal_evaluation_systems"])
     evaluations = []
     for step in REPORTING_STEPS:
         evaluations.append(
@@ -39,7 +40,7 @@ def main() -> None:
                 ),
             )
         )
-        for system in CAUSAL_EVALUATION_SYSTEMS:
+        for system in evaluation_systems:
             evaluations.append(
                 verify_evaluation(
                     args.cross_eval_root / system / f"step_{step:06d}",
@@ -51,7 +52,7 @@ def main() -> None:
         evaluations=evaluations,
         expected_sample_count=args.expected_samples,
         output_dir=args.output_dir,
-        preparation=verify_cross_attention_preparation(args.protocol_dir),
+        preparation=preparation,
     )
     print(
         json.dumps(

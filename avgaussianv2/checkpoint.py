@@ -72,7 +72,10 @@ def _compatibility(config: ProjectConfig) -> dict[str, Any]:
         "audio_backend": config.model.audio_backend,
         "audio_render_strategy": config.model.audio_render_strategy,
     }
-    if config.model.audio_backend == "cross_attention_tokens":
+    if config.model.audio_backend in {
+        "cross_attention_tokens",
+        "cross_attention_masks",
+    }:
         compatibility.update(
             {
                 "audio_freq_patch": config.model.audio_freq_patch,
@@ -81,6 +84,11 @@ def _compatibility(config: ProjectConfig) -> dict[str, Any]:
                 "audio_transformer_heads": config.model.audio_transformer_heads,
                 "audio_dropout": config.model.audio_dropout,
                 "audio_cross_gate_init": config.model.audio_cross_gate_init,
+            }
+        )
+    if config.model.audio_backend == "cross_attention_tokens":
+        compatibility.update(
+            {
                 "audio_residual_scale": config.model.audio_residual_scale,
                 "audio_gaussian_schema": "audiogs_mono_diff_v1",
                 "audio_gaussian_token_rows": config.model.audio_gaussian_token_rows,

@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -50,6 +51,56 @@ CAUSAL_EVALUATION_SYSTEMS = (
     "cross_attention_no_gaussians",
     "cross_attention_no_pose",
 )
+MASK_CROSS_ATTENTION_SYSTEM = "cross_attention_masks"
+MASK_CAUSAL_EVALUATION_SYSTEMS = (
+    "cross_attention_masks",
+    "cross_attention_masks_no_rgbd",
+    "cross_attention_masks_shuffled_rgbd",
+)
+ALL_CROSS_ATTENTION_EVALUATION_SYSTEMS = (
+    *CAUSAL_EVALUATION_SYSTEMS,
+    *MASK_CAUSAL_EVALUATION_SYSTEMS,
+)
+
+
+@dataclass(frozen=True)
+class CrossAttentionVariant:
+    backend: str
+    system: str
+    evaluation_systems: tuple[str, ...]
+    audio_query_input: str
+    cross_attention_memory: tuple[str, ...]
+
+
+_VARIANTS = {
+    "cross_attention_tokens": CrossAttentionVariant(
+        backend="cross_attention_tokens",
+        system=CROSS_ATTENTION_SYSTEM,
+        evaluation_systems=CAUSAL_EVALUATION_SYSTEMS,
+        audio_query_input="source_audio_stft_tokens",
+        cross_attention_memory=(
+            "rgbd_tokens",
+            "pose_tokens",
+            "explicit_audiogs_gaussian_attribute_tokens",
+        ),
+    ),
+    "cross_attention_masks": CrossAttentionVariant(
+        backend="cross_attention_masks",
+        system=MASK_CROSS_ATTENTION_SYSTEM,
+        evaluation_systems=MASK_CAUSAL_EVALUATION_SYSTEMS,
+        audio_query_input="audiogs_mono_diff_feature_patch_tokens",
+        cross_attention_memory=("rgbd_tokens",),
+    ),
+}
+
+
+def cross_attention_variant(audio_backend: str) -> CrossAttentionVariant:
+    try:
+        return _VARIANTS[audio_backend]
+    except KeyError as error:
+        raise ValueError(
+            f"unsupported strict cross-attention backend {audio_backend!r}"
+        ) from error
 
 
 def _load_yaml(path: Path) -> dict:
@@ -94,6 +145,8 @@ def _atomic_write(path: Path, data: bytes) -> None:
 def validate_backend_only_delta(
     base_config: Path,
     derived_config: Path,
+    *,
+    expected_backend: str | None = None,
 ) -> dict[str, str]:
     """Require the raw protocol to change only ``model.audio_backend``."""
     base = _load_yaml(Path(base_config))
@@ -102,12 +155,22 @@ def validate_backend_only_delta(
     model = expected.setdefault("model", {})
     if not isinstance(model, dict):
         raise ValueError("base model config must be a mapping")
-    model["audio_backend"] = "cross_attention_tokens"
+    derived_model = derived.get("model")
+    if not isinstance(derived_model, Mapping):
+        raise ValueError("derived model config must be a mapping")
+    backend = str(derived_model.get("audio_backend", ""))
+    cross_attention_variant(backend)
+    if expected_backend is not None and backend != expected_backend:
+        raise ValueError(
+            f"derived audio backend must be {expected_backend!r}, got {backend!r}"
+        )
+    model["audio_backend"] = backend
     if derived != expected:
         raise ValueError(
             "cross-attention config may change only model.audio_backend"
         )
     return {
+        "audio_backend": backend,
         "base_config_sha256": hashlib.sha256(
             Path(base_config).read_bytes()
         ).hexdigest(),
@@ -139,14 +202,24 @@ def verify_cross_attention_preparation(
         if (protocol / name).read_bytes() != data:
             raise RuntimeError(f"live cross-attention preparation differs: {name}")
     evidence = json.loads(files["preparation.json"])
+    if not isinstance(evidence, dict):
+        raise ValueError("cross-attention preparation evidence must be an object")
+    backend = evidence.get("audio_backend")
+    if backend is None and evidence.get("system") == CROSS_ATTENTION_SYSTEM:
+        # Version-1 preparations created before the mask renderer existed did
+        # not persist the otherwise implied backend name.
+        backend = "cross_attention_tokens"
+    variant = cross_attention_variant(str(backend))
     if (
-        not isinstance(evidence, dict)
-        or evidence.get("schema") != PREPARATION_SCHEMA
+        evidence.get("schema") != PREPARATION_SCHEMA
         or evidence.get("version") != 1
+        or evidence.get("system") != variant.system
+        or tuple(evidence.get("causal_evaluation_systems", ()))
+        != variant.evaluation_systems
         or manifest["identity"]
         != {
             "scene_id": evidence.get("scene_id"),
-            "system": CROSS_ATTENTION_SYSTEM,
+            "system": variant.system,
         }
     ):
         raise ValueError("cross-attention preparation evidence schema mismatch")
@@ -170,12 +243,13 @@ def prepare_cross_attention_run(
 ) -> dict[str, object]:
     """Bind cross-attention to A's data, budget, and both Gaussian checkpoints."""
     delta = validate_backend_only_delta(base_config, derived_config)
+    variant = cross_attention_variant(delta["audio_backend"])
     audit_protocol_config(base_config)
     audit_protocol_config(derived_config)
     base_project = load_project_config(base_config)
     derived_project = load_project_config(derived_config)
     if (
-        derived_project.model.audio_backend != "cross_attention_tokens"
+        derived_project.model.audio_backend != variant.backend
         or base_project.scene.scene_id != derived_project.scene.scene_id
     ):
         raise ValueError("invalid cross-attention project identity")
@@ -326,7 +400,8 @@ def prepare_cross_attention_run(
         "schema": PREPARATION_SCHEMA,
         "version": 1,
         "scene_id": scene_id,
-        "system": CROSS_ATTENTION_SYSTEM,
+        "system": variant.system,
+        "audio_backend": variant.backend,
         "repository": repository_identity(),
         "base_a": {
             "config_path": str(Path(base_config).absolute()),
@@ -362,13 +437,14 @@ def prepare_cross_attention_run(
             "shared_indices_sha256": base_compatibility.index_sha256,
             "only_raw_config_delta": "model.audio_backend",
             "audiogs_unet_used_by_cross_attention": False,
-            "audio_query_input": "source_audio_stft_tokens",
+            "audio_query_input": variant.audio_query_input,
             "residual_anchor": "native_audiogs_gaussian_render",
-            "cross_attention_memory": [
-                "rgbd_tokens",
-                "pose_tokens",
-                "explicit_audiogs_gaussian_attribute_tokens",
-            ],
+            "cross_attention_memory": list(variant.cross_attention_memory),
+            "renderer_contract": (
+                "audiogs_mono_diff_features_to_mono_diff_masks"
+                if variant.backend == "cross_attention_masks"
+                else "complex_spectrogram_residual"
+            ),
             "audio_criterion": "native_audiogs_checkpoint_criterion",
         },
         "token_protocol": {
@@ -381,14 +457,14 @@ def prepare_cross_attention_run(
             "pose_tokens": 2,
             "memory_modality_embeddings": True,
         },
-        "causal_evaluation_systems": list(CAUSAL_EVALUATION_SYSTEMS),
+        "causal_evaluation_systems": list(variant.evaluation_systems),
     }
     evidence_bytes = canonical_json(evidence)
     _atomic_write(protocol / "preparation.json", evidence_bytes)
     publish_generation(
         protocol / "immutable",
         schema=PREPARATION_SCHEMA,
-        identity={"scene_id": scene_id, "system": CROSS_ATTENTION_SYSTEM},
+        identity={"scene_id": scene_id, "system": variant.system},
         files={
             "resolved_project.yaml": resolved.read_bytes(),
             "resolved_project.origin.json": resolved.with_name(
@@ -403,7 +479,12 @@ def prepare_cross_attention_run(
 
 __all__ = [
     "CAUSAL_EVALUATION_SYSTEMS",
+    "ALL_CROSS_ATTENTION_EVALUATION_SYSTEMS",
     "CROSS_ATTENTION_SYSTEM",
+    "MASK_CAUSAL_EVALUATION_SYSTEMS",
+    "MASK_CROSS_ATTENTION_SYSTEM",
+    "CrossAttentionVariant",
+    "cross_attention_variant",
     "prepare_cross_attention_run",
     "validate_backend_only_delta",
     "verify_cross_attention_preparation",

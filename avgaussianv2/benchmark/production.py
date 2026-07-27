@@ -1199,6 +1199,8 @@ def build_evaluation_adapters(
                     "cross_attention_shuffled_rgbd",
                     "cross_attention_no_gaussians",
                     "cross_attention_no_pose",
+                    "cross_attention_masks",
+                    "cross_attention_masks_shuffled_rgbd",
                 }
                 model.condition_content_permutation = None
                 if hasattr(model.audio, "gaussian_tokens_enabled"):
@@ -1209,7 +1211,10 @@ def build_evaluation_adapters(
                     model.audio.pose_tokens_enabled = (
                         evidence.system_name != "cross_attention_no_pose"
                     )
-                if evidence.system_name == "cross_attention_shuffled_rgbd":
+                if evidence.system_name in {
+                    "cross_attention_shuffled_rgbd",
+                    "cross_attention_masks_shuffled_rgbd",
+                }:
                     condition_encoder = model.condition_encoder
                     d_model = getattr(condition_encoder, "d_model", None)
                     if d_model is None:

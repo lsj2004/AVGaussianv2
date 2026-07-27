@@ -359,6 +359,23 @@ These names intentionally keep the old `cross_attention_tokens` results
 separate: that backend changes the postprocessor output and is not the
 U-Net-aligned baseline.
 
+The strict runner supports both backends. Select the mask renderer without
+changing the legacy positional interface by setting one environment variable:
+
+```bash
+export CROSS_ATTENTION_BACKEND=cross_attention_masks
+scripts/run_cross_attention_cam38.sh scene1_opera prepare 0
+scripts/run_cross_attention_cam38.sh scene1_opera diagnose 0
+scripts/run_cross_attention_cam38.sh scene1_opera train 0
+scripts/run_cross_attention_cam38.sh scene1_opera eval 0 cross_attention_masks 5000
+scripts/run_cross_attention_cam38.sh scene1_opera eval 1 cross_attention_masks_no_rgbd 5000
+scripts/run_cross_attention_cam38.sh scene1_opera eval 2 cross_attention_masks_shuffled_rgbd 5000
+```
+
+Repeat the three evaluations at 10k and 30k, then run `report`. Preparation
+copies the immutable FiLM worker's exact ordered indices and update budget and
+verifies both native Gaussian checkpoint contracts before it permits training.
+
 ## Outputs
 
 Every run writes `resolved_config.json`, `loss_history.json`, `gradient_norms.json`,
