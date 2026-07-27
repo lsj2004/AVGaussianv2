@@ -322,6 +322,43 @@ or share a GPU when memory permits. The five causal evaluations reuse the same
 trained checkpoint. They measure inference-time reliance; they are not
 retrained capacity ablations.
 
+### AudioGS mask-protocol Cross-Attention baseline
+
+`cross_attention_masks` is the controlled network-replacement baseline. Unlike
+the older complex-spectrogram residual postprocessor above, it leaves the
+AudioGS feature construction and binaural synthesis path untouched. Its
+renderer receives the exact tensors produced by AudioGS:
+
+```text
+mono_features [B,3,257,160] + diff_features [B,2,257,160]
+                              + RGBD visual tokens
+                                      |
+                                      v
+mono_mask [B,1,257,160] + diff_mask [B,1,257,160]
+```
+
+The mono mask uses `softplus + 0.1` and the difference mask uses `tanh`,
+matching the upstream U-Net contract. With the GS-only checkpoint, the outer
+control rule also remains the same as the FiLM baseline:
+
+```text
+native AudioGS + conditioned renderer - plain renderer
+```
+
+The implementation uses 16x4 time-frequency patches. The native 257x160 field
+is padded to 272x160 (17x40 audio queries) and cropped back after mask
+decoding. It has 1,151,744 trainable renderer parameters at the default
+128-dimensional, four-layer setting. The strict configs are:
+
+```text
+configs/benchmark_cam38/scene1_opera_cross_attention_masks.yaml
+configs/benchmark_cam38/Scene7playing_cross_attention_masks.yaml
+```
+
+These names intentionally keep the old `cross_attention_tokens` results
+separate: that backend changes the postprocessor output and is not the
+U-Net-aligned baseline.
+
 ## Outputs
 
 Every run writes `resolved_config.json`, `loss_history.json`, `gradient_norms.json`,

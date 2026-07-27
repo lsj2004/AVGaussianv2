@@ -253,6 +253,7 @@ def test_audio_backend_rejects_unimplemented_enhanced_criterion() -> None:
 
 
 def test_audio_backend_applies_condition_only_inside_render_scope() -> None:
+    torch.manual_seed(0)
     model = TinyAudioModel()
     model.renderer = FiLMConditionedAudioUNet(model.renderer, embedding_dim=8)
     backend = AudioGSBackend(model, source_path=Path("audio.pth"))

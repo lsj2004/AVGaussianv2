@@ -149,6 +149,27 @@ def build_runtime(
             d_model=config.model.embedding_dim,
             alpha_threshold=config.model.alpha_threshold,
         )
+    elif config.model.audio_backend == "cross_attention_masks":
+        from avgaussianv2.models.visual_tokens import RGBDTokenEncoder
+
+        audio = audio_backend.load(
+            config.paths.audio_checkpoint,
+            embedding_dim=config.model.embedding_dim,
+            upstream_root=config.paths.audio_upstream_root,
+            model_class=config.model.audio_model_class,
+            render_strategy=config.model.audio_render_strategy,
+            renderer_kind="mask_cross_attention",
+            transformer_layers=config.model.audio_transformer_layers,
+            transformer_heads=config.model.audio_transformer_heads,
+            freq_patch=config.model.audio_freq_patch,
+            time_patch=config.model.audio_time_patch,
+            dropout=config.model.audio_dropout,
+            cross_gate_init=config.model.audio_cross_gate_init,
+        )
+        condition = RGBDTokenEncoder(
+            d_model=config.model.embedding_dim,
+            alpha_threshold=config.model.alpha_threshold,
+        )
     else:
         audio = audio_backend.load(
             config.paths.audio_checkpoint,

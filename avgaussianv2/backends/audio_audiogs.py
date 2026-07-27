@@ -12,6 +12,9 @@ import torch
 from torch import Tensor, nn
 
 from avgaussianv2.models.film_unet import FiLMConditionedAudioUNet
+from avgaussianv2.models.mask_cross_attention import (
+    AudioFeatureMaskCrossAttention,
+)
 
 
 class AudioCheckpointError(RuntimeError):
@@ -23,7 +26,7 @@ ForwardOverride = Callable[[nn.Module, Tensor, Tensor], Tensor]
 
 
 class AudioRenderStrategy(str, Enum):
-    """How RGBD-conditioned U-Net output is combined with AudioGS."""
+    """How RGBD-conditioned renderer output is combined with AudioGS."""
 
     NATIVE_RESIDUAL = "native_residual"
     DIRECT_CONDITIONED_UNET = "direct_conditioned_unet"
@@ -189,8 +192,19 @@ class AudioGSBackend(nn.Module):
         render_strategy: AudioRenderStrategy | str = AudioRenderStrategy.NATIVE_RESIDUAL,
     ) -> None:
         super().__init__()
-        if not isinstance(getattr(model, "renderer", None), FiLMConditionedAudioUNet):
-            raise TypeError("AudioGS model renderer must be wrapped by FiLMConditionedAudioUNet")
+        renderer = getattr(model, "renderer", None)
+        required_renderer_methods = (
+            "use_condition",
+            "conditioning_parameters",
+            "base_parameters",
+        )
+        if not isinstance(renderer, nn.Module) or any(
+            not callable(getattr(renderer, name, None))
+            for name in required_renderer_methods
+        ):
+            raise TypeError(
+                "AudioGS model renderer must implement the conditioned renderer protocol"
+            )
         self.model = model
         self.source_path = Path(source_path)
         self.checkpoint_config = checkpoint_config
@@ -204,10 +218,14 @@ class AudioGSBackend(nn.Module):
         )
 
     @property
-    def conditioned_renderer(self) -> FiLMConditionedAudioUNet:
+    def conditioned_renderer(self) -> nn.Module:
         renderer = self.model.renderer
-        if not isinstance(renderer, FiLMConditionedAudioUNet):
-            raise RuntimeError("AudioGS renderer wrapper was replaced after backend construction")
+        if not isinstance(renderer, nn.Module) or not callable(
+            getattr(renderer, "use_condition", None)
+        ):
+            raise RuntimeError(
+                "AudioGS conditioned renderer was replaced after backend construction"
+            )
         return renderer
 
     @classmethod
@@ -219,6 +237,13 @@ class AudioGSBackend(nn.Module):
         upstream_root: str | Path | None = None,
         model_class: str = "Audio3DGS",
         render_strategy: AudioRenderStrategy | str = AudioRenderStrategy.NATIVE_RESIDUAL,
+        renderer_kind: str = "film_unet",
+        transformer_layers: int = 4,
+        transformer_heads: int = 4,
+        freq_patch: int = 16,
+        time_patch: int = 4,
+        dropout: float = 0.0,
+        cross_gate_init: float = 0.01,
     ) -> "AudioGSBackend":
         checkpoint_path = Path(checkpoint)
         if not checkpoint_path.exists():
@@ -248,7 +273,25 @@ class AudioGSBackend(nn.Module):
             if cache_name in checkpoint_state and cache_name in initialized_state:
                 checkpoint_state[cache_name] = initialized_state[cache_name]
         model.load_state_dict(checkpoint_state, strict=True)
-        model.renderer = FiLMConditionedAudioUNet(model.renderer, embedding_dim=embedding_dim)
+        if renderer_kind == "film_unet":
+            model.renderer = FiLMConditionedAudioUNet(
+                model.renderer,
+                embedding_dim=embedding_dim,
+            )
+        elif renderer_kind == "mask_cross_attention":
+            model.renderer = AudioFeatureMaskCrossAttention(
+                d_model=embedding_dim,
+                num_layers=transformer_layers,
+                num_heads=transformer_heads,
+                freq_patch=freq_patch,
+                time_patch=time_patch,
+                dropout=dropout,
+                cross_gate_init=cross_gate_init,
+            )
+        else:
+            raise ValueError(
+                "renderer_kind must be 'film_unet' or 'mask_cross_attention'"
+            )
         forward_override = None
         if upstream_root is not None:
             forward_override = _upstream_forward_override(Path(upstream_root), model_class)
@@ -294,12 +337,16 @@ class AudioGSBackend(nn.Module):
         if condition is None:
             return native
         # GS-only checkpoints bypass their saved renderer. For residual
-        # strategies, isolate only the visual-condition delta so zero-init
-        # FiLM preserves the native pretrained function exactly.
-        plain_unet = self.forward_override(self.model, cam_pose, source_audio)
+        # strategies, isolate only the visual-condition delta so the native
+        # pretrained Gaussian function remains the common residual anchor.
+        plain_renderer = self.forward_override(self.model, cam_pose, source_audio)
         with self.conditioned_renderer.use_condition(condition):
-            conditioned_unet = self.forward_override(self.model, cam_pose, source_audio)
-        residual = conditioned_unet - plain_unet
+            conditioned_renderer = self.forward_override(
+                self.model,
+                cam_pose,
+                source_audio,
+            )
+        residual = conditioned_renderer - plain_renderer
         if self.render_strategy is AudioRenderStrategy.GATED_NATIVE_RESIDUAL:
             residual = self.residual_gate_scale() * residual
         return native + residual
@@ -318,10 +365,10 @@ class AudioGSBackend(nn.Module):
         ]
 
     def film_parameters(self) -> list[nn.Parameter]:
-        parameters = list(self.conditioned_renderer.film.parameters())
+        parameters = list(self.conditioned_renderer.conditioning_parameters())
         if self.residual_gate_logit is not None:
             parameters.append(self.residual_gate_logit)
         return parameters
 
     def audio_unet_parameters(self) -> list[nn.Parameter]:
-        return list(self.conditioned_renderer.base.parameters())
+        return list(self.conditioned_renderer.base_parameters())

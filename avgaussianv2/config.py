@@ -172,8 +172,15 @@ class ModelConfig:
                 raise ValueError(f"model.{name} must be positive")
         if not 0 <= self.alpha_threshold <= 1:
             raise ValueError("model.alpha_threshold must be in [0, 1]")
-        if self.audio_backend not in {"audiogs", "cross_attention_tokens"}:
-            raise ValueError("model.audio_backend must be 'audiogs' or 'cross_attention_tokens'")
+        cross_backends = {
+            "cross_attention_tokens",
+            "cross_attention_masks",
+        }
+        if self.audio_backend not in {"audiogs", *cross_backends}:
+            raise ValueError(
+                "model.audio_backend must be 'audiogs', "
+                "'cross_attention_tokens', or 'cross_attention_masks'"
+            )
         if self.audio_render_strategy not in {
             "native_residual",
             "direct_conditioned_unet",
@@ -184,17 +191,18 @@ class ModelConfig:
                 "direct_conditioned_unet, or gated_native_residual"
             )
         if (
-            self.audio_backend == "cross_attention_tokens"
+            self.audio_backend in cross_backends
             and self.audio_render_strategy != "native_residual"
         ):
             raise ValueError(
-                "cross_attention_tokens does not use AudioGS render strategies; "
+                "cross-attention baselines require the shared native-residual "
+                "AudioGS strategy; "
                 "model.audio_render_strategy must remain native_residual"
             )
-        if self.audio_backend == "cross_attention_tokens":
+        if self.audio_backend in cross_backends:
             if self.audio_model_class != "Audio3DGSMonoDiffGSOnly":
                 raise ValueError(
-                    "cross_attention_tokens requires "
+                    "cross-attention baselines require "
                     "model.audio_model_class=Audio3DGSMonoDiffGSOnly"
                 )
             cross_positive = {

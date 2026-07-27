@@ -57,6 +57,24 @@ class TinyRuntimeAudioGS(nn.Module):
         return zeros, zeros
 
 
+class TinyMaskBackend(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.value = nn.Parameter(torch.tensor(1.0))
+
+    def build_criterion(self):
+        return nn.MSELoss()
+
+    def acoustic_parameters(self):
+        return []
+
+    def film_parameters(self):
+        return [self.value]
+
+    def audio_unet_parameters(self):
+        return []
+
+
 def test_cross_attention_runtime_loads_native_audiogs_without_unet(monkeypatch) -> None:
     visual = nn.Linear(1, 1)
     native_model = TinyRuntimeAudioGS()
@@ -132,3 +150,69 @@ def test_cross_attention_runtime_loads_native_audiogs_without_unet(monkeypatch) 
     assert isinstance(bundle.model.condition_encoder, RGBDTokenEncoder)
     assert bundle.train_samples == ("train-sample",)
     assert bundle.eval_samples == ("eval-sample",)
+
+
+def test_mask_cross_attention_runtime_selects_renderer_protocol(monkeypatch) -> None:
+    visual = nn.Linear(1, 1)
+    backend = TinyMaskBackend()
+    captured = {}
+
+    def load_audio(*_args, **kwargs):
+        captured.update(kwargs)
+        return backend
+
+    monkeypatch.setattr(
+        runtime_module,
+        "FTGSVisualBackend",
+        SimpleNamespace(load=lambda *_: visual),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "AudioGSBackend",
+        SimpleNamespace(load=load_audio),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "AlignedAVDataset",
+        lambda _config, split: (f"{split}-sample",),
+    )
+    monkeypatch.setattr(runtime_module, "AVGaussianFusionV2", AVGaussianFusionV2)
+    monkeypatch.setattr(runtime_module, "RGBDConditionEncoder", nn.Identity)
+    config = ProjectConfig(
+        scene=SceneConfig(
+            "scene",
+            30.0,
+            ("cam00",),
+            ("cam38",),
+            {"cam00": 0, "cam38": 38},
+        ),
+        paths=PathConfig(
+            Path("/visual"),
+            Path("/audio"),
+            Path("/visual.pt"),
+            Path("/audio.pt"),
+            Path("/manifest.json"),
+        ),
+        model=ModelConfig(
+            audio_backend="cross_attention_masks",
+            embedding_dim=32,
+            audio_freq_patch=4,
+            audio_time_patch=2,
+            audio_transformer_layers=1,
+            audio_transformer_heads=4,
+            audio_model_class="Audio3DGSMonoDiffGSOnly",
+        ),
+        train=TrainConfig(),
+    )
+
+    bundle = runtime_module.build_runtime(
+        config,
+        torch.device("cpu"),
+        trusted_upstream_artifacts=True,
+    )
+
+    assert bundle.model.audio is backend
+    assert isinstance(bundle.model.condition_encoder, RGBDTokenEncoder)
+    assert captured["renderer_kind"] == "mask_cross_attention"
+    assert captured["transformer_layers"] == 1
+    assert captured["freq_patch"] == 4

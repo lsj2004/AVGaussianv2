@@ -144,3 +144,9 @@ class FiLMConditionedAudioUNet(nn.Module):
         mono_mask = F.softplus(self.base.out_mono(d1)) + 0.1
         diff_mask = torch.tanh(self.base.out_diff(d1))
         return mono_mask, diff_mask
+
+    def conditioning_parameters(self) -> list[nn.Parameter]:
+        return list(self.film.parameters())
+
+    def base_parameters(self) -> list[nn.Parameter]:
+        return list(self.base.parameters())
