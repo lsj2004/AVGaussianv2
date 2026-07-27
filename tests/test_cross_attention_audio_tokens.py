@@ -127,6 +127,31 @@ def test_audio_stft_tokenizer_returns_time_frequency_tokens() -> None:
     assert torch.isfinite(batch.tokens).all()
 
 
+def test_audio_stft_matches_centered_reflection_reference() -> None:
+    tokenizer = AudioSTFTTokenizer(
+        d_model=16,
+        n_fft=32,
+        hop_length=8,
+        win_length=16,
+        freq_patch=4,
+        time_patch=2,
+    )
+    source_audio = torch.randn(2, 2, 160)
+    actual = tokenizer.stft(source_audio)
+    reference = torch.stft(
+        source_audio.reshape(4, 160),
+        n_fft=32,
+        hop_length=8,
+        win_length=16,
+        window=tokenizer.window,
+        return_complex=True,
+        center=True,
+        pad_mode="reflect",
+    ).reshape_as(actual)
+
+    torch.testing.assert_close(actual, reference)
+
+
 def test_gaussian_encoder_uses_real_attributes_and_compresses_tf_grid() -> None:
     model = TinyNativeAudioGS()
     adapter = AudioGSGaussianAttributeAdapter(model)

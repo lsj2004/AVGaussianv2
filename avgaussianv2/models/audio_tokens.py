@@ -56,6 +56,21 @@ def _stft(
     if samples < win_length:
         raise ValueError("source_audio is shorter than win_length")
     flat = source_audio.reshape(batch * channels, samples)
+    # torch.stft(center=True, pad_mode="reflect") dispatches to a CUDA
+    # ReflectionPad1d backward kernel that is not deterministic. Materialize
+    # the exact same reflection with slices, then run the STFT without its
+    # implicit padding so strict benchmark training can backpropagate.
+    center_padding = int(n_fft) // 2
+    if center_padding >= samples:
+        raise ValueError("source_audio is too short for centered reflection padding")
+    flat = torch.cat(
+        [
+            flat[:, 1 : center_padding + 1].flip(-1),
+            flat,
+            flat[:, -center_padding - 1 : -1].flip(-1),
+        ],
+        dim=-1,
+    )
     spectrum = torch.stft(
         flat,
         n_fft=int(n_fft),
@@ -63,6 +78,7 @@ def _stft(
         win_length=int(win_length),
         window=window.to(device=source_audio.device, dtype=source_audio.dtype),
         return_complex=True,
+        center=False,
     )
     return spectrum.reshape(batch, channels, spectrum.shape[-2], spectrum.shape[-1])
 
