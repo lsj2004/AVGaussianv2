@@ -107,6 +107,13 @@ _TASK12_CHECKPOINT_FIELDS = {
 }
 
 
+def _training_mode_for_evaluation_system(system_name: str) -> str:
+    """Map inference-only causal labels to their shared training contract."""
+    if system_name in CROSS_ATTENTION_CONTINUATION_SYSTEMS:
+        return "joint_conditioned"
+    return system_name
+
+
 class BenchmarkEvaluationError(RuntimeError):
     pass
 
@@ -661,7 +668,7 @@ def _audit_continuation_snapshot(
     compatibility = BenchmarkCompatibility.from_mapping(contract["compatibility"])
     if compatibility.to_mapping() != {
         "scene_id": evidence.scene_id,
-        "mode": evidence.system_name,
+        "mode": _training_mode_for_evaluation_system(evidence.system_name),
         "train_cameras": list(evidence.train_cameras),
         "test_camera": evidence.test_camera,
         "seed": evidence.seed,

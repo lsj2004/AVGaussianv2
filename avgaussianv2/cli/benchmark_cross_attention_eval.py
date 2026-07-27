@@ -39,7 +39,14 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
-    preparation = verify_cross_attention_preparation(args.protocol_dir)
+    # Training remains bound to the immutable preparation revision and worker
+    # fingerprint. Evaluation code may receive audit-only fixes afterwards;
+    # the strict checkpoint/runtime evidence below still rejects model,
+    # configuration, source-inventory or data changes.
+    preparation = verify_cross_attention_preparation(
+        args.protocol_dir,
+        require_repository_match=False,
+    )
     scene_id = str(preparation["scene_id"])
     identity = expected_identity(scene_id, args.system, args.step)
     evidence = continuation_training_evidence(

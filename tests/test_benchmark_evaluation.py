@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import multiprocessing
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -479,6 +480,22 @@ def test_strict_task12_contract_adapter_accepts_real_checkpoint_layout(tmp_path)
         tuple(f"scene1_opera/cam38/{index:06d}" for index in range(130)),
         130,
     )
+    audit_training_evidence(evidence, identity)
+
+
+def test_cross_attention_causal_label_reuses_joint_training_contract(tmp_path):
+    evidence = replace(
+        _task12_evidence(tmp_path),
+        system_name="cross_attention_no_gaussians",
+    )
+    identity = EvaluationIdentity(
+        "scene1_opera",
+        "cross_attention_no_gaussians",
+        5_000,
+        tuple(f"scene1_opera/cam38/{index:06d}" for index in range(130)),
+        130,
+    )
+
     audit_training_evidence(evidence, identity)
 
 
