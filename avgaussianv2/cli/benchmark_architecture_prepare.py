@@ -10,6 +10,7 @@ from avgaussianv2.benchmark.architecture_ablation import (
     ABLATION_STRATEGIES,
     prepare_architecture_run,
 )
+from avgaussianv2.benchmark.training import BenchmarkMode
 
 
 def main() -> None:
@@ -19,6 +20,11 @@ def main() -> None:
     parser.add_argument("--base-protocol-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--strategy", choices=sorted(ABLATION_STRATEGIES), required=True)
+    parser.add_argument(
+        "--mode",
+        choices=tuple(mode.value for mode in BenchmarkMode),
+        default=BenchmarkMode.JOINT_CONDITIONED.value,
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--audiogs-contract", type=Path, required=True)
     parser.add_argument("--ftgspp-contract", type=Path, required=True)
@@ -30,6 +36,7 @@ def main() -> None:
         base_protocol_dir=args.base_protocol_dir,
         output_dir=args.output_dir,
         strategy=args.strategy,
+        mode=args.mode,
         device=args.device,
         trusted_upstream_artifacts=args.trust_upstream_artifacts,
         native_contract_dirs={
@@ -42,6 +49,7 @@ def main() -> None:
             {
                 "scene_id": result["scene_id"],
                 "strategy": result["strategy"],
+                "mode": result["mode"],
                 "alignment": result["alignment"],
             },
             sort_keys=True,

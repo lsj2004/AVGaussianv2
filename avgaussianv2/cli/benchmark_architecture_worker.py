@@ -71,6 +71,7 @@ def main() -> None:
             {
                 "scene_id": evidence["scene_id"],
                 "strategy": evidence["strategy"],
+                "mode": evidence.get("mode", "joint_conditioned"),
                 "warmup_step": result["completed_warmup_steps"],
                 "main_step": result["completed_main_updates"],
                 "runtime_contract_sha256": result["runtime_contract_sha256"],

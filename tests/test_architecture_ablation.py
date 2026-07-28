@@ -15,6 +15,8 @@ from avgaussianv2.benchmark.architecture_ablation import (
 from avgaussianv2.benchmark.training import (
     BenchmarkCompatibility,
     BenchmarkConfig,
+    BenchmarkMode,
+    build_worker_manifest,
     hash_shared_indices,
     make_shared_indices,
 )
@@ -147,6 +149,52 @@ def test_aligned_manifest_reuses_exact_a_sample_sequence() -> None:
     assert manifest["compatibility"] == compatibility.to_mapping()
     assert manifest["mode"] == "joint_conditioned"
     assert json.dumps(manifest, sort_keys=True)
+
+
+def test_aligned_manifest_supports_audio_only_plain_unet_baseline() -> None:
+    config = BenchmarkConfig()
+    indices = make_shared_indices(17, config.main_updates, config.seed)
+    compatibility = BenchmarkCompatibility(
+        scene_id="scene1_opera",
+        mode=BenchmarkMode.AUDIO_ONLY.value,
+        train_cameras=tuple(f"cam{index:02d}" for index in range(38)),
+        test_camera="cam38",
+        seed=42,
+        index_sha256=hash_shared_indices(indices),
+        visual_initialization_sha256="a" * 64,
+        audio_initialization_sha256="b" * 64,
+        model_initialization_sha256="c" * 64,
+        source_sha256="d" * 64,
+        config_sha256="e" * 64,
+    )
+    base = build_worker_manifest(
+        config=config,
+        compatibility=compatibility,
+        shared_indices=indices,
+    )
+
+    manifest = build_aligned_worker_manifest(
+        base_manifest=base,
+        compatibility=compatibility,
+        config=config,
+        mode=BenchmarkMode.AUDIO_ONLY,
+    )
+
+    assert manifest["mode"] == BenchmarkMode.AUDIO_ONLY.value
+    assert manifest["shared_indices"] == list(indices)
+
+
+def test_architecture_eval_uses_prepared_mode() -> None:
+    evaluator = (
+        Path(__file__).resolve().parents[1]
+        / "avgaussianv2"
+        / "cli"
+        / "benchmark_architecture_eval.py"
+    ).read_text()
+
+    assert 'mode = str(preparation.get("mode", "joint_conditioned"))' in evaluator
+    assert "expected_identity(scene_id, mode, args.step)" in evaluator
+    assert "system=mode" in evaluator
 
 
 def test_architecture_worker_prints_generic_worker_result_keys() -> None:

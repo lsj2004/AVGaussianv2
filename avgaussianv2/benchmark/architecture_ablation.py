@@ -117,8 +117,10 @@ def build_aligned_worker_manifest(
     base_manifest: Mapping[str, object],
     compatibility: BenchmarkCompatibility,
     config: BenchmarkConfig,
+    mode: BenchmarkMode | str = BenchmarkMode.JOINT_CONDITIONED,
 ) -> dict[str, object]:
-    """Reuse A's exact sample sequence while binding B/C runtime identities."""
+    """Reuse a base worker's exact sequence while binding a derived runtime."""
+    resolved_mode = BenchmarkMode(mode)
     expected_fields = {
         "schema",
         "version",
@@ -132,9 +134,13 @@ def build_aligned_worker_manifest(
     if (
         base_manifest["schema"] != "avgaussianv2.cam38-benchmark-worker"
         or base_manifest["version"] != 1
-        or base_manifest["mode"] != "joint_conditioned"
+        or base_manifest["mode"] != resolved_mode.value
     ):
-        raise ValueError("base worker is not the strict A joint_conditioned run")
+        raise ValueError(
+            f"base worker is not the strict {resolved_mode.value} run"
+        )
+    if compatibility.mode != resolved_mode.value:
+        raise ValueError("derived compatibility mode differs from base worker")
     shared = tuple(base_manifest["shared_indices"])
     if len(shared) != config.main_updates:
         raise ValueError("base A sample sequence length differs from ablation budget")
@@ -251,13 +257,15 @@ def prepare_architecture_run(
     base_protocol_dir: Path,
     output_dir: Path,
     strategy: str,
+    mode: BenchmarkMode | str = BenchmarkMode.JOINT_CONDITIONED,
     device: torch.device | str,
     trusted_upstream_artifacts: bool,
     native_contract_dirs: Mapping[str, Path],
     runtime_builder=build_production_runtime,
     native_verifier=verify_native_contract,
 ) -> dict[str, object]:
-    """Prepare one B/C worker while reusing A's exact sequence and native assets."""
+    """Prepare one renderer worker with an aligned mode, sequence, and assets."""
+    resolved_mode = BenchmarkMode(mode)
     delta = validate_strategy_only_delta(
         base_config, derived_config, expected_strategy=strategy
     )
@@ -273,15 +281,19 @@ def prepare_architecture_run(
     scene_id = derived_project.scene.scene_id
 
     base_manifest_path = (
-        Path(base_protocol_dir) / "worker_manifests" / "joint_conditioned.json"
+        Path(base_protocol_dir)
+        / "worker_manifests"
+        / f"{resolved_mode.value}.json"
     )
-    base_manifest = _load_json_mapping(base_manifest_path, "base A worker manifest")
+    base_manifest = _load_json_mapping(
+        base_manifest_path, f"base {resolved_mode.value} worker manifest"
+    )
     base_compatibility = BenchmarkCompatibility.from_mapping(
         base_manifest["compatibility"]
     )
     if (
         base_compatibility.scene_id != scene_id
-        or base_compatibility.mode != BenchmarkMode.JOINT_CONDITIONED.value
+        or base_compatibility.mode != resolved_mode.value
     ):
         raise ValueError("base A worker identity differs from architecture scene")
     training = BenchmarkConfig.from_mapping(base_manifest["training"])
@@ -383,7 +395,7 @@ def prepare_architecture_run(
 
     compatibility = BenchmarkCompatibility(
         scene_id=scene_id,
-        mode=BenchmarkMode.JOINT_CONDITIONED.value,
+        mode=resolved_mode.value,
         train_cameras=base_compatibility.train_cameras,
         test_camera=base_compatibility.test_camera,
         seed=training.seed,
@@ -400,6 +412,7 @@ def prepare_architecture_run(
         base_manifest=base_manifest,
         compatibility=compatibility,
         config=training,
+        mode=resolved_mode,
     )
     manifest_path = protocol / "worker_manifest.json"
     manifest_bytes = canonical_json(manifest)
@@ -410,6 +423,7 @@ def prepare_architecture_run(
         "version": 1,
         "scene_id": scene_id,
         "strategy": strategy,
+        "mode": resolved_mode.value,
         "repository": repository_identity(),
         "base_a": {
             "config_path": str(Path(base_config).absolute()),

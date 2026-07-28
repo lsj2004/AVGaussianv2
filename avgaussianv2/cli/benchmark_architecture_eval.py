@@ -30,11 +30,12 @@ def main() -> None:
 
     preparation = verify_architecture_preparation(args.protocol_dir)
     scene_id = str(preparation["scene_id"])
-    identity = expected_identity(scene_id, "joint_conditioned", args.step)
+    mode = str(preparation.get("mode", "joint_conditioned"))
+    identity = expected_identity(scene_id, mode, args.step)
     evidence = continuation_training_evidence(
         args.worker_dir,
         scene_id=scene_id,
-        system="joint_conditioned",
+        system=mode,
         step=args.step,
     )
     runtime_factory, predictor_factory = build_evaluation_adapters(
@@ -56,6 +57,7 @@ def main() -> None:
             {
                 "scene_id": scene_id,
                 "strategy": preparation["strategy"],
+                "mode": mode,
                 "step": args.step,
                 "count": result.count,
                 "content_sha256": result.content_sha256,
