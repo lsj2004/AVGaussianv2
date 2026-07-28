@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -219,7 +220,18 @@ def test_mask_cross_attention_runtime_selects_renderer_protocol(monkeypatch) -> 
     assert captured["freq_patch"] == 4
 
 
-def test_query_dependent_p1_runtime_selects_geometry_protocol(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("audio_backend", "contrast_mode"),
+    [
+        ("query_dependent_p1", "audio_total"),
+        ("query_dependent_p1_spatial", "spatial"),
+    ],
+)
+def test_query_dependent_p1_runtime_selects_geometry_protocol(
+    monkeypatch,
+    audio_backend: str,
+    contrast_mode: str,
+) -> None:
     visual = nn.Linear(1, 1)
     backend = TinyMaskBackend()
     captured = {}
@@ -261,7 +273,7 @@ def test_query_dependent_p1_runtime_selects_geometry_protocol(monkeypatch) -> No
             Path("/manifest.json"),
         ),
         model=ModelConfig(
-            audio_backend="query_dependent_p1",
+            audio_backend=audio_backend,
             embedding_dim=32,
             p1_transformer_layers=1,
             p1_transformer_heads=4,
@@ -288,3 +300,5 @@ def test_query_dependent_p1_runtime_selects_geometry_protocol(monkeypatch) -> No
     assert captured["freq_patch"] == 4
     assert bundle.model.camera_contrast_weight == 0.5
     assert bundle.model.camera_contrast_margin == 0.05
+    assert bundle.model.camera_contrast_mode == contrast_mode
+    assert bundle.model.camera_spatial_supervision_weight == 0.1

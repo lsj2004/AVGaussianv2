@@ -12,8 +12,10 @@ from avgaussianv2.contracts import AlignedAVSample
 from avgaussianv2.losses import (
     AudioLoss,
     JointLossWeights,
+    SpatialAudioLossWeights,
     capture_visual_anchor,
     compute_joint_loss,
+    spatial_audio_loss,
 )
 
 
@@ -184,6 +186,7 @@ def _camera_contrast(
     model: nn.Module,
     sample: AlignedAVSample,
     contrast_sample: AlignedAVSample | None,
+    correct_predicted_audio: Tensor,
     correct_audio_loss: Tensor,
     audio_loss_fn: AudioLoss,
 ) -> tuple[Tensor, dict[str, Tensor]]:
@@ -202,16 +205,73 @@ def _camera_contrast(
         wrong.predicted_audio,
         sample,
     )
-    wrong_loss = _audio_loss_tensor(
-        audio_loss_fn(wrong.predicted_audio, sample.target_audio),
-        sample,
-    )
-    observed = wrong_loss - correct_audio_loss
+    mode = str(getattr(model, "camera_contrast_mode", "audio_total"))
+    if mode == "audio_total":
+        correct_loss = correct_audio_loss
+        wrong_loss = _audio_loss_tensor(
+            audio_loss_fn(wrong.predicted_audio, sample.target_audio),
+            sample,
+        )
+        component_parts: dict[str, Tensor] = {}
+        supervision = zero
+        supervision_weight = 0.0
+        supervision_parts: dict[str, Tensor] = {}
+    elif mode == "spatial":
+        spatial_weights = SpatialAudioLossWeights(
+            lre=float(getattr(model, "camera_contrast_lre_weight", 0.30)),
+            ild=float(getattr(model, "camera_contrast_ild_weight", 0.25)),
+            ipd=float(getattr(model, "camera_contrast_ipd_weight", 0.25)),
+            diff=float(getattr(model, "camera_contrast_diff_weight", 0.20)),
+        )
+        options = {
+            "weights": spatial_weights,
+            "n_fft": int(getattr(model, "camera_contrast_n_fft", 512)),
+            "hop_length": int(getattr(model, "camera_contrast_hop_length", 160)),
+            "win_length": int(getattr(model, "camera_contrast_win_length", 400)),
+        }
+        correct_spatial = spatial_audio_loss(
+            correct_predicted_audio,
+            sample.target_audio,
+            **options,
+        )
+        wrong_spatial = spatial_audio_loss(
+            wrong.predicted_audio,
+            sample.target_audio,
+            **options,
+        )
+        correct_loss = correct_spatial["total"]
+        wrong_loss = wrong_spatial["total"]
+        supervision = correct_loss
+        supervision_weight = float(
+            getattr(model, "camera_spatial_supervision_weight", 0.10)
+        )
+        supervision_parts = {
+            "camera_spatial_supervision": supervision,
+            "camera_spatial_supervision_weight": correct_audio_loss.new_tensor(
+                supervision_weight
+            ),
+        }
+        component_parts = {
+            f"camera_contrast_correct_{name}": value
+            for name, value in correct_spatial.items()
+        } | {
+            f"camera_contrast_wrong_{name}": value
+            for name, value in wrong_spatial.items()
+        }
+    else:
+        raise ValueError(f"unsupported camera contrast mode {mode!r}")
+    observed = wrong_loss - correct_loss
     contrast = torch.relu(correct_audio_loss.new_tensor(margin) - observed)
-    return correct_audio_loss.new_tensor(weight) * contrast, {
+    objective = (
+        correct_audio_loss.new_tensor(weight) * contrast
+        + correct_audio_loss.new_tensor(supervision_weight) * supervision
+    )
+    return objective, {
         "camera_contrast": contrast,
         "camera_contrast_weight": correct_audio_loss.new_tensor(weight),
         "camera_contrast_margin_observed": observed,
+        **supervision_parts,
+        **component_parts,
     }
 
 
@@ -232,6 +292,7 @@ def condition_warmup_step(
         model,
         sample,
         contrast_sample,
+        output.predicted_audio,
         audio,
         audio_loss_fn,
     )
@@ -291,6 +352,7 @@ def joint_train_step(
         model,
         sample,
         contrast_sample,
+        output.predicted_audio,
         parts["audio"],
         audio_loss_fn,
     )

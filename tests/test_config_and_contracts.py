@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from avgaussianv2.config import load_project_config
+from avgaussianv2.config import ModelConfig, load_project_config
 from avgaussianv2.contracts import RGBDRender
 
 
@@ -115,6 +115,24 @@ train: {}
 
     with pytest.raises(ValueError, match="model.audio_backend"):
         load_project_config(path)
+
+
+def test_spatial_p1_rejects_invalid_supervision_weights() -> None:
+    with pytest.raises(ValueError, match="p1_spatial_supervision_weight"):
+        ModelConfig(
+            audio_backend="query_dependent_p1_spatial",
+            audio_model_class="Audio3DGSMonoDiffGSOnly",
+            p1_spatial_supervision_weight=0,
+        ).validate()
+    with pytest.raises(ValueError, match="positive loss weight"):
+        ModelConfig(
+            audio_backend="query_dependent_p1_spatial",
+            audio_model_class="Audio3DGSMonoDiffGSOnly",
+            p1_spatial_lre_weight=0,
+            p1_spatial_ild_weight=0,
+            p1_spatial_ipd_weight=0,
+            p1_spatial_diff_weight=0,
+        ).validate()
 
 
 def test_load_project_config_resolves_relative_paths_from_config_directory(

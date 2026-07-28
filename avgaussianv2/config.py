@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -112,6 +113,11 @@ class ModelConfig:
     p1_visual_scene_scale: float = 1.0
     p1_camera_contrast_weight: float = 0.5
     p1_camera_contrast_margin: float = 0.05
+    p1_spatial_supervision_weight: float = 0.10
+    p1_spatial_lre_weight: float = 0.30
+    p1_spatial_ild_weight: float = 0.25
+    p1_spatial_ipd_weight: float = 0.25
+    p1_spatial_diff_weight: float = 0.20
     sample_rate: int = 16_000
     condition_height: int = 64
     condition_width: int = 96
@@ -215,6 +221,24 @@ class ModelConfig:
                     defaults.p1_camera_contrast_margin,
                 )
             ),
+            p1_spatial_supervision_weight=float(
+                raw.get(
+                    "p1_spatial_supervision_weight",
+                    defaults.p1_spatial_supervision_weight,
+                )
+            ),
+            p1_spatial_lre_weight=float(
+                raw.get("p1_spatial_lre_weight", defaults.p1_spatial_lre_weight)
+            ),
+            p1_spatial_ild_weight=float(
+                raw.get("p1_spatial_ild_weight", defaults.p1_spatial_ild_weight)
+            ),
+            p1_spatial_ipd_weight=float(
+                raw.get("p1_spatial_ipd_weight", defaults.p1_spatial_ipd_weight)
+            ),
+            p1_spatial_diff_weight=float(
+                raw.get("p1_spatial_diff_weight", defaults.p1_spatial_diff_weight)
+            ),
             sample_rate=int(raw.get("sample_rate", defaults.sample_rate)),
             condition_height=int(raw.get("condition_height", defaults.condition_height)),
             condition_width=int(raw.get("condition_width", defaults.condition_width)),
@@ -239,12 +263,13 @@ class ModelConfig:
             "cross_attention_tokens",
             "cross_attention_masks",
             "query_dependent_p1",
+            "query_dependent_p1_spatial",
         }
         if self.audio_backend not in {"audiogs", *cross_backends}:
             raise ValueError(
                 "model.audio_backend must be 'audiogs', "
                 "'cross_attention_tokens', 'cross_attention_masks', "
-                "or 'query_dependent_p1'"
+                "'query_dependent_p1', or 'query_dependent_p1_spatial'"
             )
         if self.audio_render_strategy not in {
             "native_residual",
@@ -293,7 +318,10 @@ class ModelConfig:
                 raise ValueError("model.audio_cross_gate_init must be in [0,1]")
             if self.audio_residual_scale <= 0:
                 raise ValueError("model.audio_residual_scale must be positive")
-        if self.audio_backend == "query_dependent_p1":
+        if self.audio_backend in {
+            "query_dependent_p1",
+            "query_dependent_p1_spatial",
+        }:
             p1_positive = {
                 "p1_transformer_layers": self.p1_transformer_layers,
                 "p1_transformer_heads": self.p1_transformer_heads,
@@ -319,6 +347,27 @@ class ModelConfig:
                 raise ValueError("model.p1_dropout must be non-negative")
             if not 0 <= self.p1_cross_gate_init <= 0.1:
                 raise ValueError("model.p1_cross_gate_init must be in [0,0.1]")
+        if self.audio_backend == "query_dependent_p1_spatial":
+            if (
+                not math.isfinite(self.p1_spatial_supervision_weight)
+                or self.p1_spatial_supervision_weight <= 0
+            ):
+                raise ValueError(
+                    "model.p1_spatial_supervision_weight must be finite and positive"
+                )
+            spatial_weights = {
+                "p1_spatial_lre_weight": self.p1_spatial_lre_weight,
+                "p1_spatial_ild_weight": self.p1_spatial_ild_weight,
+                "p1_spatial_ipd_weight": self.p1_spatial_ipd_weight,
+                "p1_spatial_diff_weight": self.p1_spatial_diff_weight,
+            }
+            for name, value in spatial_weights.items():
+                if not math.isfinite(value) or value < 0:
+                    raise ValueError(f"model.{name} must be finite and non-negative")
+            if sum(spatial_weights.values()) <= 0:
+                raise ValueError(
+                    "query-dependent spatial contrast requires a positive loss weight"
+                )
 
 
 @dataclass(frozen=True)

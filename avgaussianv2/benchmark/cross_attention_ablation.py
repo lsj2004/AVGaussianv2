@@ -63,10 +63,17 @@ QUERY_P1_CAUSAL_EVALUATION_SYSTEMS = (
     "query_dependent_p1_no_rgbd",
     "query_dependent_p1_wrong_camera",
 )
+QUERY_P1_SPATIAL_SYSTEM = "query_dependent_p1_spatial"
+QUERY_P1_SPATIAL_CAUSAL_EVALUATION_SYSTEMS = (
+    "query_dependent_p1_spatial",
+    "query_dependent_p1_spatial_no_rgbd",
+    "query_dependent_p1_spatial_wrong_camera",
+)
 ALL_CROSS_ATTENTION_EVALUATION_SYSTEMS = (
     *CAUSAL_EVALUATION_SYSTEMS,
     *MASK_CAUSAL_EVALUATION_SYSTEMS,
     *QUERY_P1_CAUSAL_EVALUATION_SYSTEMS,
+    *QUERY_P1_SPATIAL_CAUSAL_EVALUATION_SYSTEMS,
 )
 
 
@@ -102,6 +109,19 @@ _VARIANTS = {
         backend="query_dependent_p1",
         system=QUERY_P1_SYSTEM,
         evaluation_systems=QUERY_P1_CAUSAL_EVALUATION_SYSTEMS,
+        audio_query_input="native_audiogs_target_view_time_frequency_features",
+        cross_attention_memory=(
+            "rgb_tokens",
+            "metric_depth_geometry",
+            "world_positions",
+            "world_normals",
+            "condition_camera_pose",
+        ),
+    ),
+    "query_dependent_p1_spatial": CrossAttentionVariant(
+        backend="query_dependent_p1_spatial",
+        system=QUERY_P1_SPATIAL_SYSTEM,
+        evaluation_systems=QUERY_P1_SPATIAL_CAUSAL_EVALUATION_SYSTEMS,
         audio_query_input="native_audiogs_target_view_time_frequency_features",
         cross_attention_memory=(
             "rgb_tokens",
@@ -465,7 +485,10 @@ def prepare_cross_attention_run(
                 if variant.backend == "cross_attention_masks"
                 else (
                     "query_dependent_geometry_biased_complex_residual"
-                    if variant.backend == "query_dependent_p1"
+                    if variant.backend in {
+                        "query_dependent_p1",
+                        "query_dependent_p1_spatial",
+                    }
                     else "complex_spectrogram_residual"
                 )
             ),
@@ -474,10 +497,31 @@ def prepare_cross_attention_run(
                 {
                     "weight": derived_project.model.p1_camera_contrast_weight,
                     "margin": derived_project.model.p1_camera_contrast_margin,
+                    "mode": (
+                        "spatial_lre_ild_ipd_binaural_diff"
+                        if variant.backend == "query_dependent_p1_spatial"
+                        else "native_audio_total"
+                    ),
+                    "spatial_weights": (
+                        {
+                            "supervision": (
+                                derived_project.model.p1_spatial_supervision_weight
+                            ),
+                            "lre": derived_project.model.p1_spatial_lre_weight,
+                            "ild": derived_project.model.p1_spatial_ild_weight,
+                            "ipd": derived_project.model.p1_spatial_ipd_weight,
+                            "diff": derived_project.model.p1_spatial_diff_weight,
+                        }
+                        if variant.backend == "query_dependent_p1_spatial"
+                        else None
+                    ),
                     "warmup_seed_offset": 10_000,
                     "main_seed_offset": 20_000,
                 }
-                if variant.backend == "query_dependent_p1"
+                if variant.backend in {
+                    "query_dependent_p1",
+                    "query_dependent_p1_spatial",
+                }
                 else None
             ),
         },
@@ -493,7 +537,10 @@ def prepare_cross_attention_run(
                 "pose_encoding": "listener_geometry_in_audio_queries",
                 "memory_modality_embeddings": False,
             }
-            if variant.backend == "query_dependent_p1"
+            if variant.backend in {
+                "query_dependent_p1",
+                "query_dependent_p1_spatial",
+            }
             else {
                 "audio_position": "deterministic_2d_sinusoidal_frequency_time",
                 "visual_position": "deterministic_2d_sinusoidal_row_column",
@@ -533,6 +580,8 @@ __all__ = [
     "MASK_CROSS_ATTENTION_SYSTEM",
     "QUERY_P1_CAUSAL_EVALUATION_SYSTEMS",
     "QUERY_P1_SYSTEM",
+    "QUERY_P1_SPATIAL_CAUSAL_EVALUATION_SYSTEMS",
+    "QUERY_P1_SPATIAL_SYSTEM",
     "CrossAttentionVariant",
     "cross_attention_variant",
     "prepare_cross_attention_run",

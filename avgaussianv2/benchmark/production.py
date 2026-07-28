@@ -1203,6 +1203,8 @@ def build_evaluation_adapters(
                     "cross_attention_masks_shuffled_rgbd",
                     "query_dependent_p1",
                     "query_dependent_p1_wrong_camera",
+                    "query_dependent_p1_spatial",
+                    "query_dependent_p1_spatial_wrong_camera",
                 }
                 model.condition_content_permutation = None
                 if hasattr(model.audio, "gaussian_tokens_enabled"):
@@ -1246,7 +1248,10 @@ def build_evaluation_adapters(
                 model.condition_enabled = False
             model.eval()
             wrong_camera_by_frame: dict[int, int] = {}
-            if evidence.system_name == "query_dependent_p1_wrong_camera":
+            if evidence.system_name in {
+                "query_dependent_p1_wrong_camera",
+                "query_dependent_p1_spatial_wrong_camera",
+            }:
                 records = getattr(bundle.train_samples, "records", None)
                 if records is None:
                     raise TypeError(
@@ -1277,7 +1282,10 @@ def build_evaluation_adapters(
                     sample.image_size,
                 )
                 return BenchmarkPrediction(rendered_rgb=render.rgb)
-            if evidence.system_name == "query_dependent_p1_wrong_camera":
+            if evidence.system_name in {
+                "query_dependent_p1_wrong_camera",
+                "query_dependent_p1_spatial_wrong_camera",
+            }:
                 try:
                     condition_index = wrong_camera_by_frame[
                         int(sample.frame_index)

@@ -232,6 +232,78 @@ def test_same_frame_camera_negatives_are_reproducible() -> None:
     assert negatives == [1, 0]
 
 
+def test_spatial_camera_contrast_reports_binaural_components() -> None:
+    class SpatialContrastFusion(TinyTrainFusion):
+        camera_contrast_weight = 0.5
+        camera_contrast_margin = 0.05
+        camera_contrast_mode = "spatial"
+        camera_spatial_supervision_weight = 0.10
+        camera_contrast_n_fft = 16
+        camera_contrast_hop_length = 4
+        camera_contrast_win_length = 16
+        camera_contrast_lre_weight = 0.30
+        camera_contrast_ild_weight = 0.25
+        camera_contrast_ipd_weight = 0.25
+        camera_contrast_diff_weight = 0.20
+
+        def forward(self, sample):
+            output = super().forward(sample)
+            return replace(
+                output,
+                predicted_audio=sample.target_audio * self.film.value.sigmoid(),
+            )
+
+        def forward_with_condition_sample(self, sample, _condition_sample):
+            output = self.forward(sample)
+            return replace(
+                output,
+                predicted_audio=output.predicted_audio.flip(1),
+            )
+
+    sample = make_sample()
+    sample = replace(
+        sample,
+        target_audio=torch.stack(
+            (
+                torch.linspace(-0.8, 0.8, 32),
+                torch.linspace(-0.2, 0.2, 32).flip(0),
+            )
+        ).unsqueeze(0),
+    )
+    model = SpatialContrastFusion()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    stats = condition_warmup_step(
+        model,
+        sample,
+        optimizer,
+        audio_loss,
+        contrast_sample=replace(sample, camera="cam01"),
+    )
+
+    assert stats.losses["camera_contrast_correct_lre"] < 1e-5
+    assert (
+        stats.losses["camera_contrast_wrong_lre"]
+        > stats.losses["camera_contrast_correct_lre"]
+    )
+    assert (
+        stats.losses["camera_contrast_margin_observed"]
+        == pytest.approx(
+            stats.losses["camera_contrast_wrong_total"]
+            - stats.losses["camera_contrast_correct_total"]
+        )
+    )
+    assert stats.losses["camera_spatial_supervision"] == pytest.approx(
+        stats.losses["camera_contrast_correct_total"]
+    )
+    assert stats.losses["camera_spatial_supervision_weight"] == pytest.approx(0.10)
+    assert stats.total == pytest.approx(
+        stats.losses["audio"]
+        + 0.5 * stats.losses["camera_contrast"]
+        + 0.1 * stats.losses["camera_spatial_supervision"]
+    )
+
+
 def test_joint_step_can_skip_audio_visual_gradient_probe(monkeypatch) -> None:
     model = TinyTrainFusion()
     model.visual.requires_grad_(False)

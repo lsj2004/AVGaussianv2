@@ -119,7 +119,11 @@ def build_runtime(
         config.paths.visual_checkpoint,
         config.paths.visual_upstream_root,
     )
-    if config.model.audio_backend == "query_dependent_p1":
+    p1_backends = {
+        "query_dependent_p1",
+        "query_dependent_p1_spatial",
+    }
+    if config.model.audio_backend in p1_backends:
         from avgaussianv2.models.p1_visual import GeometricVisualTokenEncoder
 
         audio = audio_backend.load(
@@ -213,13 +217,28 @@ def build_runtime(
             alpha_threshold=config.model.alpha_threshold,
         )
     model = fusion_model(visual=visual, condition_encoder=condition, audio=audio)
-    if config.model.audio_backend == "query_dependent_p1":
+    if config.model.audio_backend in p1_backends:
         model.camera_contrast_weight = (
             config.model.p1_camera_contrast_weight
         )
         model.camera_contrast_margin = (
             config.model.p1_camera_contrast_margin
         )
+        model.camera_contrast_mode = (
+            "spatial"
+            if config.model.audio_backend == "query_dependent_p1_spatial"
+            else "audio_total"
+        )
+        model.camera_spatial_supervision_weight = (
+            config.model.p1_spatial_supervision_weight
+        )
+        model.camera_contrast_lre_weight = config.model.p1_spatial_lre_weight
+        model.camera_contrast_ild_weight = config.model.p1_spatial_ild_weight
+        model.camera_contrast_ipd_weight = config.model.p1_spatial_ipd_weight
+        model.camera_contrast_diff_weight = config.model.p1_spatial_diff_weight
+        model.camera_contrast_n_fft = config.model.n_fft
+        model.camera_contrast_hop_length = config.model.hop_length
+        model.camera_contrast_win_length = config.model.win_length
     criterion = audio.build_criterion()
     train_samples = aligned_dataset(config, split="train")
     eval_samples = (

@@ -85,6 +85,9 @@ CROSS_ATTENTION_CONTINUATION_SYSTEMS = {
     "query_dependent_p1",
     "query_dependent_p1_no_rgbd",
     "query_dependent_p1_wrong_camera",
+    "query_dependent_p1_spatial",
+    "query_dependent_p1_spatial_no_rgbd",
+    "query_dependent_p1_spatial_wrong_camera",
 }
 EVALUATION_CONTINUATION_SYSTEMS = (
     CONTINUATION_SYSTEMS | CROSS_ATTENTION_CONTINUATION_SYSTEMS
@@ -832,6 +835,9 @@ def _audit_continuation_snapshot(
                 "query_dependent_p1",
                 "query_dependent_p1_no_rgbd",
                 "query_dependent_p1_wrong_camera",
+                "query_dependent_p1_spatial",
+                "query_dependent_p1_spatial_no_rgbd",
+                "query_dependent_p1_spatial_wrong_camera",
             }
             else 0
         )

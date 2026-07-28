@@ -8,6 +8,7 @@ from avgaussianv2.benchmark.cross_attention_ablation import (
     CAUSAL_EVALUATION_SYSTEMS,
     MASK_CAUSAL_EVALUATION_SYSTEMS,
     QUERY_P1_CAUSAL_EVALUATION_SYSTEMS,
+    QUERY_P1_SPATIAL_CAUSAL_EVALUATION_SYSTEMS,
     validate_backend_only_delta,
 )
 from avgaussianv2.benchmark.evaluation import EVALUATION_CONTINUATION_SYSTEMS
@@ -91,6 +92,14 @@ def test_cross_attention_delta_rejects_every_other_change(tmp_path: Path) -> Non
             "Scene7playing.yaml",
             "Scene7playing_query_dependent_p1.yaml",
         ),
+        (
+            "scene1_opera.yaml",
+            "scene1_opera_query_dependent_p1_spatial.yaml",
+        ),
+        (
+            "Scene7playing.yaml",
+            "Scene7playing_query_dependent_p1_spatial.yaml",
+        ),
     ],
 )
 def test_repository_cross_configs_are_backend_only_deltas(
@@ -107,6 +116,7 @@ def test_repository_cross_configs_are_backend_only_deltas(
         "cross_attention_tokens",
         "cross_attention_masks",
         "query_dependent_p1",
+        "query_dependent_p1_spatial",
     }
     assert config.model.audio_render_strategy == "native_residual"
 
@@ -116,6 +126,7 @@ def test_causal_evaluation_systems_are_registered_continuations() -> None:
         set(CAUSAL_EVALUATION_SYSTEMS)
         | set(MASK_CAUSAL_EVALUATION_SYSTEMS)
         | set(QUERY_P1_CAUSAL_EVALUATION_SYSTEMS)
+        | set(QUERY_P1_SPATIAL_CAUSAL_EVALUATION_SYSTEMS)
     ) == set(ALL_CROSS_ATTENTION_EVALUATION_SYSTEMS)
     assert (
         set(ALL_CROSS_ATTENTION_EVALUATION_SYSTEMS)
