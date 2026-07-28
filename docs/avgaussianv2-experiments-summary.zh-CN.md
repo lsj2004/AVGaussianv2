@@ -101,6 +101,44 @@ clip 独立评估，没有先 overlap-add 为完整连续音轨。
 `audio_total` 改善并不自动代表空间音频质量改善，因此 waveform、LSD 和 LRE
 必须共同报告。
 
+### 2.3 基线系统定义与当前覆盖
+
+这里必须区分“是否使用 U-Net”和“是否经过相同 30k continuation”。当前
+配置的音频模型是 `Audio3DGSMonoDiffGSOnly`；当 `condition=None` 时，后端
+直接返回 native GS-only 前向结果，继承的 U-Net 不参与音频输出。因此报告中
+的 `audio_only` 是 **AudioGS GS-only 的 30k audio-only continuation**，不是
+“AudioGS + U-Net、无视觉条件”。
+
+| 系统 | 实际音频前向 | 视觉分支 | 视觉条件 | 当前状态 |
+|---|---|---|---|---|
+| Native AudioGS | GS-only，不使用 U-Net | 无 | 无 | 已评估；原始 61-epoch checkpoint，描述性参考 |
+| Audio-only 30k | GS-only，不使用 U-Net | 冻结且不参与音频 | 无 | 已完成；与联合模型 update-matched |
+| AudioGS + plain U-Net | 继承的 mono/diff U-Net | 无或冻结 | 无 | **尚未完成严格双数据集 baseline** |
+| AudioGS U-Net + FiLM | `native + conditioned_U-Net - plain_U-Net` | FreeTimeGS++ RGBD | 有 | 已完成；联合模型 |
+| FreeTimeGS++ visual-only | 不产生音频 | FreeTimeGS++ | 不适用 | 已完成；只比较视觉指标 |
+
+30k cam38 micro 指标总表如下。`—` 表示该系统不能产生对应模态，`未跑` 表示
+代码路径存在，但缺少严格对齐的训练与评估结果。
+
+| 系统 | audio_total ↓ | waveform L1 ↓ | mono LSD ↓ | diff LSD ↓ | LRE dB ↓ |
+|---|---:|---:|---:|---:|---:|
+| Native AudioGS（GS-only） | 0.653924 | 0.027220 | 0.982832 | 1.167756 | 0.371422 |
+| Audio-only 30k（GS-only） | 0.539302 | **0.026613** | 0.963523 | 1.146853 | **0.276815** |
+| AudioGS + plain U-Net（无视觉） | **未跑** | **未跑** | **未跑** | **未跑** | **未跑** |
+| AudioGS U-Net + FiLM | **0.461376** | 0.027442 | **0.916021** | **1.061590** | 1.159030 |
+| FreeTimeGS++ visual-only | — | — | — | — | — |
+
+| 系统 | RGB-L1 ↓ | PSNR dB ↑ | SSIM ↑ |
+|---|---:|---:|---:|
+| Native FreeTimeGS++ checkpoint | **0.076549** | **18.2343** | 0.527436 |
+| FreeTimeGS++ visual-only 30k | 0.085769 | 18.2161 | **0.541144** |
+| AudioGS U-Net + FiLM 联合模型 30k | 0.084584 | 18.1340 | 0.534050 |
+
+Native AudioGS/FreeTimeGS++ 的训练预算与 30k continuation 不同，因此只能
+描述性比较。严格因果比较目前只覆盖 FiLM 联合模型与 GS-only audio
+continuation、FreeTimeGS++ visual-only continuation；plain U-Net 无视觉
+baseline 是现有实验矩阵中的真实缺口。
+
 ## 3. 路径 A：FiLM + AudioGS U-Net
 
 ### 3.1 动机和实现
@@ -119,11 +157,11 @@ audio =
 
 这样能够以原生声学高斯渲染为锚点，只加入由视觉条件导致的 U-Net 差值。
 
-### 3.2 相对 audio-only 的正式结果
+### 3.2 相对 AudioGS GS-only continuation 的正式结果
 
 30k、423 个 cam38 样本的 micro 结果：
 
-| 指标 | Audio-only | FiLM + U-Net | 差值 | 结论 |
+| 指标 | Audio-only GS-only | FiLM + U-Net | 差值 | 结论 |
 |---|---:|---:|---:|---|
 | audio_total | 0.539302 | **0.461376** | -0.077926 | 改善 14.45% |
 | audio_mono | 0.477085 | **0.333581** | -0.143504 | 改善 |
@@ -137,9 +175,9 @@ audio =
 
 | 场景 | 系统 | audio_total | waveform_l1 | lre_error_db |
 |---|---|---:|---:|---:|
-| scene1_opera | Audio-only | 1.410239 | **0.050588** | **0.420740** |
+| scene1_opera | Audio-only GS-only | 1.410239 | **0.050588** | **0.420740** |
 | scene1_opera | FiLM + U-Net | **1.222404** | 0.054872 | 2.465855 |
-| Scene7playing | Audio-only | 0.152879 | 0.015976 | **0.212957** |
+| Scene7playing | Audio-only GS-only | 0.152879 | 0.015976 | **0.212957** |
 | Scene7playing | FiLM + U-Net | **0.123718** | **0.015272** | 0.579210 |
 
 FiLM 在两个场景的 `audio_total` 都改善，但 `scene1_opera` 的 waveform 和
@@ -428,7 +466,7 @@ wrong-camera 的 5k/10k/30k 评估后再进入正式排名。
 | 1 | FiLM + AudioGS U-Net | **1.222404** | **0.123718** | **0.461376** | 当前综合最优 |
 | 2 | Mask-protocol Cross-Attn | 1.333412 | 0.140418 | 0.507059 | 视觉有效但不稳定 |
 | 3 | Gaussian-token complex Cross-Attn | 1.407427 | 0.152107 | 0.537903 | 几乎退化为 audio-only |
-| 4 | Audio-only | 1.410239 | 0.152879 | 0.539302 | update-matched baseline |
+| 4 | Audio-only GS-only | 1.410239 | 0.152879 | 0.539302 | update-matched baseline |
 | 5 | Gated native residual | 1.574867 | 0.126429 | 0.571575 | 场景差异大 |
 | 6 | Direct conditioned U-Net | 1.497358 | 0.182761 | 0.586774 | 去掉 native 锚点后退化 |
 | — | Native AudioGS | 1.718166 | 0.181735 | 0.653924 | 描述性参考，非 update-matched |
