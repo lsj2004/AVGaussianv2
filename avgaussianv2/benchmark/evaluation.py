@@ -82,6 +82,9 @@ CROSS_ATTENTION_CONTINUATION_SYSTEMS = {
     "cross_attention_masks",
     "cross_attention_masks_no_rgbd",
     "cross_attention_masks_shuffled_rgbd",
+    "query_dependent_p1",
+    "query_dependent_p1_no_rgbd",
+    "query_dependent_p1_wrong_camera",
 }
 EVALUATION_CONTINUATION_SYSTEMS = (
     CONTINUATION_SYSTEMS | CROSS_ATTENTION_CONTINUATION_SYSTEMS
@@ -826,6 +829,9 @@ def _audit_continuation_snapshot(
                 "cross_attention_masks",
                 "cross_attention_masks_no_rgbd",
                 "cross_attention_masks_shuffled_rgbd",
+                "query_dependent_p1",
+                "query_dependent_p1_no_rgbd",
+                "query_dependent_p1_wrong_camera",
             }
             else 0
         )

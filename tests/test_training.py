@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 import torch
 from torch import nn
@@ -13,6 +15,7 @@ from avgaussianv2.train import (
     joint_train_step,
     run_condition_warmup,
     run_joint_finetune,
+    same_frame_camera_negative_indices,
 )
 
 
@@ -213,6 +216,20 @@ def test_condition_warmup_step_accepts_scalar_criterion() -> None:
     assert stats.losses == {"audio": stats.total}
     assert stats.gradient_norms["condition_encoder"] > 0
     assert stats.audio_to_visual_grad_norm == 0
+
+
+def test_same_frame_camera_negatives_are_reproducible() -> None:
+    anchor = make_sample()
+    other = replace(anchor, camera="cam01")
+    later = replace(anchor, frame_index=5, camera="cam02")
+
+    negatives = same_frame_camera_negative_indices(
+        [anchor, other, later],
+        [0, 1],
+        seed=42,
+    )
+
+    assert negatives == [1, 0]
 
 
 def test_joint_step_can_skip_audio_visual_gradient_probe(monkeypatch) -> None:

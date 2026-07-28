@@ -95,6 +95,10 @@ class _DeviceSampleSequence(Sequence[AlignedAVSample]):
     def __len__(self) -> int:
         return len(self.samples)
 
+    @property
+    def records(self):
+        return getattr(self.samples, "records", None)
+
     def __getitem__(self, index):
         if isinstance(index, slice):
             return [

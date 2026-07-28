@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from torch import nn
+from torch import Tensor, nn
 
-from avgaussianv2.contracts import AlignedAVSample, FusionOutput
+from avgaussianv2.contracts import AlignedAVSample, FusionOutput, RGBDRender
 
 
 def _set_requires_grad(parameters, enabled: bool) -> None:
@@ -24,13 +24,34 @@ class AVGaussianFusionV2(nn.Module):
         self.condition_enabled = True
         self.condition_content_permutation: tuple[int, ...] | None = None
 
-    def forward(self, sample: AlignedAVSample) -> FusionOutput:
-        rgbd = self.visual.render_rgbd(
+    def render_rgbd(self, sample: AlignedAVSample) -> RGBDRender:
+        return self.visual.render_rgbd(
             sample.visual_time,
             sample.w2c,
             sample.intrinsic,
             sample.image_size,
         )
+
+    def forward_audio_only(self, sample: AlignedAVSample) -> Tensor:
+        return self.audio.render(
+            sample.audio_cam_pose,
+            sample.source_audio,
+            condition=None,
+        )
+
+    def _encode_condition(
+        self,
+        rgbd: RGBDRender,
+        condition_sample: AlignedAVSample,
+    ):
+        if bool(
+            getattr(self.condition_encoder, "requires_camera_geometry", False)
+        ):
+            return self.condition_encoder(
+                rgbd,
+                condition_sample.w2c,
+                condition_sample.intrinsic,
+            )
         if self.condition_content_permutation is None:
             condition = self.condition_encoder(rgbd)
         else:
@@ -47,6 +68,15 @@ class AVGaussianFusionV2(nn.Module):
                 rgbd,
                 self.condition_content_permutation,
             )
+        return condition
+
+    def forward_with_condition_sample(
+        self,
+        sample: AlignedAVSample,
+        condition_sample: AlignedAVSample,
+    ) -> FusionOutput:
+        rgbd = self.render_rgbd(condition_sample)
+        condition = self._encode_condition(rgbd, condition_sample)
         predicted_audio = self.audio.render(
             sample.audio_cam_pose,
             sample.source_audio,
@@ -57,6 +87,9 @@ class AVGaussianFusionV2(nn.Module):
             condition=condition,
             predicted_audio=predicted_audio,
         )
+
+    def forward(self, sample: AlignedAVSample) -> FusionOutput:
+        return self.forward_with_condition_sample(sample, sample)
 
     def freeze_pretrained(self) -> None:
         _set_requires_grad(self.visual.parameters(), False)

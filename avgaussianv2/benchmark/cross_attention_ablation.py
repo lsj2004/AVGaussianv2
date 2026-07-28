@@ -57,9 +57,16 @@ MASK_CAUSAL_EVALUATION_SYSTEMS = (
     "cross_attention_masks_no_rgbd",
     "cross_attention_masks_shuffled_rgbd",
 )
+QUERY_P1_SYSTEM = "query_dependent_p1"
+QUERY_P1_CAUSAL_EVALUATION_SYSTEMS = (
+    "query_dependent_p1",
+    "query_dependent_p1_no_rgbd",
+    "query_dependent_p1_wrong_camera",
+)
 ALL_CROSS_ATTENTION_EVALUATION_SYSTEMS = (
     *CAUSAL_EVALUATION_SYSTEMS,
     *MASK_CAUSAL_EVALUATION_SYSTEMS,
+    *QUERY_P1_CAUSAL_EVALUATION_SYSTEMS,
 )
 
 
@@ -90,6 +97,19 @@ _VARIANTS = {
         evaluation_systems=MASK_CAUSAL_EVALUATION_SYSTEMS,
         audio_query_input="audiogs_mono_diff_feature_patch_tokens",
         cross_attention_memory=("rgbd_tokens",),
+    ),
+    "query_dependent_p1": CrossAttentionVariant(
+        backend="query_dependent_p1",
+        system=QUERY_P1_SYSTEM,
+        evaluation_systems=QUERY_P1_CAUSAL_EVALUATION_SYSTEMS,
+        audio_query_input="native_audiogs_target_view_time_frequency_features",
+        cross_attention_memory=(
+            "rgb_tokens",
+            "metric_depth_geometry",
+            "world_positions",
+            "world_normals",
+            "condition_camera_pose",
+        ),
     ),
 }
 
@@ -443,20 +463,48 @@ def prepare_cross_attention_run(
             "renderer_contract": (
                 "audiogs_mono_diff_features_to_mono_diff_masks"
                 if variant.backend == "cross_attention_masks"
-                else "complex_spectrogram_residual"
+                else (
+                    "query_dependent_geometry_biased_complex_residual"
+                    if variant.backend == "query_dependent_p1"
+                    else "complex_spectrogram_residual"
+                )
             ),
             "audio_criterion": "native_audiogs_checkpoint_criterion",
-        },
-        "token_protocol": {
-            "audio_position": "deterministic_2d_sinusoidal_frequency_time",
-            "visual_position": "deterministic_2d_sinusoidal_row_column",
-            "acoustic_gaussian_schema": "audiogs_mono_diff_v1",
-            "acoustic_gaussian_position": (
-                "native_frequency_time_grid_then_16x16_structural_pooling"
+            "same_frame_camera_contrast": (
+                {
+                    "weight": derived_project.model.p1_camera_contrast_weight,
+                    "margin": derived_project.model.p1_camera_contrast_margin,
+                    "warmup_seed_offset": 10_000,
+                    "main_seed_offset": 20_000,
+                }
+                if variant.backend == "query_dependent_p1"
+                else None
             ),
-            "pose_tokens": 2,
-            "memory_modality_embeddings": True,
         },
+        "token_protocol": (
+            {
+                "audio_position": "deterministic_2d_frequency_time_query_grid",
+                "visual_position": "metric_camera_ray_xyz",
+                "query_dependent_correspondence": (
+                    "listener_head_geometry_bias_per_audio_query_and_visual_token"
+                ),
+                "acoustic_gaussian_schema": None,
+                "pose_tokens": 0,
+                "pose_encoding": "listener_geometry_in_audio_queries",
+                "memory_modality_embeddings": False,
+            }
+            if variant.backend == "query_dependent_p1"
+            else {
+                "audio_position": "deterministic_2d_sinusoidal_frequency_time",
+                "visual_position": "deterministic_2d_sinusoidal_row_column",
+                "acoustic_gaussian_schema": "audiogs_mono_diff_v1",
+                "acoustic_gaussian_position": (
+                    "native_frequency_time_grid_then_16x16_structural_pooling"
+                ),
+                "pose_tokens": 2,
+                "memory_modality_embeddings": True,
+            }
+        ),
         "causal_evaluation_systems": list(variant.evaluation_systems),
     }
     evidence_bytes = canonical_json(evidence)
@@ -483,6 +531,8 @@ __all__ = [
     "CROSS_ATTENTION_SYSTEM",
     "MASK_CAUSAL_EVALUATION_SYSTEMS",
     "MASK_CROSS_ATTENTION_SYSTEM",
+    "QUERY_P1_CAUSAL_EVALUATION_SYSTEMS",
+    "QUERY_P1_SYSTEM",
     "CrossAttentionVariant",
     "cross_attention_variant",
     "prepare_cross_attention_run",

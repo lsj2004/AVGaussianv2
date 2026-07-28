@@ -16,6 +16,7 @@ from avgaussianv2.models.cross_attention_audio import (
     AudioVisualTokenAudioBackend,
 )
 from avgaussianv2.models.fusion import AVGaussianFusionV2
+from avgaussianv2.models.p1_visual import GeometricVisualTokenEncoder
 from avgaussianv2.models.visual_tokens import RGBDTokenEncoder
 
 
@@ -216,3 +217,74 @@ def test_mask_cross_attention_runtime_selects_renderer_protocol(monkeypatch) -> 
     assert captured["renderer_kind"] == "mask_cross_attention"
     assert captured["transformer_layers"] == 1
     assert captured["freq_patch"] == 4
+
+
+def test_query_dependent_p1_runtime_selects_geometry_protocol(monkeypatch) -> None:
+    visual = nn.Linear(1, 1)
+    backend = TinyMaskBackend()
+    captured = {}
+
+    def load_audio(*_args, **kwargs):
+        captured.update(kwargs)
+        return backend
+
+    monkeypatch.setattr(
+        runtime_module,
+        "FTGSVisualBackend",
+        SimpleNamespace(load=lambda *_: visual),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "AudioGSBackend",
+        SimpleNamespace(load=load_audio),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "AlignedAVDataset",
+        lambda _config, split: (f"{split}-sample",),
+    )
+    monkeypatch.setattr(runtime_module, "AVGaussianFusionV2", AVGaussianFusionV2)
+    monkeypatch.setattr(runtime_module, "RGBDConditionEncoder", nn.Identity)
+    config = ProjectConfig(
+        scene=SceneConfig(
+            "scene",
+            30.0,
+            ("cam00",),
+            ("cam38",),
+            {"cam00": 0, "cam38": 38},
+        ),
+        paths=PathConfig(
+            Path("/visual"),
+            Path("/audio"),
+            Path("/visual.pt"),
+            Path("/audio.pt"),
+            Path("/manifest.json"),
+        ),
+        model=ModelConfig(
+            audio_backend="query_dependent_p1",
+            embedding_dim=32,
+            p1_transformer_layers=1,
+            p1_transformer_heads=4,
+            p1_freq_patch=4,
+            p1_time_patch=2,
+            audio_model_class="Audio3DGSMonoDiffGSOnly",
+        ),
+        train=TrainConfig(),
+    )
+
+    bundle = runtime_module.build_runtime(
+        config,
+        torch.device("cpu"),
+        trusted_upstream_artifacts=True,
+    )
+
+    assert bundle.model.audio is backend
+    assert isinstance(
+        bundle.model.condition_encoder,
+        GeometricVisualTokenEncoder,
+    )
+    assert captured["renderer_kind"] == "p1_query_geometry"
+    assert captured["transformer_layers"] == 1
+    assert captured["freq_patch"] == 4
+    assert bundle.model.camera_contrast_weight == 0.5
+    assert bundle.model.camera_contrast_margin == 0.05

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
-  echo "usage: $0 <scene1_opera|Scene7playing> <prepare|diagnose|train|eval|report> [gpu] [system] [step] [cross_attention_tokens|cross_attention_masks]" >&2
+  echo "usage: $0 <scene1_opera|Scene7playing> <prepare|diagnose|train|eval|report> [gpu] [system] [step] [cross_attention_tokens|cross_attention_masks|query_dependent_p1]" >&2
   exit 2
 fi
 
@@ -22,6 +22,11 @@ case "${BACKEND}" in
     CONFIG_SUFFIX="cross_attention_masks"
     OUTPUT_NAME="cross_attention_masks_ablation"
     DEFAULT_SYSTEM="cross_attention_masks"
+    ;;
+  query_dependent_p1)
+    CONFIG_SUFFIX="query_dependent_p1"
+    OUTPUT_NAME="query_dependent_p1_cam38"
+    DEFAULT_SYSTEM="query_dependent_p1"
     ;;
   *)
     echo "unsupported cross-attention backend: ${BACKEND}" >&2
@@ -95,7 +100,7 @@ case "${ACTION}" in
     ;;
   eval)
     case "${SYSTEM}" in
-      cross_attention|cross_attention_no_rgbd|cross_attention_shuffled_rgbd|cross_attention_no_gaussians|cross_attention_no_pose|cross_attention_masks|cross_attention_masks_no_rgbd|cross_attention_masks_shuffled_rgbd) ;;
+      cross_attention|cross_attention_no_rgbd|cross_attention_shuffled_rgbd|cross_attention_no_gaussians|cross_attention_no_pose|cross_attention_masks|cross_attention_masks_no_rgbd|cross_attention_masks_shuffled_rgbd|query_dependent_p1|query_dependent_p1_no_rgbd|query_dependent_p1_wrong_camera) ;;
       *)
         echo "unsupported causal system: ${SYSTEM}" >&2
         exit 2

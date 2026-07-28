@@ -1201,6 +1201,8 @@ def build_evaluation_adapters(
                     "cross_attention_no_pose",
                     "cross_attention_masks",
                     "cross_attention_masks_shuffled_rgbd",
+                    "query_dependent_p1",
+                    "query_dependent_p1_wrong_camera",
                 }
                 model.condition_content_permutation = None
                 if hasattr(model.audio, "gaussian_tokens_enabled"):
@@ -1243,6 +1245,18 @@ def build_evaluation_adapters(
             else:
                 model.condition_enabled = False
             model.eval()
+            wrong_camera_by_frame: dict[int, int] = {}
+            if evidence.system_name == "query_dependent_p1_wrong_camera":
+                records = getattr(bundle.train_samples, "records", None)
+                if records is None:
+                    raise TypeError(
+                        "wrong-camera evaluation requires indexed train records"
+                    )
+                for index, record in enumerate(records):
+                    wrong_camera_by_frame.setdefault(
+                        int(record.frame_index),
+                        index,
+                    )
         except BaseException as error:
             stack = holder.pop("stack", None)
             holder.pop("pins", None)
@@ -1263,6 +1277,28 @@ def build_evaluation_adapters(
                     sample.image_size,
                 )
                 return BenchmarkPrediction(rendered_rgb=render.rgb)
+            if evidence.system_name == "query_dependent_p1_wrong_camera":
+                try:
+                    condition_index = wrong_camera_by_frame[
+                        int(sample.frame_index)
+                    ]
+                except KeyError as error:
+                    raise ValueError(
+                        "wrong-camera evaluation has no same-frame train sample"
+                    ) from error
+                condition_sample = move_sample(
+                    bundle.train_samples[condition_index],
+                    torch.device(device),
+                )
+                output = model.forward_with_condition_sample(
+                    sample,
+                    condition_sample,
+                )
+                target_rgbd = model.render_rgbd(sample)
+                return BenchmarkPrediction(
+                    predicted_audio=output.predicted_audio,
+                    rendered_rgb=target_rgbd.rgb,
+                )
             output = model(sample)
             if evidence.system_name == "native_audiogs":
                 return BenchmarkPrediction(predicted_audio=output.predicted_audio)

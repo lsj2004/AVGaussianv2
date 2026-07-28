@@ -25,6 +25,7 @@ from avgaussianv2.train import (
     build_warmup_optimizer,
     condition_warmup_step,
     joint_train_step,
+    same_frame_camera_negative_indices,
 )
 
 
@@ -99,6 +100,30 @@ def run_diagnostic(
         samples = _DeviceSampleSequence(runtime.train_samples, device)
         warmup_indices = make_shared_indices(len(samples), steps, seed)
         main_indices = tuple(worker_manifest["shared_indices"][:steps])
+        contrast_enabled = (
+            float(
+                getattr(runtime.model, "camera_contrast_weight", 0.0)
+            )
+            > 0
+        )
+        warmup_contrast = (
+            same_frame_camera_negative_indices(
+                samples,
+                warmup_indices,
+                seed + 10_000,
+            )
+            if contrast_enabled
+            else (-1,) * len(warmup_indices)
+        )
+        main_contrast = (
+            same_frame_camera_negative_indices(
+                samples,
+                main_indices,
+                seed + 20_000,
+            )
+            if contrast_enabled
+            else (-1,) * len(main_indices)
+        )
         probe = samples[main_indices[0]]
         runtime.model.eval()
         with torch.no_grad():
@@ -120,8 +145,16 @@ def run_diagnostic(
                 samples[index],
                 warmup_optimizer,
                 runtime.audio_loss_fn,
+                contrast_sample=(
+                    None
+                    if contrast_index < 0
+                    else samples[contrast_index]
+                ),
             )
-            for index in warmup_indices
+            for index, contrast_index in zip(
+                warmup_indices,
+                warmup_contrast,
+            )
         ]
 
         runtime.model.unfreeze_all()
@@ -136,8 +169,16 @@ def run_diagnostic(
                 runtime.audio_loss_fn,
                 visual_anchor,
                 probe_audio_visual_gradient=True,
+                contrast_sample=(
+                    None
+                    if contrast_index < 0
+                    else samples[contrast_index]
+                ),
             )
-            for index in main_indices
+            for index, contrast_index in zip(
+                main_indices,
+                main_contrast,
+            )
         ]
 
         runtime.model.eval()

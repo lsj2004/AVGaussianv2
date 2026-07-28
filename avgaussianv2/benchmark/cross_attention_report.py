@@ -172,6 +172,9 @@ def build_cross_attention_scene_report(
             "rgbd_on_vs_shuffled": f"{main_system}_shuffled_rgbd",
             "gaussians_on_vs_off": f"{main_system}_no_gaussians",
             "pose_on_vs_off": f"{main_system}_no_pose",
+            "correct_camera_vs_wrong_camera": (
+                f"{main_system}_wrong_camera"
+            ),
         }
         for label, system in optional_comparisons.items():
             if system in evaluation_systems:

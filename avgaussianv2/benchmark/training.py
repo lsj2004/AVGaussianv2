@@ -36,6 +36,7 @@ from avgaussianv2.train import (
     build_warmup_optimizer,
     condition_warmup_step,
     joint_train_step,
+    same_frame_camera_negative_indices,
 )
 
 SCHEMA = "avgaussianv2.cam38-fixed-budget"
@@ -1623,13 +1624,33 @@ class FixedBudgetTrainer:
                 self.config.conditioner_warmup_steps,
                 self.config.seed,
             )
+            warmup_contrast_indices = (
+                same_frame_camera_negative_indices(
+                    train_samples,
+                    warmup_indices,
+                    self.config.seed + 10_000,
+                )
+                if float(
+                    getattr(model, "camera_contrast_weight", 0.0)
+                )
+                > 0
+                else (-1,) * len(warmup_indices)
+            )
             while warmup_step < self.config.conditioner_warmup_steps:
                 sample_index = warmup_indices[warmup_step]
+                contrast_index = warmup_contrast_indices[warmup_step]
                 condition_warmup_step(
                     model,
                     _require_training_sample(train_samples[sample_index]),
                     optimizer,
                     audio_loss_fn,
+                    contrast_sample=(
+                        None
+                        if contrast_index < 0
+                        else _require_training_sample(
+                            train_samples[contrast_index]
+                        )
+                    ),
                 )
                 warmup_step += 1
                 if (
@@ -1692,8 +1713,25 @@ class FixedBudgetTrainer:
                     f"invalid progress journal: {error}"
                 ) from error
 
+        main_contrast_indices = (
+            same_frame_camera_negative_indices(
+                train_samples,
+                shared_indices,
+                self.config.seed + 20_000,
+            )
+            if (
+                resolved_mode is BenchmarkMode.JOINT_CONDITIONED
+                and float(
+                    getattr(model, "camera_contrast_weight", 0.0)
+                )
+                > 0
+            )
+            else (-1,) * len(shared_indices)
+        )
         while main_step < self.config.main_updates:
-            sample = _require_training_sample(train_samples[shared_indices[main_step]])
+            sample_index = shared_indices[main_step]
+            contrast_index = main_contrast_indices[main_step]
+            sample = _require_training_sample(train_samples[sample_index])
             next_step = main_step + 1
             if resolved_mode is BenchmarkMode.JOINT_CONDITIONED:
                 stats = joint_train_step(
@@ -1705,6 +1743,13 @@ class FixedBudgetTrainer:
                     visual_anchor,
                     probe_audio_visual_gradient=(
                         next_step % train_config.gradient_probe_interval == 0
+                    ),
+                    contrast_sample=(
+                        None
+                        if contrast_index < 0
+                        else _require_training_sample(
+                            train_samples[contrast_index]
+                        )
                     ),
                 )
                 if next_step % train_config.gradient_probe_interval == 0:
