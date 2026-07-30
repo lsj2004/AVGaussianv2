@@ -4,7 +4,40 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 from pathlib import Path
+
+
+_MARKER = "AVGAUSSIANV2_ARCHITECTURE_EVAL_REEXEC"
+_ENVIRONMENT = {
+    "PYTHONHASHSEED": "42",
+    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+}
+
+
+def _ensure_environment() -> None:
+    if all(os.environ.get(name) == value for name, value in _ENVIRONMENT.items()):
+        return
+    if os.environ.get(_MARKER) == "1":
+        raise RuntimeError("architecture evaluator deterministic re-exec failed")
+    environment = dict(os.environ)
+    environment.update(_ENVIRONMENT)
+    environment[_MARKER] = "1"
+    os.execve(
+        sys.executable,
+        [
+            sys.executable,
+            "-m",
+            "avgaussianv2.cli.benchmark_architecture_eval",
+            *sys.argv[1:],
+        ],
+        environment,
+    )
+
+
+if __name__ == "__main__":
+    _ensure_environment()
 
 from avgaussianv2.benchmark.architecture_ablation import (
     verify_architecture_preparation,
@@ -44,6 +77,7 @@ def main() -> None:
         evidence=evidence,
         trusted_upstream_artifacts=args.trust_upstream_artifacts,
     )
+    args.output_dir.parent.mkdir(parents=True, exist_ok=True)
     result = BenchmarkEvaluator(args.device).evaluate(
         identity=identity,
         evidence=evidence,

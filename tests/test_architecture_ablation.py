@@ -195,6 +195,11 @@ def test_architecture_eval_uses_prepared_mode() -> None:
     assert 'mode = str(preparation.get("mode", "joint_conditioned"))' in evaluator
     assert "expected_identity(scene_id, mode, args.step)" in evaluator
     assert "system=mode" in evaluator
+    assert '"CUBLAS_WORKSPACE_CONFIG": ":4096:8"' in evaluator
+    assert evaluator.index("_ensure_environment()") < evaluator.index(
+        "from avgaussianv2.benchmark.architecture_ablation import"
+    )
+    assert "args.output_dir.parent.mkdir(parents=True, exist_ok=True)" in evaluator
 
 
 def test_architecture_worker_prints_generic_worker_result_keys() -> None:
