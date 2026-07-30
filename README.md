@@ -14,6 +14,9 @@ For a protocol-aware comparison of the results committed across those branches, 
 [`docs/experiment-results-across-branches.zh-CN.md`](docs/experiment-results-across-branches.zh-CN.md).
 For side-by-side Mermaid diagrams of every evaluated model architecture, see
 [`docs/model-architecture-variants.zh-CN.md`](docs/model-architecture-variants.zh-CN.md).
+The previously published cam38 numbers predate the held-out visual-time fix. Before running
+or interpreting new experiments, follow
+[`docs/post-visual-time-fix-rerun-plan.zh-CN.md`](docs/post-visual-time-fix-rerun-plan.zh-CN.md).
 
 ## Upstream models and environment
 

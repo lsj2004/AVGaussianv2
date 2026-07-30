@@ -42,8 +42,12 @@ ROOT = Path(__file__).resolve().parents[1]
 DIGEST = "a" * 64
 
 
+@pytest.mark.parametrize(
+    ("time_shape", "valid"),
+    [([130, 38, 1], True), ([130, 37, 1], False)],
+)
 def test_materialize_strict_manifest_uses_verified_cam38_native_inputs(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, time_shape, valid
 ):
     scene = "scene1_opera"
     config_path = tmp_path / "configs/benchmark_cam38/scene1_opera.yaml"
@@ -77,7 +81,12 @@ def test_materialize_strict_manifest_uses_verified_cam38_native_inputs(
     memmap = tmp_path / "memmap"
     memmap.mkdir()
     (memmap / "meta.json").write_text(
-        json.dumps({"rgb": {"shape": [130, 38, 8, 12, 3]}})
+        json.dumps(
+            {
+                "rgb": {"shape": [130, 38, 8, 12, 3]},
+                "time": {"shape": time_shape},
+            }
+        )
     )
     manifest = tmp_path / "runs/cam38_strict/scene1_opera/protocol/scene_manifest.json"
     config = ProjectConfig(
@@ -123,14 +132,20 @@ def test_materialize_strict_manifest_uses_verified_cam38_native_inputs(
         lambda _path: config,
     )
 
-    result = materialize_strict_scene_manifest(
-        config_path=config_path,
-        native_contract_dirs={
+    arguments = {
+        "config_path": config_path,
+        "native_contract_dirs": {
             "audiogs": tmp_path / "audiogs-contract",
             "ftgspp": tmp_path / "ftgspp-contract",
         },
-        native_verifier=verify,
-    )
+        "native_verifier": verify,
+    }
+    if not valid:
+        with pytest.raises(ValueError, match="RGB/model-time"):
+            materialize_strict_scene_manifest(**arguments)
+        return
+
+    result = materialize_strict_scene_manifest(**arguments)
 
     payload = json.loads(manifest.read_text())
     assert result == manifest
@@ -142,14 +157,7 @@ def test_materialize_strict_manifest_uses_verified_cam38_native_inputs(
     assert payload["cameras"]["cam38"]["audio_path"].endswith("/cam38.wav")
 
     before = manifest.read_bytes()
-    materialize_strict_scene_manifest(
-        config_path=config_path,
-        native_contract_dirs={
-            "audiogs": tmp_path / "audiogs-contract",
-            "ftgspp": tmp_path / "ftgspp-contract",
-        },
-        native_verifier=verify,
-    )
+    materialize_strict_scene_manifest(**arguments)
     assert manifest.read_bytes() == before
 
 
@@ -173,12 +181,22 @@ class _Model(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(()))
+        self.calls = {"audio_only": 0, "visual_only": 0, "full": 0}
         self.visual = SimpleNamespace(
             render_rgbd=lambda *_: SimpleNamespace(rgb=torch.ones(1, 2, 2, 3))
         )
         self.condition_enabled = True
 
+    def forward_audio_only(self, _sample):
+        self.calls["audio_only"] += 1
+        return torch.ones(1, 2, 8)
+
+    def render_rgbd(self, _sample):
+        self.calls["visual_only"] += 1
+        return SimpleNamespace(rgb=torch.ones(1, 2, 2, 3))
+
     def forward(self, _sample):
+        self.calls["full"] += 1
         return SimpleNamespace(
             predicted_audio=torch.ones(1, 2, 8),
             rgbd=SimpleNamespace(rgb=torch.ones(1, 2, 2, 3)),
@@ -445,6 +463,12 @@ def test_native_production_adapter_exposes_only_its_modality(
     assert consumed_checkpoints == [b"native"]
     assert (prediction.predicted_audio is not None) is has_audio
     assert (prediction.rendered_rgb is not None) is has_rgb
+    expected_calls = (
+        {"audio_only": 1, "visual_only": 0, "full": 0}
+        if system == "native_audiogs"
+        else {"audio_only": 0, "visual_only": 1, "full": 0}
+    )
+    assert model.calls == expected_calls
 
 
 def test_snapshot_importer_preserves_nested_package_semantics(

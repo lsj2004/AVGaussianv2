@@ -322,12 +322,16 @@ def materialize_strict_scene_manifest(
     with _PinnedInput(memmap_metadata_path, None) as memmap_pin:
         memmap_metadata = json.loads(memmap_pin.data)
     rgb_shape = memmap_metadata.get("rgb", {}).get("shape")
+    time_shape = memmap_metadata.get("time", {}).get("shape")
     if (
         not isinstance(rgb_shape, list)
         or len(rgb_shape) != 5
         or rgb_shape[:2] != [expected_frames, 38]
+        or time_shape != [expected_frames, 38, 1]
     ):
-        raise ValueError("strict FTGS memmap must contain exact train frames/cameras")
+        raise ValueError(
+            "strict FTGS memmap must contain exact train RGB/model-time frames/cameras"
+        )
 
     for camera in cameras:
         _strict_regular_file(
@@ -1251,16 +1255,13 @@ def build_evaluation_adapters(
 
         def predict(sample):
             if evidence.system_name == "native_ftgspp":
-                render = model.visual.render_rgbd(
-                    sample.visual_time,
-                    sample.w2c,
-                    sample.intrinsic,
-                    sample.image_size,
-                )
+                render = model.render_rgbd(sample)
                 return BenchmarkPrediction(rendered_rgb=render.rgb)
-            output = model(sample)
             if evidence.system_name == "native_audiogs":
-                return BenchmarkPrediction(predicted_audio=output.predicted_audio)
+                return BenchmarkPrediction(
+                    predicted_audio=model.forward_audio_only(sample)
+                )
+            output = model(sample)
             return BenchmarkPrediction(
                 predicted_audio=output.predicted_audio,
                 rendered_rgb=output.rgbd.rgb,

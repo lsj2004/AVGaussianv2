@@ -1,5 +1,13 @@
 # 双数据集 cam38 基准结果（2026-07-26）
 
+> **历史 pre-fix 结果**
+>
+> 本报告由 cam38 `visual_time` 修复前的 evaluator 生成。held-out camera 曾使用
+> `frame_index / fps` 代替 FreeTimeGS++ model time。当前代码已改为复用同帧
+> train-camera 的共享 `time.memmap` model time。以下数值保留用于历史比较，
+> 不能作为修复后代码的有效结果。重跑范围见
+> [`../../../docs/post-visual-time-fix-rerun-plan.zh-CN.md`](../../../docs/post-visual-time-fix-rerun-plan.zh-CN.md)。
+
 ## 结论
 
 在 `scene1_opera` 和 `Scene7playing` 共 423 个 cam38 测试样本上，30k

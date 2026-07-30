@@ -86,6 +86,18 @@ def _open_memmaps(root: Path) -> dict[str, np.memmap]:
     return arrays
 
 
+def _shared_visual_time(time_array: np.memmap, frame_index: int) -> Tensor:
+    """Read the frame's model time without substituting physical seconds."""
+    values = np.asarray(time_array[frame_index], dtype=np.float32).reshape(-1)
+    if values.size == 0 or not np.isfinite(values).all():
+        raise ValueError(f"visual model time is invalid at frame {frame_index}")
+    if not np.allclose(values, values[0], rtol=1e-6, atol=1e-7):
+        raise ValueError(
+            f"visual model time differs across cameras at frame {frame_index}"
+        )
+    return torch.tensor([[float(values[0])]], dtype=torch.float32)
+
+
 def _read_audio_crop(path: Path, start: int, frames: int, expected_rate: int) -> Tensor:
     info = sf.info(str(path))
     if int(info.samplerate) != expected_rate:
@@ -270,9 +282,9 @@ class AlignedAVDataset(Dataset[AlignedAVSample]):
             intrinsic[0] *= source_width / calibration_width
             intrinsic[1] *= source_height / calibration_height
             intrinsic[2, 2] = 1.0
-            visual_time = torch.tensor(
-                [[frame / float(self.config.scene.fps)]], dtype=torch.float32
-            )
+            # The strict memmap excludes held-out RGB, but its frame time is a
+            # camera-independent FreeTimeGS++ coordinate and remains safe to use.
+            visual_time = _shared_visual_time(self.arrays["time"], frame)
         rgb, intrinsic = _resize_rgb_and_intrinsic(rgb, intrinsic, self.image_size)
         return AlignedAVSample(
             scene_id=self.config.scene.scene_id,

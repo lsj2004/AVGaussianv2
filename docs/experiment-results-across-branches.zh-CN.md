@@ -1,5 +1,14 @@
 # AVGaussianV2 跨分支实验结果分析
 
+> **历史结果提示**
+>
+> 本文汇总的是 cam38 `visual_time` 修复前的结果。旧 evaluator 在 held-out
+> camera 不在 train-only memmap 时使用 `frame_index / fps` 代替 FreeTimeGS++
+> model time。当前代码已经改为复用同帧 train-camera 的共享 `time.memmap`
+> model time。本文数字保留用于历史比较，在完成
+> [`post-visual-time-fix-rerun-plan.zh-CN.md`](post-visual-time-fix-rerun-plan.zh-CN.md)
+> 前，不应作为修复后代码的有效排名。
+
 本文汇总截至 2026-07-30 已提交到各远端分支的实验结果，回答三个问题：
 
 1. 哪些分支真的产生了新结果，哪些只是继承了相同结果或提供运行代码；

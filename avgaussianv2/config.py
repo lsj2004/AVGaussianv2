@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -266,6 +267,21 @@ class TrainConfig:
             raise ValueError("train.crop_seconds must be positive")
         if self.warmup_steps < 0 or self.joint_steps < 0:
             raise ValueError("train stage steps must be nonnegative")
+        for name in ("audio_lr", "visual_lr", "condition_lr"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"train.{name} must be finite and positive")
+        for name in (
+            "lambda_audio",
+            "lambda_rgb",
+            "lambda_dssim",
+            "lambda_visual_anchor",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"train.{name} must be finite and non-negative")
+        if self.lambda_audio == 0 and self.lambda_rgb == 0:
+            raise ValueError("train must enable at least one primary loss")
         if self.gradient_probe_interval <= 0:
             raise ValueError("train.gradient_probe_interval must be positive")
         if self.max_zero_audio_visual_grad_steps <= 0:

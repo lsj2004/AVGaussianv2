@@ -166,8 +166,48 @@ def test_eval_reads_heldout_video_when_train_memmap_excludes_camera(
     assert dataset.records[0].camera_index == -1
     assert sample.camera == "cam10"
     assert sample.frame_index == 1
-    assert sample.visual_time.item() == pytest.approx(0.1)
+    assert sample.time_seconds == pytest.approx(0.1)
+    assert sample.visual_time.item() == pytest.approx(-0.8)
     assert sample.target_rgb.mean().item() == pytest.approx(1.0 / 255.0)
+
+
+def test_eval_rejects_camera_dependent_visual_model_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_scene(tmp_path)
+    config.scene.camera_mapping["cam10"] = 2
+    video = tmp_path / "cam10.mp4"
+    video.write_bytes(b"heldout")
+    manifest = json.loads(config.paths.manifest.read_text())
+    manifest["cameras"]["cam10"]["video_path"] = str(video)
+    config.paths.manifest.write_text(json.dumps(manifest))
+    time_array = aligned.np.memmap(
+        config.paths.visual_memmap / "time.memmap",
+        mode="r+",
+        dtype=aligned.np.float32,
+        shape=(5, 2, 1),
+    )
+    time_array[1, 1, 0] = -0.7
+    time_array.flush()
+    monkeypatch.setattr(
+        aligned,
+        "_load_heldout_calibration",
+        lambda *_args: (
+            aligned.torch.eye(4, dtype=aligned.torch.float32),
+            aligned.torch.tensor(
+                [[24.0, 0.0, 6.0], [0.0, 16.0, 4.0], [0.0, 0.0, 1.0]]
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        aligned,
+        "_read_heldout_frame",
+        lambda *_args: aligned.torch.zeros((8, 12, 3), dtype=aligned.torch.uint8),
+    )
+
+    dataset = AlignedAVDataset(config, split="eval")
+    with pytest.raises(ValueError, match="visual model time differs across cameras"):
+        dataset[0]
 
 
 def test_missing_camera_mapping_is_fatal(tmp_path: Path) -> None:

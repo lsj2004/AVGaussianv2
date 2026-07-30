@@ -418,8 +418,11 @@ def _audio_only_step(
     audio_loss_fn: AudioLoss,
 ) -> TrainStepStats:
     optimizer.zero_grad(set_to_none=True)
-    output = model(sample)
-    raw = audio_loss_fn(output.predicted_audio, sample.target_audio)
+    forward_audio_only = getattr(model, "forward_audio_only", None)
+    if not callable(forward_audio_only):
+        raise TypeError("audio-only benchmark model must expose forward_audio_only()")
+    predicted_audio = forward_audio_only(sample)
+    raw = audio_loss_fn(predicted_audio, sample.target_audio)
     loss = raw["total_loss"] if isinstance(raw, Mapping) else raw
     if not isinstance(loss, Tensor) or loss.ndim:
         raise ValueError("audio loss must resolve to a scalar tensor")
@@ -444,10 +447,13 @@ def _visual_only_step(
     visual_anchor: Mapping[str, Tensor],
 ) -> TrainStepStats:
     optimizer.zero_grad(set_to_none=True)
-    output = model(sample)
-    target = sample.target_rgb.to(output.rgbd.rgb)
-    rgb_l1 = F.l1_loss(output.rgbd.rgb, target)
-    rgb = rgb_l1 + float(config.lambda_dssim) * dssim(output.rgbd.rgb, target)
+    render_rgbd = getattr(model, "render_rgbd", None)
+    if not callable(render_rgbd):
+        raise TypeError("visual-only benchmark model must expose render_rgbd()")
+    rgbd = render_rgbd(sample)
+    target = sample.target_rgb.to(rgbd.rgb)
+    rgb_l1 = F.l1_loss(rgbd.rgb, target)
+    rgb = rgb_l1 + float(config.lambda_dssim) * dssim(rgbd.rgb, target)
     current = dict(model.visual.named_parameters())
     if current.keys() != visual_anchor.keys():
         raise ValueError("visual anchor parameters changed during benchmark")

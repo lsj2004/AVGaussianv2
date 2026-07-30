@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from torch import Tensor
 from torch import nn
 
-from avgaussianv2.contracts import AlignedAVSample, FusionOutput
+from avgaussianv2.contracts import AlignedAVSample, FusionOutput, RGBDRender
 
 
 def _set_requires_grad(parameters, enabled: bool) -> None:
@@ -24,13 +25,23 @@ class AVGaussianFusionV2(nn.Module):
         self.condition_enabled = True
         self.condition_content_permutation: tuple[int, ...] | None = None
 
-    def forward(self, sample: AlignedAVSample) -> FusionOutput:
-        rgbd = self.visual.render_rgbd(
+    def render_rgbd(self, sample: AlignedAVSample) -> RGBDRender:
+        return self.visual.render_rgbd(
             sample.visual_time,
             sample.w2c,
             sample.intrinsic,
             sample.image_size,
         )
+
+    def forward_audio_only(self, sample: AlignedAVSample) -> Tensor:
+        return self.audio.render(
+            sample.audio_cam_pose,
+            sample.source_audio,
+            condition=None,
+        )
+
+    def forward(self, sample: AlignedAVSample) -> FusionOutput:
+        rgbd = self.render_rgbd(sample)
         if self.condition_content_permutation is None:
             condition = self.condition_encoder(rgbd)
         else:

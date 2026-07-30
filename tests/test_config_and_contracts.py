@@ -209,6 +209,75 @@ train:
         load_project_config(path)
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("audio_lr", "-0.001", "train.audio_lr must be finite and positive"),
+        ("visual_lr", ".nan", "train.visual_lr must be finite and positive"),
+        ("lambda_audio", "-1", "train.lambda_audio must be finite and non-negative"),
+        ("lambda_rgb", ".inf", "train.lambda_rgb must be finite and non-negative"),
+    ],
+)
+def test_load_project_config_rejects_invalid_training_scalars(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    path = tmp_path / "scene.yaml"
+    path.write_text(
+        f"""
+scene:
+  id: scene1_opera
+  fps: 30
+  train_cameras: [cam00]
+  eval_cameras: [cam10]
+  camera_mapping: {{cam00: 0, cam10: 10}}
+paths:
+  visual_upstream_root: /repos/FreeTimeGSPlusPlus
+  audio_upstream_root: /repos/audioGS-replay
+  visual_checkpoint: /runs/visual.pt
+  audio_checkpoint: /runs/audio.pth
+  manifest: /runs/manifest.json
+model: {{}}
+train:
+  {field}: {value}
+""".strip()
+        + "\n"
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load_project_config(path)
+
+
+def test_load_project_config_requires_a_primary_training_loss(tmp_path: Path) -> None:
+    path = tmp_path / "scene.yaml"
+    path.write_text(
+        """
+scene:
+  id: scene1_opera
+  fps: 30
+  train_cameras: [cam00]
+  eval_cameras: [cam10]
+  camera_mapping: {cam00: 0, cam10: 10}
+paths:
+  visual_upstream_root: /repos/FreeTimeGSPlusPlus
+  audio_upstream_root: /repos/audioGS-replay
+  visual_checkpoint: /runs/visual.pt
+  audio_checkpoint: /runs/audio.pth
+  manifest: /runs/manifest.json
+model: {}
+train:
+  lambda_audio: 0
+  lambda_rgb: 0
+""".strip()
+        + "\n"
+    )
+
+    with pytest.raises(ValueError, match="at least one primary loss"):
+        load_project_config(path)
+
+
 def test_rgbd_render_rejects_shape_mismatch() -> None:
     with pytest.raises(ValueError, match="shared batch and image shape"):
         RGBDRender(

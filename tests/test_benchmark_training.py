@@ -47,17 +47,30 @@ class TinyFusion(nn.Module):
         self.film = Scalar(0.4)
         self.audio_unet = Scalar(0.5)
         self.condition_enabled = True
+        self.visual_forward_calls = 0
+        self.audio_forward_calls = 0
 
-    def forward(self, sample):
+    def render_rgbd(self, sample):
+        self.visual_forward_calls += 1
         visual = self.visual.value
         rgb = visual.sigmoid().expand(1, 4, 4, 3)
         depth = (visual + 2).expand(1, 4, 4, 1)
-        condition = visual * self.condition_encoder.value
+        return RGBDRender(rgb, depth, torch.ones_like(depth))
+
+    def forward_audio_only(self, sample):
+        self.audio_forward_calls += 1
+        gain = self.acoustic.value + self.audio_unet.value
+        return sample.source_audio * gain
+
+    def forward(self, sample):
+        rgbd = self.render_rgbd(sample)
+        condition = self.visual.value * self.condition_encoder.value
         gain = self.acoustic.value + self.audio_unet.value
         if self.condition_enabled:
             gain = gain + condition * self.film.value
+        self.audio_forward_calls += 1
         return FusionOutput(
-            RGBDRender(rgb, depth, torch.ones_like(depth)),
+            rgbd,
             condition.reshape(1, 1),
             sample.source_audio * gain,
         )
@@ -326,6 +339,12 @@ def test_fixed_budget_updates_only_allowed_groups_and_never_accepts_eval_data(
     assert result.selection == "final"
     assert (tmp_path / mode.value / "final.pt").is_file()
     assert all(frame in {0, 1, 2} for frame in samples.seen)
+    expected_calls = {
+        BenchmarkMode.JOINT_CONDITIONED: (8, 8),
+        BenchmarkMode.AUDIO_ONLY: (0, 6),
+        BenchmarkMode.VISUAL_ONLY: (6, 0),
+    }[mode]
+    assert (model.visual_forward_calls, model.audio_forward_calls) == expected_calls
 
 
 @pytest.mark.parametrize(
