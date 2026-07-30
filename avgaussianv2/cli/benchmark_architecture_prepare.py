@@ -20,6 +20,7 @@ def main() -> None:
     parser.add_argument("--base-protocol-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--strategy", choices=sorted(ABLATION_STRATEGIES), required=True)
+    parser.add_argument("--native-lre-anchor-strength", type=float)
     parser.add_argument(
         "--mode",
         choices=tuple(mode.value for mode in BenchmarkMode),
@@ -36,6 +37,7 @@ def main() -> None:
         base_protocol_dir=args.base_protocol_dir,
         output_dir=args.output_dir,
         strategy=args.strategy,
+        native_lre_anchor_strength=args.native_lre_anchor_strength,
         mode=args.mode,
         device=args.device,
         trusted_upstream_artifacts=args.trust_upstream_artifacts,

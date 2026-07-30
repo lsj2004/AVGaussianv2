@@ -94,6 +94,7 @@ class ModelConfig:
     audio_dropout: float = 0.0
     audio_cross_gate_init: float = 0.01
     audio_residual_scale: float = 0.05
+    native_lre_anchor_strength: float = 0.0
     audio_gaussian_token_rows: int = 16
     audio_gaussian_token_columns: int = 16
     audio_gaussian_token_hidden_dim: int = 32
@@ -144,6 +145,12 @@ class ModelConfig:
             ),
             audio_residual_scale=float(
                 raw.get("audio_residual_scale", defaults.audio_residual_scale)
+            ),
+            native_lre_anchor_strength=float(
+                raw.get(
+                    "native_lre_anchor_strength",
+                    defaults.native_lre_anchor_strength,
+                )
             ),
             audio_gaussian_token_rows=int(
                 raw.get(
@@ -235,6 +242,8 @@ class ModelConfig:
                 raise ValueError(f"model.{name} must be positive")
         if not 0 <= self.alpha_threshold <= 1:
             raise ValueError("model.alpha_threshold must be in [0, 1]")
+        if not 0 <= self.native_lre_anchor_strength <= 1:
+            raise ValueError("model.native_lre_anchor_strength must be in [0,1]")
         cross_backends = {
             "cross_attention_tokens",
             "cross_attention_masks",

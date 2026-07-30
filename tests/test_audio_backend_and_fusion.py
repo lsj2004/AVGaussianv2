@@ -189,6 +189,49 @@ def test_audio_backend_loads_original_weights_before_wrapping(tmp_path: Path) ->
     torch.testing.assert_close(backend.model.acoustic_gain, torch.tensor(0.75))
 
 
+def test_lre_projection_matches_anchor_ratio_and_preserves_total_energy() -> None:
+    rendered = torch.tensor([[[2.0, 0.0], [1.0, 0.0]]])
+    anchor = torch.tensor([[[1.0, 0.0], [2.0, 0.0]]])
+
+    projected = AudioGSBackend.project_lre(rendered, anchor, strength=1.0)
+    projected_energy = projected.square().sum(dim=-1)
+    anchor_energy = anchor.square().sum(dim=-1)
+
+    torch.testing.assert_close(
+        projected_energy.sum(dim=1),
+        rendered.square().sum(dim=(1, 2)),
+    )
+    torch.testing.assert_close(
+        projected_energy[:, 0] / projected_energy[:, 1],
+        anchor_energy[:, 0] / anchor_energy[:, 1],
+    )
+
+
+def test_partial_lre_projection_interpolates_log_energy_ratio() -> None:
+    rendered = torch.tensor([[[2.0], [1.0]]])
+    anchor = torch.tensor([[[1.0], [2.0]]])
+
+    projected = AudioGSBackend.project_lre(rendered, anchor, strength=0.5)
+    projected_energy = projected.square().sum(dim=-1)
+
+    torch.testing.assert_close(
+        projected_energy[:, 0] / projected_energy[:, 1],
+        torch.ones(1),
+    )
+
+
+def test_lre_projection_keeps_gradient_to_native_anchor() -> None:
+    rendered = torch.tensor([[[2.0], [1.0]]], requires_grad=True)
+    anchor = torch.tensor([[[1.0], [2.0]]], requires_grad=True)
+
+    projected = AudioGSBackend.project_lre(rendered, anchor, strength=1.0)
+    projected[:, 0].square().sum().backward()
+
+    assert rendered.grad is not None
+    assert anchor.grad is not None
+    assert torch.count_nonzero(anchor.grad) > 0
+
+
 @pytest.mark.parametrize(
     ("model_file", "expected_module", "expected_class"),
     [

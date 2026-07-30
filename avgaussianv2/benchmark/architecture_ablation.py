@@ -40,6 +40,7 @@ from avgaussianv2.config import load_project_config
 
 
 ABLATION_STRATEGIES = {
+    "native_residual",
     "direct_conditioned_unet",
     "gated_native_residual",
 }
@@ -62,8 +63,9 @@ def validate_strategy_only_delta(
     derived_config: Path,
     *,
     expected_strategy: str,
+    native_lre_anchor_strength: float | None = None,
 ) -> dict[str, str]:
-    """Require a derived protocol to differ only by one model strategy field."""
+    """Require a derived protocol to differ only by declared model fields."""
     if expected_strategy not in ABLATION_STRATEGIES:
         raise ValueError(f"unsupported ablation strategy {expected_strategy!r}")
     base = _load_yaml_mapping(base_config)
@@ -73,9 +75,15 @@ def validate_strategy_only_delta(
     if not isinstance(model, dict):
         raise ValueError("base model config must be a mapping")
     model["audio_render_strategy"] = expected_strategy
+    if native_lre_anchor_strength is not None:
+        strength = float(native_lre_anchor_strength)
+        if not 0.0 <= strength <= 1.0:
+            raise ValueError("native_lre_anchor_strength must be in [0,1]")
+        model["native_lre_anchor_strength"] = strength
     if derived != expected:
         raise ValueError(
-            "derived architecture config may change only audio_render_strategy"
+            "derived architecture config may change only the declared "
+            "audio_render_strategy and native_lre_anchor_strength"
         )
     return {
         "strategy": expected_strategy,
@@ -257,6 +265,7 @@ def prepare_architecture_run(
     base_protocol_dir: Path,
     output_dir: Path,
     strategy: str,
+    native_lre_anchor_strength: float | None = None,
     mode: BenchmarkMode | str = BenchmarkMode.JOINT_CONDITIONED,
     device: torch.device | str,
     trusted_upstream_artifacts: bool,
@@ -267,7 +276,10 @@ def prepare_architecture_run(
     """Prepare one renderer worker with an aligned mode, sequence, and assets."""
     resolved_mode = BenchmarkMode(mode)
     delta = validate_strategy_only_delta(
-        base_config, derived_config, expected_strategy=strategy
+        base_config,
+        derived_config,
+        expected_strategy=strategy,
+        native_lre_anchor_strength=native_lre_anchor_strength,
     )
     audit_protocol_config(base_config)
     audit_protocol_config(derived_config)
@@ -451,7 +463,14 @@ def prepare_architecture_run(
             "same_ordered_dataset_as_a": True,
             "same_shared_indices_as_a": True,
             "shared_indices_sha256": base_compatibility.index_sha256,
-            "only_config_delta": "model.audio_render_strategy",
+            "only_config_delta": (
+                ["model.audio_render_strategy"]
+                if native_lre_anchor_strength is None
+                else [
+                    "model.audio_render_strategy",
+                    "model.native_lre_anchor_strength",
+                ]
+            ),
         },
     }
     evidence_bytes = canonical_json(evidence)

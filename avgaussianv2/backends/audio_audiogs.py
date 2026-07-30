@@ -193,6 +193,7 @@ class AudioGSBackend(nn.Module):
         forward_override: ForwardOverride | None = None,
         render_strategy: AudioRenderStrategy | str = AudioRenderStrategy.NATIVE_RESIDUAL,
         complex_renderer: AlignedComplexCrossAttention | None = None,
+        native_lre_anchor_strength: float = 0.0,
     ) -> None:
         super().__init__()
         renderer = getattr(model, "renderer", None)
@@ -218,6 +219,9 @@ class AudioGSBackend(nn.Module):
         self.upstream_root = None if upstream_root is None else Path(upstream_root)
         self.forward_override = forward_override
         self.render_strategy = AudioRenderStrategy(render_strategy)
+        self.native_lre_anchor_strength = float(native_lre_anchor_strength)
+        if not 0.0 <= self.native_lre_anchor_strength <= 1.0:
+            raise ValueError("native_lre_anchor_strength must be in [0, 1]")
         self.residual_gate_logit = (
             nn.Parameter(torch.zeros(()))
             if self.render_strategy is AudioRenderStrategy.GATED_NATIVE_RESIDUAL
@@ -259,6 +263,7 @@ class AudioGSBackend(nn.Module):
         additive_scale: float = 0.01,
         geometry_rank: int = 16,
         geometry_bias_scale: float = 1.0,
+        native_lre_anchor_strength: float = 0.0,
     ) -> "AudioGSBackend":
         checkpoint_path = Path(checkpoint)
         if not checkpoint_path.exists():
@@ -342,6 +347,7 @@ class AudioGSBackend(nn.Module):
             forward_override=forward_override,
             render_strategy=render_strategy,
             complex_renderer=complex_renderer,
+            native_lre_anchor_strength=native_lre_anchor_strength,
         )
 
     def build_criterion(self) -> nn.Module:
@@ -391,10 +397,15 @@ class AudioGSBackend(nn.Module):
             return conditioned
 
         if self.render_strategy is AudioRenderStrategy.DIRECT_CONDITIONED_UNET:
+            native = None
+            if self.native_lre_anchor_strength > 0.0:
+                native = self.model(cam_pose, source_audio)
             if condition is None:
-                return self.forward_override(self.model, cam_pose, source_audio)
-            with self.conditioned_renderer.use_condition(condition):
-                return self.forward_override(self.model, cam_pose, source_audio)
+                rendered = self.forward_override(self.model, cam_pose, source_audio)
+            else:
+                with self.conditioned_renderer.use_condition(condition):
+                    rendered = self.forward_override(self.model, cam_pose, source_audio)
+            return self._anchor_lre(rendered, native)
 
         native = self.model(cam_pose, source_audio)
         if condition is None:
@@ -412,7 +423,56 @@ class AudioGSBackend(nn.Module):
         residual = conditioned_renderer - plain_renderer
         if self.render_strategy is AudioRenderStrategy.GATED_NATIVE_RESIDUAL:
             residual = self.residual_gate_scale() * residual
-        return native + residual
+        return self._anchor_lre(native + residual, native)
+
+    @staticmethod
+    def project_lre(rendered: Tensor, anchor: Tensor, strength: float) -> Tensor:
+        """Move L/R energy ratio toward ``anchor`` while preserving total energy."""
+        if rendered.ndim != 3 or rendered.shape[1] != 2:
+            raise ValueError("rendered audio must have shape (B,2,samples)")
+        if anchor.shape != rendered.shape:
+            raise ValueError("LRE anchor must match rendered audio shape")
+        resolved_strength = float(strength)
+        if not 0.0 <= resolved_strength <= 1.0:
+            raise ValueError("LRE anchor strength must be in [0, 1]")
+        if resolved_strength == 0.0:
+            return rendered
+
+        energy = rendered.square().sum(dim=-1)
+        anchor_energy = anchor.square().sum(dim=-1)
+        scale = torch.maximum(
+            energy.sum(dim=1, keepdim=True),
+            rendered.new_ones((rendered.shape[0], 1)),
+        )
+        eps = torch.finfo(rendered.dtype).eps * scale
+        current_log_ratio = torch.log((energy[:, :1] + eps) / (energy[:, 1:] + eps))
+        anchor_log_ratio = torch.log(
+            (anchor_energy[:, :1] + eps) / (anchor_energy[:, 1:] + eps)
+        )
+        desired_log_ratio = torch.lerp(
+            current_log_ratio,
+            anchor_log_ratio,
+            resolved_strength,
+        )
+        left_fraction = torch.sigmoid(desired_log_ratio)
+        total_energy = energy.sum(dim=1, keepdim=True)
+        desired_energy = torch.cat(
+            (total_energy * left_fraction, total_energy * (1.0 - left_fraction)),
+            dim=1,
+        )
+        gain = torch.sqrt((desired_energy + eps) / (energy + eps))
+        return rendered * gain.unsqueeze(-1)
+
+    def _anchor_lre(self, rendered: Tensor, anchor: Tensor | None) -> Tensor:
+        if self.native_lre_anchor_strength == 0.0:
+            return rendered
+        if anchor is None:
+            raise RuntimeError("native AudioGS output is required for LRE anchoring")
+        return self.project_lre(
+            rendered,
+            anchor,
+            self.native_lre_anchor_strength,
+        )
 
     def residual_gate_scale(self) -> Tensor:
         """Return a bounded (0, 2) gate initialized exactly to one."""

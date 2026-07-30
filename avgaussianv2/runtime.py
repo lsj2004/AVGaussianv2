@@ -143,6 +143,7 @@ def build_runtime(
             additive_scale=config.model.p1_additive_scale,
             geometry_rank=config.model.p1_geometry_rank,
             geometry_bias_scale=config.model.p1_geometry_bias_scale,
+            native_lre_anchor_strength=config.model.native_lre_anchor_strength,
         )
         condition = GeometricVisualTokenEncoder(
             d_model=config.model.embedding_dim,
@@ -169,6 +170,7 @@ def build_runtime(
             time_patch=config.model.audio_time_patch,
             dropout=config.model.audio_dropout,
             cross_gate_init=config.model.audio_cross_gate_init,
+            native_lre_anchor_strength=config.model.native_lre_anchor_strength,
             residual_scale=config.model.audio_residual_scale,
             gaussian_token_rows=config.model.audio_gaussian_token_rows,
             gaussian_token_columns=config.model.audio_gaussian_token_columns,
@@ -207,6 +209,7 @@ def build_runtime(
             upstream_root=config.paths.audio_upstream_root,
             model_class=config.model.audio_model_class,
             render_strategy=config.model.audio_render_strategy,
+            native_lre_anchor_strength=config.model.native_lre_anchor_strength,
         )
         condition = condition_encoder(
             embedding_dim=config.model.embedding_dim,

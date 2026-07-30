@@ -65,10 +65,28 @@ def test_strategy_delta_rejects_every_other_protocol_change(tmp_path: Path) -> N
     changed = _config("direct_conditioned_unet")
     changed["train"]["seed"] = 7
     _write_yaml(derived, changed)
-    with pytest.raises(ValueError, match="only audio_render_strategy"):
+    with pytest.raises(ValueError, match="only the declared"):
         validate_strategy_only_delta(
             base, derived, expected_strategy="direct_conditioned_unet"
         )
+
+
+def test_strategy_delta_accepts_declared_native_lre_anchor(tmp_path: Path) -> None:
+    base = tmp_path / "base.yaml"
+    derived = tmp_path / "derived.yaml"
+    _write_yaml(base, _config())
+    anchored = _config("direct_conditioned_unet")
+    anchored["model"]["native_lre_anchor_strength"] = 1.0
+    _write_yaml(derived, anchored)
+
+    result = validate_strategy_only_delta(
+        base,
+        derived,
+        expected_strategy="direct_conditioned_unet",
+        native_lre_anchor_strength=1.0,
+    )
+
+    assert result["strategy"] == "direct_conditioned_unet"
 
 
 class TinyState(nn.Module):
