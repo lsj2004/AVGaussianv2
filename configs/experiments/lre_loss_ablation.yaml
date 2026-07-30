@@ -22,9 +22,37 @@ fixed_loss:
   lre_smooth_l1_beta: 1.0
   formula: smooth_l1(pred_lre_db / scale_db, target_lre_db / scale_db)
 
-systems:
+architecture_screening:
+  seed: 42
+  lambda_lre: 0.0
+  required:
+    - gs_only
+    - plain_unet
+    - film_residual
+    - mask_cross_attention
+    - query_dependent_p1
+  conditional:
+    - gaussian_token_cross_attention
+  default_pruned:
+    - direct_conditioned_unet
+    - gated_native_residual
+    - spatial_p1
+  branch_sources:
+    gs_only: clean/codebase-structure
+    film_residual: clean/codebase-structure
+    gaussian_token_cross_attention: clean/codebase-structure
+    plain_unet: origin/agent/plain-unet-baseline
+    mask_cross_attention: origin/agent/p1-spatial-camera-contrast
+    query_dependent_p1: origin/agent/p1-spatial-camera-contrast
+    spatial_p1: origin/agent/p1-spatial-camera-contrast
+  keep_architectures_max: 2
+  require_visual_causal_check_for_conditioned: true
+
+loss_search_default_systems:
   - audio_only
   - joint_conditioned
+loss_search_systems:
+  source: architecture_screening_survivors
 
 reference_baselines:
   - source_binaural

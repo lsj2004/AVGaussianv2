@@ -130,7 +130,7 @@ def generate(
         winners_path=winners_path,
         screening_manifest_path=output_dir.resolve() / "screening/manifest.json",
     )
-    systems = tuple(manifest["systems"])
+    systems = tuple(manifest["loss_search_default_systems"])
     if not systems or len(set(systems)) != len(systems):
         raise ValueError("systems must be nonempty and unique")
     report_steps = tuple(int(step) for step in stage_config["report_steps"])

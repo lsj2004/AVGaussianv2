@@ -4,14 +4,14 @@
 
 本轮先回答三个问题：
 
-1. `Source Binaural`、`Mono`、`audio_only`、`joint_conditioned` 谁的
-   MAG / ENV / LRE / DPAM 更好；
-2. 加 sign-sensitive LRE loss 后，能否降低 LRE，同时不明显损害
+1. GS-only、Plain U-Net、FiLM、Cross-Attention、P1 中哪些架构更好；
+2. 胜出架构加 sign-sensitive LRE loss 后，能否降低 LRE，同时不明显损害
    MAG、ENV、DPAM 和原 AudioGS loss；
 3. 哪些方法或 loss 权重值得继续训练，哪些可以尽早停止。
 
 `configs/experiments/lre_loss_ablation.yaml` 中的组合是**候选池上限**，不是必须
 全部跑完的清单。Agent 应根据中间结果动态淘汰，把算力留给更有希望的配置。
+不要直接展开“全部架构 × 全部 loss 权重”的笛卡尔积。
 
 ## 2. 服务器与并发
 
@@ -35,41 +35,65 @@ Agent 必须记录每个进程的 GPU、峰值显存、运行时间和失败原�
 
 - 计算 `Source Binaural` 和 `Mono` 的 paper MAG / ENV / LRE / DPAM；
 - 验证 `lambda_lre=0` 与旧 objective 一致；
-- 对 `audio_only`、`joint_conditioned` 做短程 smoke，确认 loss、梯度和指标有限；
+- 建立统一架构 runner，保证所有方法使用同一 split、初始化、seed、预算和 evaluator；
+- 将 Plain U-Net、Mask Cross-Attention、P1 从实验分支接入统一 runner；
+- 对所有可运行架构做短程 smoke，确认 loss、梯度和指标有限；
 - 检查两张 GPU 的可用显存，并确定每卡并发数。
 
 P0 失败时不启动大规模训练。
 
-### P1：快速探索方法和 loss 配置
+架构来源：
 
-使用固定 seed 42，优先比较：
+| 架构 | 当前来源 | 初始处理 |
+|---|---|---|
+| GS-only | clean 分支 `audio_only` | 必跑基线 |
+| FiLM residual | clean 分支 `joint_conditioned` | 必跑 |
+| Plain U-Net | `origin/agent/plain-unet-baseline` | 必跑 |
+| Mask Cross-Attention | `origin/agent/p1-spatial-camera-contrast` | 必跑 |
+| Query-dependent P1 | `origin/agent/p1-spatial-camera-contrast` | 必跑主候选 |
+| Gaussian-token Cross-Attention | clean / gaussian-token 分支 | 条件复核 |
+| Direct / Gated / Spatial P1 | 已有历史负结果 | 默认淘汰，仅 smoke 异常优秀时恢复 |
+
+Visual-only 不产生音频，不进入这轮音频架构排名。
+
+历史结果只用于安排优先级。它们来自 `visual_time` 修复前或不同分支，不能直接
+替代本轮统一 runner 的重评估。
+
+### P1：先做架构赛马
+
+所有架构先固定：
 
 ```text
-systems: audio_only, joint_conditioned
-lambda_lre: 0.0, 0.01, 0.02, 0.05
+seed: 42
+lambda_lre: 0.0
 scenes: scene1_opera, Scene7playing
 ```
 
 先看最早可评估 checkpoint（建议 1k）的指标，再把有希望的配置推进到 5k。
 如果当前 runner 只能在 5k 评估，则直接使用 5k，不为此改变训练语义。重点排序：
 
-1. LRE 是否稳定下降；
-2. MAG / ENV / DPAM 是否优于或接近 control；
-3. `audio_total`、waveform L1 是否没有明显退化；
-4. 两个场景的趋势是否一致。
+1. MAG / ENV / DPAM、`audio_total` 和 waveform L1；
+2. LRE 是否接近或优于 GS-only；
+3. 两个场景的趋势是否一致；
+4. 视觉方法的 correct RGBD 是否优于 no-RGBD / shuffled-RGBD。
 
-P1 不要求全量跑完。明显失败的配置应及时停止。
+P1 目标是保留最多 1-2 个架构。明显失败或没有使用视觉的配置应及时停止。
 
-### P2：只确认少量候选
+### P2：只在胜出架构上搜索 LRE loss
 
-从 P1 中保留最多 1-2 个非零 `lambda_lre`，与 `lambda_lre=0` 对照：
+只对 P1 胜出的最多 1-2 个架构测试：
 
-- 两个系统都有效时都保留；只有一个系统有效时只推进该系统；
+```text
+lambda_lre: 0.0, 0.01, 0.02, 0.05
+seed: 42
+```
+
+- 每个架构最多保留 1-2 个非零权重；
 - 先训练到 10k；
 - 10k 仍有稳定收益的候选再训练到 30k；
 - 输出逐样本指标和 Source Binaural / Mono / control / treatment 对比表。
 
-P2 的目标是选出当前最佳方法和 loss 配置，不是补齐搜索网格。
+P2 的目标是选出“架构 + loss 权重”，不是补齐搜索网格。
 
 ### P3：最后再做随机种子
 
@@ -77,7 +101,7 @@ P2 的目标是选出当前最佳方法和 loss 配置，不是补齐搜索网�
 
 ```text
 seeds: 17, 73
-configs: control + 最佳 1 个候选
+configs: 最佳架构的 control + 最佳 LRE 权重
 ```
 
 如果 P2 没有候选通过保护指标，就不跑多 seed，直接结论为当前 LRE loss 配置
@@ -89,7 +113,9 @@ configs: control + 最佳 1 个候选
 
 - loss、梯度或输出出现非有限值；
 - 同一配置连续 OOM，降低并发后仍无法稳定运行；
-- 两个场景在连续两个观测点都没有 LRE 改善；
+- 架构在两个场景、连续两个观测点都被更简单方法稳定支配；
+- 视觉架构的 correct RGBD 与 no-RGBD / shuffled-RGBD 基本相同；
+- LRE loss 配置在两个场景连续两个观测点都没有 LRE 改善；
 - LRE 没有改善，同时 MAG、ENV、DPAM、`audio_total` 或 waveform L1 明显变差；
 - 候选在主要指标上被另一个更小权重配置稳定支配。
 
