@@ -12,6 +12,8 @@ of each active branch, see
 [`docs/codebase-and-branch-guide.zh-CN.md`](docs/codebase-and-branch-guide.zh-CN.md).
 For a protocol-aware comparison of the results committed across those branches, see
 [`docs/experiment-results-across-branches.zh-CN.md`](docs/experiment-results-across-branches.zh-CN.md).
+For side-by-side Mermaid diagrams of every evaluated model architecture, see
+[`docs/model-architecture-variants.zh-CN.md`](docs/model-architecture-variants.zh-CN.md).
 
 ## Upstream models and environment
 
