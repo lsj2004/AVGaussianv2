@@ -1,0 +1,142 @@
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+import yaml
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts/generate_lre_ablation_configs.py"
+
+
+def _load_generator():
+    spec = importlib.util.spec_from_file_location("lre_ablation_generator", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _manifest() -> Path:
+    return ROOT / "configs/experiments/lre_loss_ablation.yaml"
+
+
+def test_screening_generation_only_expands_screening_seed(tmp_path: Path) -> None:
+    generated = _load_generator().generate(_manifest(), tmp_path)
+
+    assert generated["stage"] == "screening"
+    assert len(generated["configs"]) == 8
+    assert len(generated["runs"]) == 16
+    assert {record["seed"] for record in generated["runs"]} == {42}
+    assert {record["lambda_lre"] for record in generated["runs"]} == {
+        0.0,
+        0.01,
+        0.02,
+        0.05,
+    }
+    assert {record["system"] for record in generated["runs"]} == {
+        "audio_only",
+        "joint_conditioned",
+    }
+    assert {tuple(record["report_steps"]) for record in generated["runs"]} == {
+        (5_000,)
+    }
+    assert all(record["max_steps"] == 5_000 for record in generated["runs"])
+
+    scene1 = next(
+        record
+        for record in generated["configs"]
+        if record["scene"] == "scene1_opera"
+        and record["lambda_lre"] == pytest.approx(0.02)
+    )
+    config = yaml.safe_load(Path(scene1["config"]).read_text())
+    assert config["train"]["joint_steps"] == 5_000
+    assert config["benchmark"]["continuation_updates"] == 5_000
+    assert config["benchmark"]["report_steps"] == [5_000]
+    assert (
+        Path(scene1["config"]).parent / config["paths"]["visual_checkpoint"]
+    ).resolve() == (
+        ROOT / "runs/cam38_strict/scene1_opera/ftgspp/native/"
+        "scene1_opera/00/gaussians.pt"
+    ).resolve()
+
+
+def test_confirmation_requires_winners_bound_to_screening_manifest(
+    tmp_path: Path,
+) -> None:
+    module = _load_generator()
+
+    with pytest.raises(ValueError, match="requires --winners"):
+        module.generate(_manifest(), tmp_path, stage="confirmation")
+
+    module.generate(_manifest(), tmp_path, stage="screening")
+    screening_manifest = tmp_path / "screening/manifest.json"
+    winners = tmp_path / "winners.json"
+    winners.write_text(
+        json.dumps(
+            {
+                "schema": "avgaussianv2.lre-loss-screening-selection",
+                "version": 1,
+                "source_screening_manifest_sha256": hashlib.sha256(
+                    screening_manifest.read_bytes()
+                ).hexdigest(),
+                "selected_lambda_lre": [0.01, 0.02],
+            }
+        )
+    )
+
+    generated = module.generate(
+        _manifest(),
+        tmp_path,
+        stage="confirmation",
+        winners_path=winners,
+    )
+
+    assert len(generated["configs"]) == 18
+    assert len(generated["runs"]) == 36
+    assert {record["seed"] for record in generated["runs"]} == {17, 42, 73}
+    assert {record["lambda_lre"] for record in generated["runs"]} == {
+        0.0,
+        0.01,
+        0.02,
+    }
+    assert {tuple(record["report_steps"]) for record in generated["runs"]} == {
+        (5_000, 10_000, 30_000)
+    }
+    assert all(record["max_steps"] == 30_000 for record in generated["runs"])
+    assert all(
+        record["control_run_id"] is None
+        for record in generated["runs"]
+        if record["lambda_lre"] == 0.0
+    )
+    assert all(
+        record["control_run_id"] is not None
+        for record in generated["runs"]
+        if record["lambda_lre"] != 0.0
+    )
+
+
+def test_confirmation_rejects_unbound_or_invalid_winners(tmp_path: Path) -> None:
+    module = _load_generator()
+    module.generate(_manifest(), tmp_path, stage="screening")
+    winners = tmp_path / "winners.json"
+    winners.write_text(
+        json.dumps(
+            {
+                "schema": "avgaussianv2.lre-loss-screening-selection",
+                "version": 1,
+                "source_screening_manifest_sha256": "0" * 64,
+                "selected_lambda_lre": [0.0, 0.02],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="does not bind"):
+        module.generate(
+            _manifest(),
+            tmp_path,
+            stage="confirmation",
+            winners_path=winners,
+        )

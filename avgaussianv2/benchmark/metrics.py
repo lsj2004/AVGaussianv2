@@ -73,6 +73,78 @@ def lre_error_db(predicted: Tensor, target: Tensor, eps: float = 1e-8) -> float:
     return float((ratio_db(predicted) - ratio_db(target)).abs().mean().item())
 
 
+def paper_magnitude_distance(
+    predicted: Tensor,
+    target: Tensor,
+    n_fft: int = 512,
+    hop_length: int = 160,
+    win_length: int = 400,
+) -> float:
+    """AudioGS-paper MAG: sum of per-ear mean magnitude-spectrogram L1."""
+    _audio("paper MAG", predicted, target)
+    if n_fft <= 0 or hop_length <= 0 or win_length <= 0 or win_length > n_fft:
+        raise ValueError(
+            "paper MAG FFT and window lengths must be positive and win_length <= n_fft"
+        )
+    stft_dtype = torch.promote_types(predicted.dtype, target.dtype)
+    if stft_dtype in {torch.float16, torch.bfloat16}:
+        stft_dtype = torch.float32
+    window = torch.hamming_window(
+        win_length,
+        device=predicted.device,
+        dtype=stft_dtype,
+    )
+
+    def magnitude(audio: Tensor) -> Tensor:
+        return torch.stft(
+            audio.to(stft_dtype).flatten(0, 1),
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=win_length,
+            window=window,
+            pad_mode="constant",
+            return_complex=True,
+        ).abs().unflatten(0, audio.shape[:2])
+
+    per_ear = (magnitude(predicted) - magnitude(target)).abs().mean(dim=(-2, -1))
+    return float(per_ear.sum(dim=1).mean().item())
+
+
+def _hilbert_envelope(audio: Tensor) -> Tensor:
+    length = audio.shape[-1]
+    spectrum = torch.fft.fft(audio, dim=-1)
+    multiplier = torch.zeros(length, dtype=audio.dtype, device=audio.device)
+    multiplier[0] = 1
+    if length % 2 == 0:
+        multiplier[length // 2] = 1
+        multiplier[1 : length // 2] = 2
+    else:
+        multiplier[1 : (length + 1) // 2] = 2
+    return torch.fft.ifft(spectrum * multiplier, dim=-1).abs()
+
+
+def paper_envelope_distance(predicted: Tensor, target: Tensor) -> float:
+    """AudioGS-paper ENV: sum of per-ear Hilbert-envelope RMSE."""
+    _audio("paper ENV", predicted, target)
+    reduction_dtype = torch.promote_types(predicted.dtype, target.dtype)
+    if reduction_dtype in {torch.float16, torch.bfloat16}:
+        reduction_dtype = torch.float32
+    envelope_delta = _hilbert_envelope(
+        predicted.to(reduction_dtype)
+    ) - _hilbert_envelope(target.to(reduction_dtype))
+    per_ear = envelope_delta.square().mean(dim=-1).sqrt()
+    return float(per_ear.sum(dim=1).mean().item())
+
+
+def paper_lre_error_db(
+    predicted: Tensor,
+    target: Tensor,
+    eps: float = 1e-5,
+) -> float:
+    """AudioGS-paper LRE, including its published reference epsilon."""
+    return lre_error_db(predicted, target, eps=eps)
+
+
 def rgb_l1(predicted: Tensor, target: Tensor) -> float:
     """Return L1 error for nonempty floating BHWC RGB tensors."""
     _rgb("RGB L1", predicted, target)

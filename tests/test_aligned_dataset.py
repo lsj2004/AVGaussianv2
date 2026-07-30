@@ -130,6 +130,29 @@ def test_training_dataset_excludes_windows_requiring_padding(tmp_path: Path) -> 
     assert [record.frame_index for record in dataset.records] == [1, 2, 3, 4]
 
 
+def test_audio_only_dataset_reads_identical_records_without_visual_assets(
+    tmp_path: Path,
+) -> None:
+    config = make_scene(tmp_path)
+    config = replace(
+        config,
+        paths=replace(config.paths, visual_memmap=None),
+    )
+    dataset = AlignedAVDataset(config, split="eval", audio_only=True)
+
+    sample = dataset.audio_reference(0)
+
+    assert sample.scene_id == "scene1_opera"
+    assert sample.camera == "cam10"
+    assert sample.frame_index == 1
+    assert sample.time_seconds == pytest.approx(0.1)
+    assert sample.source_audio.shape == (1, 2, 20)
+    assert sample.target_audio.shape == (1, 2, 20)
+    assert sample.sample_rate == 1_000
+    with pytest.raises(RuntimeError, match="audio_reference"):
+        dataset[0]
+
+
 def test_eval_reads_heldout_video_when_train_memmap_excludes_camera(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

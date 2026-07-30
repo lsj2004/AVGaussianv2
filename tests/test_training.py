@@ -4,7 +4,14 @@ from torch import nn
 
 from avgaussianv2.config import TrainConfig
 from avgaussianv2.contracts import AlignedAVSample, FusionOutput, RGBDRender
-from avgaussianv2.losses import JointLossWeights, capture_visual_anchor, compute_joint_loss
+from avgaussianv2.losses import (
+    JointLossWeights,
+    capture_visual_anchor,
+    compute_audio_objective,
+    compute_joint_loss,
+    signed_lre_db,
+    signed_lre_loss,
+)
 from avgaussianv2.train import (
     NonFiniteTrainingError,
     build_joint_optimizer,
@@ -94,6 +101,90 @@ def audio_loss(predicted, target):
     return {"total_loss": torch.nn.functional.mse_loss(predicted, target)}
 
 
+def test_signed_lre_loss_breaks_diff_magnitude_sign_ambiguity() -> None:
+    target = torch.stack(
+        (torch.full((64,), 2.0), torch.ones(64)),
+        dim=0,
+    ).unsqueeze(0)
+    swapped = target.flip(1).clone().requires_grad_(True)
+
+    target_diff_magnitude = torch.fft.rfft(
+        target[:, 0] - target[:, 1]
+    ).abs()
+    swapped_diff_magnitude = torch.fft.rfft(
+        swapped[:, 0] - swapped[:, 1]
+    ).abs()
+    torch.testing.assert_close(swapped_diff_magnitude, target_diff_magnitude)
+
+    loss = signed_lre_loss(swapped, target, scale_db=6.0)
+    assert loss.item() > 0
+    loss.backward()
+    assert swapped.grad is not None
+    assert swapped.grad[:, 0].abs().sum() > 0
+    assert swapped.grad[:, 1].abs().sum() > 0
+
+
+def test_signed_lre_db_preserves_left_right_direction() -> None:
+    target = torch.stack(
+        (torch.full((32,), 2.0), torch.ones(32)),
+        dim=0,
+    ).unsqueeze(0)
+
+    expected = 10.0 * torch.log10(torch.tensor(4.0))
+    torch.testing.assert_close(signed_lre_db(target), expected.reshape(1))
+    torch.testing.assert_close(signed_lre_db(target.flip(1)), -expected.reshape(1))
+
+
+def test_audio_objective_keeps_base_metric_separate_from_lre_regularizer() -> None:
+    target = torch.stack(
+        (torch.full((32,), 2.0), torch.ones(32)),
+        dim=0,
+    ).unsqueeze(0)
+    predicted = target.flip(1)
+    weights = JointLossWeights(audio=1.0, lre=0.02)
+
+    total, parts = compute_audio_objective(
+        predicted,
+        target,
+        weights=weights,
+        audio_loss_fn=audio_loss,
+    )
+
+    torch.testing.assert_close(parts["audio"], parts["audio_base"])
+    torch.testing.assert_close(
+        total,
+        parts["audio_base"] + parts["audio_lre_weighted"],
+    )
+    assert parts["audio_lre"] > 0
+    assert parts["pred_lre_db"] < 0
+    assert parts["target_lre_db"] > 0
+
+
+@pytest.mark.parametrize(
+    ("criterion", "error", "message"),
+    [
+        (lambda *_: torch.ones(2), ValueError, "scalar Tensor"),
+        (lambda *_: torch.tensor(float("nan")), ValueError, "finite"),
+        (lambda *_: {"wrong": torch.tensor(1.0)}, ValueError, "total_loss"),
+        (lambda *_: 1.0, TypeError, "resolve to a Tensor"),
+    ],
+)
+def test_audio_objective_rejects_invalid_base_criterion(
+    criterion,
+    error,
+    message,
+) -> None:
+    audio = torch.ones(1, 2, 16)
+
+    with pytest.raises(error, match=message):
+        compute_audio_objective(
+            audio,
+            audio,
+            weights=JointLossWeights(),
+            audio_loss_fn=criterion,
+        )
+
+
 def test_joint_loss_matches_weighted_components() -> None:
     model = TinyTrainFusion()
     sample = make_sample()
@@ -110,7 +201,11 @@ def test_joint_loss_matches_weighted_components() -> None:
         audio_loss_fn=audio_loss,
     )
 
-    expected = 2.0 * parts["audio"] + 3.0 * parts["rgb"] + 4.0 * parts["visual_anchor"]
+    expected = (
+        2.0 * parts["audio_base"]
+        + 3.0 * parts["rgb"]
+        + 4.0 * parts["visual_anchor"]
+    )
     torch.testing.assert_close(total, expected)
     assert parts["visual_anchor"] == 0
 
@@ -206,11 +301,14 @@ def test_condition_warmup_step_accepts_scalar_criterion() -> None:
         model,
         make_sample(),
         optimizer,
+        TrainConfig(),
         lambda predicted, target: torch.nn.functional.mse_loss(predicted, target),
     )
 
     assert stats.total > 0
-    assert stats.losses == {"audio": stats.total}
+    assert stats.losses["audio"] == stats.losses["audio_base"]
+    assert stats.losses["audio_lre"] == 0
+    assert stats.losses["audio_total_with_lre"] == stats.total
     assert stats.gradient_norms["condition_encoder"] > 0
     assert stats.audio_to_visual_grad_norm == 0
 

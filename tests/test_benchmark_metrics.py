@@ -7,6 +7,9 @@ from avgaussianv2.benchmark.metrics import (
     aggregate_metrics,
     log_spectral_distance,
     lre_error_db,
+    paper_envelope_distance,
+    paper_lre_error_db,
+    paper_magnitude_distance,
     psnr,
     rgb_l1,
     ssim,
@@ -74,6 +77,92 @@ def test_lre_measures_left_right_energy_ratio_in_db() -> None:
     assert lre_error_db(predicted, target) == pytest.approx(
         10.0 * math.log10(4.0), rel=1e-6
     )
+
+
+def test_audio_paper_metrics_are_zero_for_identical_audio() -> None:
+    audio = torch.randn(2, 2, 640)
+
+    assert paper_magnitude_distance(audio, audio) == pytest.approx(0.0)
+    assert paper_envelope_distance(audio, audio) == pytest.approx(0.0)
+    assert paper_lre_error_db(audio, audio) == pytest.approx(0.0)
+
+
+def test_paper_magnitude_distance_is_sum_of_per_ear_stft_l1() -> None:
+    target = torch.zeros(1, 2, 32)
+    predicted = target.clone()
+    predicted[:, 0, 0] = 1.0
+    window = torch.hamming_window(16)
+    predicted_stft = torch.stft(
+        predicted.flatten(0, 1),
+        n_fft=16,
+        hop_length=4,
+        win_length=16,
+        window=window,
+        pad_mode="constant",
+        return_complex=True,
+    ).abs()
+    target_stft = torch.stft(
+        target.flatten(0, 1),
+        n_fft=16,
+        hop_length=4,
+        win_length=16,
+        window=window,
+        pad_mode="constant",
+        return_complex=True,
+    ).abs()
+    expected = (
+        (predicted_stft - target_stft)
+        .abs()
+        .unflatten(0, (1, 2))
+        .mean(dim=(-2, -1))
+        .sum(dim=1)
+        .mean()
+    )
+
+    assert paper_magnitude_distance(
+        predicted,
+        target,
+        n_fft=16,
+        hop_length=4,
+        win_length=16,
+    ) == pytest.approx(expected.item())
+
+
+def test_paper_envelope_distance_matches_fft_analytic_signal_reference() -> None:
+    target = torch.zeros(1, 2, 9)
+    predicted = target.clone()
+    predicted[0, 0] = torch.tensor([1.0, -0.5, 0.25, 0.0, 0.5, -1.0, 0.0, 0.2, -0.1])
+
+    def reference_envelope(audio: torch.Tensor) -> torch.Tensor:
+        spectrum = torch.fft.fft(audio, dim=-1)
+        multiplier = torch.zeros(audio.shape[-1])
+        multiplier[0] = 1
+        multiplier[1 : (audio.shape[-1] + 1) // 2] = 2
+        return torch.fft.ifft(spectrum * multiplier, dim=-1).abs()
+
+    expected = (
+        (reference_envelope(predicted) - reference_envelope(target))
+        .square()
+        .mean(dim=-1)
+        .sqrt()
+        .sum(dim=1)
+        .mean()
+    )
+
+    assert paper_envelope_distance(predicted, target) == pytest.approx(
+        expected.item()
+    )
+
+
+def test_paper_lre_uses_published_epsilon() -> None:
+    target = torch.zeros(1, 2, 16)
+    predicted = target.clone()
+    predicted[:, 0] = 0.01
+    expected = 10.0 * math.log10(
+        (float(predicted[:, 0].square().sum()) + 1e-5) / 1e-5
+    )
+
+    assert paper_lre_error_db(predicted, target) == pytest.approx(expected)
 
 
 def test_lsd_mono_and_diff_use_distinct_stereo_constructions() -> None:

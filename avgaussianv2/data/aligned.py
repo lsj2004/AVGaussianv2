@@ -30,6 +30,17 @@ class AlignedRecord:
     target_audio_path: Path
 
 
+@dataclass(frozen=True)
+class AlignedAudioReference:
+    scene_id: str
+    camera: str
+    frame_index: int
+    time_seconds: float
+    source_audio: Tensor
+    target_audio: Tensor
+    sample_rate: int
+
+
 def _load_heldout_calibration(video_path: Path, camera: str) -> tuple[Tensor, Tensor]:
     calibration_path = video_path.parent / "cameras.npz"
     if not calibration_path.is_file() or calibration_path.is_symlink():
@@ -144,11 +155,18 @@ def _resize_rgb_and_intrinsic(
 
 
 class AlignedAVDataset(Dataset[AlignedAVSample]):
-    def __init__(self, config: ProjectConfig, split: str) -> None:
+    def __init__(
+        self,
+        config: ProjectConfig,
+        split: str,
+        *,
+        audio_only: bool = False,
+    ) -> None:
         if split not in {"train", "eval"}:
             raise ValueError("split must be train or eval")
         self.config = config
         self.split = split
+        self.audio_only = audio_only
         manifest = json.loads(config.paths.manifest.read_text())
         if manifest.get("scene_id") != config.scene.scene_id:
             raise ValueError(
@@ -159,9 +177,14 @@ class AlignedAVDataset(Dataset[AlignedAVSample]):
             raise ValueError(
                 f"audio sample rate mismatch: manifest={manifest_rate} config={config.model.sample_rate}"
             )
-        if config.paths.visual_memmap is None:
-            raise ValueError("paths.visual_memmap is required for aligned RGB/time loading")
-        self.arrays = _open_memmaps(config.paths.visual_memmap)
+        if audio_only:
+            self.arrays = None
+        else:
+            if config.paths.visual_memmap is None:
+                raise ValueError(
+                    "paths.visual_memmap is required for aligned RGB/time loading"
+                )
+            self.arrays = _open_memmaps(config.paths.visual_memmap)
         self.sample_rate = manifest_rate
         self.crop_samples = int(round(config.train.crop_seconds * self.sample_rate))
         if self.crop_samples <= 0:
@@ -204,7 +227,10 @@ class AlignedAVDataset(Dataset[AlignedAVSample]):
                 if start < 0 or end > min(source_frames, target_frames):
                     continue
                 camera_index = int(config.scene.camera_mapping[camera])
-                if camera_index < 0 or camera_index >= self.arrays["rgb"].shape[1]:
+                if self.arrays is not None and (
+                    camera_index < 0
+                    or camera_index >= self.arrays["rgb"].shape[1]
+                ):
                     if split != "eval":
                         raise ValueError(
                             f"{camera} camera mapping index {camera_index} is out of range"
@@ -235,22 +261,39 @@ class AlignedAVDataset(Dataset[AlignedAVSample]):
     def __len__(self) -> int:
         return len(self.records)
 
-    def __getitem__(self, index: int) -> AlignedAVSample:
+    def audio_reference(self, index: int) -> AlignedAudioReference:
+        """Read the exact aligned audio crop without loading visual targets."""
         record = self.records[index]
         center = int(round(record.time_seconds * self.sample_rate))
         start = center - self.crop_samples // 2
-        source_audio = _read_audio_crop(
-            self.source_audio_path,
-            start,
-            self.crop_samples,
-            self.sample_rate,
+        return AlignedAudioReference(
+            scene_id=self.config.scene.scene_id,
+            camera=record.camera,
+            frame_index=record.frame_index,
+            time_seconds=record.time_seconds,
+            source_audio=_read_audio_crop(
+                self.source_audio_path,
+                start,
+                self.crop_samples,
+                self.sample_rate,
+            ),
+            target_audio=_read_audio_crop(
+                record.target_audio_path,
+                start,
+                self.crop_samples,
+                self.sample_rate,
+            ),
+            sample_rate=self.sample_rate,
         )
-        target_audio = _read_audio_crop(
-            record.target_audio_path,
-            start,
-            self.crop_samples,
-            self.sample_rate,
-        )
+
+    def __getitem__(self, index: int) -> AlignedAVSample:
+        if self.audio_only:
+            raise RuntimeError(
+                "audio-only aligned dataset exposes audio_reference(), not visual samples"
+            )
+        assert self.arrays is not None
+        record = self.records[index]
+        audio = self.audio_reference(index)
         frame = record.frame_index
         camera = record.camera_index
         if camera >= 0:
@@ -295,8 +338,8 @@ class AlignedAVDataset(Dataset[AlignedAVSample]):
             w2c=w2c.unsqueeze(0),
             intrinsic=intrinsic.unsqueeze(0),
             audio_cam_pose=_audiogs_pose(w2c),
-            source_audio=source_audio,
-            target_audio=target_audio,
+            source_audio=audio.source_audio,
+            target_audio=audio.target_audio,
             target_rgb=rgb.unsqueeze(0),
             image_size=self.image_size,
         )

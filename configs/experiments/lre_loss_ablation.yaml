@@ -1,0 +1,115 @@
+schema: avgaussianv2.lre-loss-ablation
+version: 1
+objective: >
+  Test whether a sign-sensitive left/right energy-ratio loss reduces held-out
+  LRE without materially degrading the native AudioGS reconstruction metrics.
+
+base_configs:
+  scene1_opera: ../benchmark_cam38/scene1_opera.yaml
+  Scene7playing: ../benchmark_cam38/Scene7playing.yaml
+
+fixed_loss:
+  lre_scale_db: 6.0
+  lre_epsilon: 1.0e-8
+  lre_smooth_l1_beta: 1.0
+  formula: smooth_l1(pred_lre_db / scale_db, target_lre_db / scale_db)
+
+systems:
+  - audio_only
+  - joint_conditioned
+
+reference_baselines:
+  - source_binaural
+  - mono
+reference_metrics:
+  - paper_mag
+  - paper_env
+  - paper_lre_db
+  - paper_dpam
+
+screening:
+  seeds: [42]
+  lambda_lre: [0.0, 0.01, 0.02, 0.05]
+  report_steps: [5000]
+  keep_nonzero_candidates: 2
+  selection:
+    unit: scene_system
+    candidates_must_be_nonzero: true
+    rank:
+      - nonfinite_samples_ascending
+      - guardrail_violations_ascending
+      - worst_guardrail_overrun_ascending
+      - macro_lre_error_db_ascending
+      - lambda_lre_ascending
+    fallback: >
+      Always select exactly two nonzero candidates using the full ranking, even
+      when fewer than two pass every gate. Record gate failures; selection does
+      not make a failed candidate acceptable.
+  gates:
+    both_scenes_required: true
+    all_systems_required: true
+    lre_relative_improvement_min: 0.15
+    audio_total_relative_degradation_max: 0.03
+    waveform_l1_relative_degradation_max: 0.03
+    nonfinite_samples_max: 0
+
+confirmation:
+  seeds: [17, 42, 73]
+  lambda_lre:
+    source: screening_winners_plus_zero
+  report_steps: [5000, 10000, 30000]
+  primary_step: 30000
+  gates:
+    both_scenes_required: true
+    all_systems_required: true
+    lre_relative_improvement_min: 0.10
+    audio_total_relative_degradation_max: 0.03
+    waveform_l1_relative_degradation_max: 0.03
+    lre_paired_win_rate_min: 0.55
+    bootstrap_confidence: 0.95
+    bootstrap_resamples: 10000
+    nonfinite_samples_max: 0
+
+reporting:
+  primary_metric: lre_error_db
+  pairing_keys: [scene, system, seed, step, sample_id]
+  paper_comparison_metrics:
+    protocol: audiogs_paper_v1
+    required_for_models_and_references: true
+    dpam_may_be_skipped_during_smoke_only: true
+  guardrail_metrics:
+    - audio_total
+    - audio_mono
+    - audio_diff
+    - waveform_l1
+    - mono_lsd
+    - diff_lsd
+    - rgb_l1
+    - rgb_psnr
+    - rgb_ssim
+  required_aggregations:
+    - per_sample
+    - per_scene
+    - macro
+    - sample_weighted_micro
+    - per_seed
+    - across_seed_mean_std
+    - paired_delta
+    - paired_win_rate
+    - bootstrap_confidence_interval
+  bootstrap:
+    method: paired_hierarchical_scene_seed_sample
+    seed: 20260731
+    confidence: 0.95
+    resamples: 10000
+  expected_counts:
+    reference_baseline_rows: 846
+    screening_training_runs: 16
+    confirmation_training_runs: 36
+    screening_per_sample_rows: 3384
+    confirmation_per_sample_rows: 22842
+
+output:
+  generated_configs: ../../configs/generated/lre_loss_ablation
+  run_root: ../../runs/lre_loss_ablation_visual_time_v2
+  result_root: ../../results/lre_loss_ablation_visual_time_v2

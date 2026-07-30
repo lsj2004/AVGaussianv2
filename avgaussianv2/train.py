@@ -13,6 +13,7 @@ from avgaussianv2.losses import (
     AudioLoss,
     JointLossWeights,
     capture_visual_anchor,
+    compute_audio_objective,
     compute_joint_loss,
 )
 
@@ -65,6 +66,10 @@ def _explicit_gradient_norm(gradients: Sequence[Tensor | None]) -> float:
 def _weights(config: TrainConfig) -> JointLossWeights:
     return JointLossWeights(
         audio=config.lambda_audio,
+        lre=config.lambda_lre,
+        lre_scale_db=config.lre_scale_db,
+        lre_epsilon=config.lre_epsilon,
+        lre_smooth_l1_beta=config.lre_smooth_l1_beta,
         rgb=config.lambda_rgb,
         dssim=config.lambda_dssim,
         visual_anchor=config.lambda_visual_anchor,
@@ -112,35 +117,23 @@ def build_joint_optimizer(
     return torch.optim.Adam(optimizer_groups)
 
 
-def _audio_loss_tensor(
-    criterion_result: Tensor | Mapping[str, Tensor], sample: AlignedAVSample
-) -> Tensor:
-    if isinstance(criterion_result, Mapping):
-        if "total_loss" not in criterion_result:
-            raise KeyError("audio loss mapping is missing 'total_loss'")
-        loss = criterion_result["total_loss"]
-    else:
-        loss = criterion_result
-    if not isinstance(loss, Tensor):
-        raise TypeError("audio loss must be a scalar tensor or mapping containing one")
-    if loss.ndim != 0:
-        raise ValueError("audio loss must be a scalar tensor")
-    _require_finite_tensor("warmup audio loss", loss, sample)
-    return loss
-
-
 def condition_warmup_step(
     model: nn.Module,
     sample: AlignedAVSample,
     optimizer: torch.optim.Optimizer,
+    config: TrainConfig,
     audio_loss_fn: AudioLoss,
 ) -> TrainStepStats:
     optimizer.zero_grad(set_to_none=True)
     output = model(sample)
     _require_finite_tensor("predicted audio", output.predicted_audio, sample)
-    audio = _audio_loss_tensor(
-        audio_loss_fn(output.predicted_audio, sample.target_audio), sample
+    audio, parts = compute_audio_objective(
+        output.predicted_audio,
+        sample.target_audio,
+        weights=_weights(config),
+        audio_loss_fn=audio_loss_fn,
     )
+    _require_finite_tensor("warmup audio objective", audio, sample)
     audio.backward()
     groups = model.named_parameter_groups()
     gradient_norms = {
@@ -152,7 +145,7 @@ def condition_warmup_step(
     value = float(audio.detach().cpu())
     return TrainStepStats(
         total=value,
-        losses={"audio": value},
+        losses={name: float(item.detach().cpu()) for name, item in parts.items()},
         gradient_norms=gradient_norms,
         audio_to_visual_grad_norm=0.0,
     )
@@ -189,7 +182,7 @@ def joint_train_step(
         if not visual_parameters:
             raise ValueError("audio-to-visual gradient probe has no trainable visual parameters")
         audio_visual_gradients = torch.autograd.grad(
-            parts["audio"],
+            parts["audio_total_with_lre"],
             visual_parameters,
             retain_graph=True,
             allow_unused=True,
@@ -219,7 +212,6 @@ def run_condition_warmup(
     config: TrainConfig,
     audio_loss_fn: AudioLoss,
 ) -> list[TrainStepStats]:
-    del config
     if steps <= 0:
         return []
     if not samples:
@@ -229,7 +221,15 @@ def run_condition_warmup(
     history = []
     for step in range(steps):
         sample = samples[step % len(samples)]
-        history.append(condition_warmup_step(model, sample, optimizer, audio_loss_fn))
+        history.append(
+            condition_warmup_step(
+                model,
+                sample,
+                optimizer,
+                config,
+                audio_loss_fn,
+            )
+        )
     return history
 
 

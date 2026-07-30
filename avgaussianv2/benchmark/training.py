@@ -28,7 +28,13 @@ from torch import Tensor, nn
 
 from avgaussianv2.config import TrainConfig
 from avgaussianv2.contracts import AlignedAVSample
-from avgaussianv2.losses import AudioLoss, capture_visual_anchor, dssim
+from avgaussianv2.losses import (
+    AudioLoss,
+    JointLossWeights,
+    capture_visual_anchor,
+    compute_audio_objective,
+    dssim,
+)
 from avgaussianv2.train import (
     DisconnectedAudioVisualGradient,
     TrainStepStats,
@@ -422,18 +428,32 @@ def _audio_only_step(
     if not callable(forward_audio_only):
         raise TypeError("audio-only benchmark model must expose forward_audio_only()")
     predicted_audio = forward_audio_only(sample)
-    raw = audio_loss_fn(predicted_audio, sample.target_audio)
-    loss = raw["total_loss"] if isinstance(raw, Mapping) else raw
-    if not isinstance(loss, Tensor) or loss.ndim:
-        raise ValueError("audio loss must resolve to a scalar tensor")
-    total = float(config.lambda_audio) * loss
+    weights = JointLossWeights(
+        audio=config.lambda_audio,
+        lre=config.lambda_lre,
+        lre_scale_db=config.lre_scale_db,
+        lre_epsilon=config.lre_epsilon,
+        lre_smooth_l1_beta=config.lre_smooth_l1_beta,
+        rgb=config.lambda_rgb,
+        dssim=config.lambda_dssim,
+        visual_anchor=config.lambda_visual_anchor,
+    )
+    total, parts = compute_audio_objective(
+        predicted_audio,
+        sample.target_audio,
+        weights=weights,
+        audio_loss_fn=audio_loss_fn,
+    )
     if not torch.isfinite(total):
         raise ValueError("audio-only loss is not finite")
     total.backward()
     optimizer.step()
     return TrainStepStats(
         float(total.detach().cpu()),
-        {"audio": float(loss.detach().cpu())},
+        {
+            name: float(value.detach().cpu())
+            for name, value in parts.items()
+        },
         {},
         0.0,
     )
@@ -1635,6 +1655,7 @@ class FixedBudgetTrainer:
                     model,
                     _require_training_sample(train_samples[sample_index]),
                     optimizer,
+                    train_config,
                     audio_loss_fn,
                 )
                 warmup_step += 1

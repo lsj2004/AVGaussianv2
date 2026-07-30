@@ -42,6 +42,10 @@ model:
   audio_transformer_heads: 4
 train:
   crop_seconds: 0.5
+  lambda_lre: 0.02
+  lre_scale_db: 6.0
+  lre_epsilon: 1.0e-8
+  lre_smooth_l1_beta: 1.0
 """.strip()
         + "\n"
     )
@@ -59,6 +63,10 @@ train:
     assert config.model.audio_transformer_layers == 2
     assert config.model.audio_transformer_heads == 4
     assert config.train.crop_seconds == pytest.approx(0.5)
+    assert config.train.lambda_lre == pytest.approx(0.02)
+    assert config.train.lre_scale_db == pytest.approx(6.0)
+    assert config.train.lre_epsilon == pytest.approx(1e-8)
+    assert config.train.lre_smooth_l1_beta == pytest.approx(1.0)
 
 
 def test_load_project_config_rejects_unknown_audio_render_strategy(
@@ -215,6 +223,7 @@ train:
         ("audio_lr", "-0.001", "train.audio_lr must be finite and positive"),
         ("visual_lr", ".nan", "train.visual_lr must be finite and positive"),
         ("lambda_audio", "-1", "train.lambda_audio must be finite and non-negative"),
+        ("lambda_lre", "-1", "train.lambda_lre must be finite and non-negative"),
         ("lambda_rgb", ".inf", "train.lambda_rgb must be finite and non-negative"),
     ],
 )
@@ -275,6 +284,43 @@ train:
     )
 
     with pytest.raises(ValueError, match="at least one primary loss"):
+        load_project_config(path)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["lre_scale_db", "lre_epsilon", "lre_smooth_l1_beta"],
+)
+def test_load_project_config_rejects_nonpositive_lre_stability_values(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    path = tmp_path / "scene.yaml"
+    path.write_text(
+        f"""
+scene:
+  id: scene1_opera
+  fps: 30
+  train_cameras: [cam00]
+  eval_cameras: [cam10]
+  camera_mapping: {{cam00: 0, cam10: 10}}
+paths:
+  visual_upstream_root: /repos/FreeTimeGSPlusPlus
+  audio_upstream_root: /repos/audioGS-replay
+  visual_checkpoint: /runs/visual.pt
+  audio_checkpoint: /runs/audio.pth
+  manifest: /runs/manifest.json
+model: {{}}
+train:
+  {field}: 0
+""".strip()
+        + "\n"
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"train\.{field} must be finite and positive",
+    ):
         load_project_config(path)
 
 

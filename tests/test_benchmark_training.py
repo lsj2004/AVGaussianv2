@@ -347,6 +347,50 @@ def test_fixed_budget_updates_only_allowed_groups_and_never_accepts_eval_data(
     assert (model.visual_forward_calls, model.audio_forward_calls) == expected_calls
 
 
+def test_audio_only_step_uses_lre_regularizer_and_preserves_base_metric() -> None:
+    model = TinyFusion()
+    configure_benchmark_mode(model, BenchmarkMode.AUDIO_ONLY, "main")
+    optimizer = torch.optim.SGD(
+        [
+            parameter
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        ],
+        lr=0.01,
+    )
+    value = sample(0)
+    value = type(value)(
+        **{
+            **vars(value),
+            "source_audio": torch.stack(
+                (torch.full((16,), 0.5), torch.full((16,), 0.25)),
+                dim=0,
+            ).unsqueeze(0),
+            "target_audio": torch.stack(
+                (torch.full((16,), 0.25), torch.full((16,), 0.5)),
+                dim=0,
+            ).unsqueeze(0),
+        }
+    )
+
+    stats = benchmark_training._audio_only_step(
+        model,
+        value,
+        optimizer,
+        TrainConfig(lambda_lre=0.02),
+        audio_loss,
+    )
+
+    assert stats.losses["audio"] == stats.losses["audio_base"]
+    assert stats.losses["audio_lre"] > 0
+    assert stats.losses["audio_lre_weighted"] > 0
+    assert stats.total == pytest.approx(
+        stats.losses["audio_base"] + stats.losses["audio_lre_weighted"]
+    )
+    assert stats.losses["pred_lre_db"] > 0
+    assert stats.losses["target_lre_db"] < 0
+
+
 @pytest.mark.parametrize(
     "mode", [BenchmarkMode.JOINT_CONDITIONED, BenchmarkMode.AUDIO_ONLY]
 )

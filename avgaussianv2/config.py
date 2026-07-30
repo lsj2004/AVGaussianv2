@@ -233,6 +233,10 @@ class TrainConfig:
     visual_lr: float = 1e-5
     condition_lr: float = 1e-4
     lambda_audio: float = 1.0
+    lambda_lre: float = 0.0
+    lre_scale_db: float = 6.0
+    lre_epsilon: float = 1e-8
+    lre_smooth_l1_beta: float = 1.0
     lambda_rgb: float = 1.0
     lambda_dssim: float = 0.2
     lambda_visual_anchor: float = 1e-4
@@ -255,6 +259,10 @@ class TrainConfig:
             visual_lr=float(values["visual_lr"]),
             condition_lr=float(values["condition_lr"]),
             lambda_audio=float(values["lambda_audio"]),
+            lambda_lre=float(values["lambda_lre"]),
+            lre_scale_db=float(values["lre_scale_db"]),
+            lre_epsilon=float(values["lre_epsilon"]),
+            lre_smooth_l1_beta=float(values["lre_smooth_l1_beta"]),
             lambda_rgb=float(values["lambda_rgb"]),
             lambda_dssim=float(values["lambda_dssim"]),
             lambda_visual_anchor=float(values["lambda_visual_anchor"]),
@@ -273,6 +281,7 @@ class TrainConfig:
                 raise ValueError(f"train.{name} must be finite and positive")
         for name in (
             "lambda_audio",
+            "lambda_lre",
             "lambda_rgb",
             "lambda_dssim",
             "lambda_visual_anchor",
@@ -280,6 +289,10 @@ class TrainConfig:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"train.{name} must be finite and non-negative")
+        for name in ("lre_scale_db", "lre_epsilon", "lre_smooth_l1_beta"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"train.{name} must be finite and positive")
         if self.lambda_audio == 0 and self.lambda_rgb == 0:
             raise ValueError("train must enable at least one primary loss")
         if self.gradient_probe_interval <= 0:

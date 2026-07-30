@@ -119,6 +119,7 @@ def run_diagnostic(
                 runtime.model,
                 samples[index],
                 warmup_optimizer,
+                runtime.train_config,
                 runtime.audio_loss_fn,
             )
             for index in warmup_indices
