@@ -150,14 +150,25 @@ def test_aligned_manifest_reuses_exact_a_sample_sequence() -> None:
 
 
 def test_architecture_worker_prints_generic_worker_result_keys() -> None:
-    worker = (
+    runner = (
         Path(__file__).resolve().parents[1]
         / "avgaussianv2"
         / "cli"
-        / "benchmark_architecture_worker.py"
+        / "ablation_runner.py"
     ).read_text()
 
-    assert 'result["completed_warmup_steps"]' in worker
-    assert 'result["completed_main_updates"]' in worker
-    assert 'result["warmup_step"]' not in worker
-    assert 'result["main_step"]' not in worker
+    assert 'result["completed_warmup_steps"]' in runner
+    assert 'result["completed_main_updates"]' in runner
+    assert 'result["warmup_step"]' not in runner
+    assert 'result["main_step"]' not in runner
+
+
+def test_architecture_cli_delegates_to_shared_ablation_runner() -> None:
+    cli_dir = Path(__file__).resolve().parents[1] / "avgaussianv2" / "cli"
+    worker = (cli_dir / "benchmark_architecture_worker.py").read_text()
+    evaluator = (cli_dir / "benchmark_architecture_eval.py").read_text()
+
+    assert "run_ablation_worker(" in worker
+    assert 'result_label="strategy"' in worker
+    assert "run_ablation_evaluation(" in evaluator
+    assert 'fixed_system="joint_conditioned"' in evaluator

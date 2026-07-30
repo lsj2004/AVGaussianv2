@@ -82,3 +82,15 @@ def test_repository_cross_configs_are_backend_only_deltas(
 
 def test_causal_evaluation_systems_are_registered_continuations() -> None:
     assert set(CAUSAL_EVALUATION_SYSTEMS) <= EVALUATION_CONTINUATION_SYSTEMS
+
+
+def test_cross_attention_cli_delegates_to_shared_ablation_runner() -> None:
+    cli_dir = ROOT / "avgaussianv2" / "cli"
+    worker = (cli_dir / "benchmark_cross_attention_worker.py").read_text()
+    evaluator = (cli_dir / "benchmark_cross_attention_eval.py").read_text()
+
+    assert "run_ablation_worker(" in worker
+    assert 'result_label="system"' in worker
+    assert "run_ablation_evaluation(" in evaluator
+    assert "system_choices=CAUSAL_EVALUATION_SYSTEMS" in evaluator
+    assert '"require_repository_match": False' in evaluator

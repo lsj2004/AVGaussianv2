@@ -7,6 +7,10 @@ render from the same timestamp and camera. RGB, robustly normalized depth, and a
 are encoded by a small CNN; zero-initialized multi-scale FiLM adapters inject the embedding at
 the AudioGS U-Net encoder and decoder stages.
 
+For a map of the core model, experiment infrastructure, benchmark protocol, and the purpose
+of each active branch, see
+[`docs/codebase-and-branch-guide.zh-CN.md`](docs/codebase-and-branch-guide.zh-CN.md).
+
 ## Upstream models and environment
 
 The checked-in scene files expect these local upstream projects:
