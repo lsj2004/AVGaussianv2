@@ -10,6 +10,8 @@ the AudioGS U-Net encoder and decoder stages.
 For a map of the core model, experiment infrastructure, benchmark protocol, and the purpose
 of each active branch, see
 [`docs/codebase-and-branch-guide.zh-CN.md`](docs/codebase-and-branch-guide.zh-CN.md).
+For a protocol-aware comparison of the results committed across those branches, see
+[`docs/experiment-results-across-branches.zh-CN.md`](docs/experiment-results-across-branches.zh-CN.md).
 
 ## Upstream models and environment
 
