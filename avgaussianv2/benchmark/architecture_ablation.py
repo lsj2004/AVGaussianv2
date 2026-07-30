@@ -354,7 +354,11 @@ def prepare_architecture_run(
         raise FileExistsError(f"architecture protocol already exists: {protocol}")
     protocol.mkdir(parents=True, exist_ok=True)
     resolved = protocol / "resolved_project.yaml"
-    write_resolved_project_config(derived_config, resolved)
+    write_resolved_project_config(
+        derived_config,
+        resolved,
+        relative_path_root=Path(base_config).parent,
+    )
 
     torch.manual_seed(training.seed)
     if torch.cuda.is_available():

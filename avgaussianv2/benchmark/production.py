@@ -629,7 +629,12 @@ class _RetainedExitStack(ExitStack):
         super().__exit__(None, None, None)
 
 
-def write_resolved_project_config(source: Path, destination: Path) -> str:
+def write_resolved_project_config(
+    source: Path,
+    destination: Path,
+    *,
+    relative_path_root: Path | None = None,
+) -> str:
     """Materialize the frozen config with absolute paths.
 
     This prevents a worker's cwd from changing the meaning of a relative
@@ -637,10 +642,11 @@ def write_resolved_project_config(source: Path, destination: Path) -> str:
     """
     audit_protocol_config(source)
     raw = yaml.safe_load(source.read_text(encoding="utf-8"))
+    path_root = source.parent if relative_path_root is None else Path(relative_path_root)
     for name in ("visual_checkpoint", "audio_checkpoint", "manifest", "visual_memmap"):
         value = raw["paths"].get(name)
         if value is not None and not Path(value).is_absolute():
-            raw["paths"][name] = str((source.parent / value).resolve())
+            raw["paths"][name] = str((path_root / value).resolve())
     destination.parent.mkdir(parents=True, exist_ok=True)
     data = yaml.safe_dump(raw, sort_keys=False).encode()
     temporary = destination.with_suffix(destination.suffix + ".tmp")
