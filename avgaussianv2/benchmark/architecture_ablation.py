@@ -333,6 +333,11 @@ def prepare_architecture_run(
             if kind == "audiogs"
             else derived_project.paths.visual_checkpoint
         )
+        configured = (
+            configured
+            if configured.is_absolute()
+            else Path(base_config).parent / configured
+        )
         if (
             contract["inputs"]["protocol_config"]["sha256"]
             != delta["base_config_sha256"]
