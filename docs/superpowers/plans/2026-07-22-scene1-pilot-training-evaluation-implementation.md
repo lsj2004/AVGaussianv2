@@ -1,3 +1,9 @@
+# Archived Implementation Plan
+
+This plan describes the retired Scene1 pilot workflow. Its implementation
+remains available in Git history on `origin/agent/scene1-pilot`; the current
+clean branch uses the strict cam38 benchmark instead.
+
 # Scene1 Pilot Training and Evaluation Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -22,7 +28,6 @@ git worktree add .worktrees/scene1-pilot -b agent/scene1-pilot
 cd .worktrees/scene1-pilot
 git status --short --branch
 ```
-
 Expected: the branch is `agent/scene1-pilot` and the worktree is clean. Perform every remaining
 task and commit from this worktree; do not modify or commit from `main`.
 

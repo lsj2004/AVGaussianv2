@@ -4,9 +4,9 @@
 真实关系，以及阅读代码时如何避开实验编排层的大量跳转。
 
 当前整理分支为 `clean/codebase-structure`，基线是
-`origin/agent/gaussian-token-cross-attention`。这个基线已经包含核心模型、pilot、
-正式 cam38 benchmark、cross-attention 和显式 AudioGS Gaussian token，同时又是
-P1 与 plain U-Net 两个最新实验分支的共同祖先。
+`origin/agent/gaussian-token-cross-attention`。当前主线保留核心模型、正式
+cam38 benchmark、cross-attention 和显式 AudioGS Gaussian token。早期 Scene1
+pilot 已从主线退役，完整实现仍保留在 `origin/agent/scene1-pilot` 的 Git 历史中。
 
 ## 1. 先看结论
 
@@ -131,17 +131,12 @@ flowchart LR
 - `runtime.py`：根据 `model.audio_backend` 选择具体音频和条件编码器。
 - `train.py`：warmup/joint 的冻结、optimizer 和单步损失。
 
-### 4.2 Experiment：快速判断是否值得继续
+### 4.2 Archived pilot：历史快速诊断
 
-`avgaussianv2/experiment/` 和 `cli/pilot*.py` 负责：
-
-- 固定样本序列；
-- `joint_conditioned`、`frozen_visual`、`condition_off` 三变体；
-- quick validation、早停、best/latest checkpoint；
-- full held-out evaluation 和比较报告；
-- 崩溃恢复与产物完整性。
-
-这一层不定义新的基础模型，只管理“如何快速且可信地跑实验”。
+`origin/agent/scene1-pilot` 曾实现单场景三变体、quick validation、早停和
+checkpoint/report 状态机。正式 cam38 benchmark 已覆盖这些生产需求，且仓库没有
+提交 pilot 正式结果，因此当前 clean 主线不再携带该工作流。需要复盘历史设计时，
+查看该分支和 `docs/superpowers/` 下的原始 spec/plan。
 
 ### 4.3 Benchmark：正式协议和证据
 
@@ -243,7 +238,7 @@ architecture/cross-attention compatibility CLI
 8. `avgaussianv2/train.py` 和 `losses.py`
 9. 研究 token 路线时再读 `audio_tokens.py`、`visual_tokens.py`、
    `acoustic_gaussian_tokens.py`、`cross_attention_audio.py`
-10. 最后根据需要进入 `experiment/` 或 `benchmark/`
+10. 最后根据需要进入 `benchmark/`
 
 ## 7. 后续分支治理建议
 

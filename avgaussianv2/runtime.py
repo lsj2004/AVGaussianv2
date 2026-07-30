@@ -46,44 +46,12 @@ def _load_runtime_components() -> tuple[object, ...]:
     )
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class TrainingBundle:
     model: nn.Module
     train_samples: Sequence[AlignedAVSample]
     eval_samples: Sequence[AlignedAVSample] | None
     audio_loss_fn: AudioLoss
-
-    def __init__(
-        self,
-        model: nn.Module,
-        train_samples: Sequence[AlignedAVSample] | None = None,
-        eval_samples: Sequence[AlignedAVSample] | None = None,
-        audio_loss_fn: AudioLoss | None = None,
-        *,
-        samples: Sequence[AlignedAVSample] | None = None,
-    ) -> None:
-        """Create a bundle, accepting the old ``samples=`` seam during migration."""
-        if audio_loss_fn is None and callable(eval_samples):
-            # Original positional form: TrainingBundle(model, samples, loss).
-            audio_loss_fn = eval_samples
-            eval_samples = ()
-        if samples is not None:
-            if train_samples is not None:
-                raise TypeError("pass train_samples or samples, not both")
-            train_samples = samples
-        if train_samples is None:
-            raise TypeError("train_samples is required")
-        if audio_loss_fn is None:
-            raise TypeError("audio_loss_fn is required")
-        object.__setattr__(self, "model", model)
-        object.__setattr__(self, "train_samples", train_samples)
-        object.__setattr__(self, "eval_samples", eval_samples)
-        object.__setattr__(self, "audio_loss_fn", audio_loss_fn)
-
-    @property
-    def samples(self) -> Sequence[AlignedAVSample]:
-        """Compatibility alias for the original training CLI injection API."""
-        return self.train_samples
 
 
 def build_runtime(
@@ -169,7 +137,12 @@ def build_runtime(
     )
     model = model.to(resolved_device)
     criterion = criterion.to(resolved_device)
-    return TrainingBundle(model, train_samples, eval_samples, criterion)
+    return TrainingBundle(
+        model=model,
+        train_samples=train_samples,
+        eval_samples=eval_samples,
+        audio_loss_fn=criterion,
+    )
 
 
 __all__ = ["TrainingBundle", "build_runtime"]

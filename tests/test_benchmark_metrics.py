@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from avgaussianv2.experiment.metrics import (
+from avgaussianv2.benchmark.metrics import (
     aggregate_metrics,
     log_spectral_distance,
     lre_error_db,

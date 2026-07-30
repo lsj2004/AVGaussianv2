@@ -30,7 +30,7 @@ from avgaussianv2.benchmark.evaluation import (
     verify_evaluation,
 )
 from avgaussianv2.benchmark.training import TEST_CAMERA, TRAIN_CAMERAS
-from avgaussianv2.experiment.metrics import aggregate_metrics
+from avgaussianv2.benchmark.metrics import aggregate_metrics
 
 SCENE_SCHEMA = "avgaussianv2.cam38-benchmark-scene-report"
 SUITE_SCHEMA = "avgaussianv2.cam38-benchmark-suite-report"

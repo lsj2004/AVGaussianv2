@@ -40,8 +40,8 @@ from avgaussianv2.benchmark.training import (
     hash_shared_indices,
 )
 from avgaussianv2.contracts import AlignedAVSample
-from avgaussianv2.experiment.evaluation import move_sample
-from avgaussianv2.experiment.metrics import (
+from avgaussianv2.data.tensor import move_sample
+from avgaussianv2.benchmark.metrics import (
     aggregate_metrics,
     log_spectral_distance,
     lre_error_db,

@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import tempfile
 import uuid
 from collections.abc import Mapping
@@ -39,6 +40,16 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def load_json_mapping(path: Path, label: str) -> dict:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        raise ValueError(f"cannot load {label}: {path}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return value
+
+
 def _atomic_file(path: Path, data: bytes) -> None:
     descriptor, name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
@@ -58,6 +69,31 @@ def _atomic_file(path: Path, data: bytes) -> None:
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+
+
+def atomic_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_file(path, data)
+
+
+def repository_identity() -> dict[str, object]:
+    """Return the exact clean Git revision used by an ablation."""
+    root = Path(__file__).resolve().parents[2]
+
+    def git(*arguments: str) -> str:
+        result = subprocess.run(
+            ("git", "-C", str(root), *arguments),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    revision = git("rev-parse", "HEAD")
+    status = git("status", "--porcelain", "--untracked-files=normal")
+    if status:
+        raise RuntimeError("ablation requires a clean tracked/untracked worktree")
+    return {"root": str(root), "commit": revision, "clean": True}
 
 
 def publish_generation(

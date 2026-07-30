@@ -1,3 +1,9 @@
+# Archived Implementation Plan
+
+This plan extends the retired Scene1 pilot workflow. Its implementation remains
+available in Git history on `origin/agent/scene1-pilot`; the current clean branch
+uses the strict cam38 benchmark evidence pipeline instead.
+
 # Worker Evidence Integrity Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

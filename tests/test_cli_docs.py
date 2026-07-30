@@ -39,52 +39,6 @@ def test_readme_documents_required_training_contracts() -> None:
         assert phrase in text
 
 
-def test_readme_documents_scene1_diagnostic_pilot_contract() -> None:
-    text = (ROOT / "README.md").read_text()
-    for phrase in (
-        "scripts/pilot_scene1_opera.sh",
-        "GPUs 0, 1, and 2",
-        "200 condition-warmup steps",
-        "at most 500 joint steps",
-        "every 50 joint steps",
-        "four validations",
-        "0.5% relative improvement",
-        "32 evenly spaced held-out samples",
-        "`cam10`",
-        "imported baseline",
-        "joint conditioned on",
-        "frozen visual",
-        "separately trained condition-off",
-        "`audio_total`",
-        "`audio_mono`",
-        "`audio_diff`",
-        "`waveform_l1`",
-        "`mono_lsd`",
-        "`diff_lsd`",
-        "`lre_error_db`",
-        "`rgb_psnr`",
-        "`rgb_ssim`",
-        "`rgb_l1`",
-        "0.5 dB PSNR",
-        "0.01 SSIM",
-        "on-minus-off median",
-        "audio-to-visual gradient",
-        "report/current",
-        "latest.pt",
-        "best.pt",
-        "--resume",
-        "--verify-only",
-        "--trust-upstream-artifacts",
-        "hashes establish artifact identity, not safety",
-        "resolve against the configuration file's directory",
-        "checkpoint after every completed step",
-        "checkpoint I/O metrics",
-        "never starts a long training run automatically",
-        "`READY` is only a recommendation",
-    ):
-        assert phrase in text
-
-
 def test_real_scene_configs_match_checkpoint_model_family() -> None:
     for name in ("scene1_opera.yaml", "Scene7playing.yaml"):
         config = load_project_config(ROOT / "configs" / name)

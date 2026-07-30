@@ -54,7 +54,7 @@ from avgaussianv2.benchmark.training import (
     make_shared_indices,
 )
 from avgaussianv2.config import load_project_config
-from avgaussianv2.experiment.evaluation import move_sample
+from avgaussianv2.data.tensor import move_sample
 from avgaussianv2.runtime import build_runtime
 
 

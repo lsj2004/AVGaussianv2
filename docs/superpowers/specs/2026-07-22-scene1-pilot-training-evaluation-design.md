@@ -1,3 +1,9 @@
+# Archived Design
+
+This document describes the retired Scene1 pilot workflow. Its implementation
+remains available in Git history on `origin/agent/scene1-pilot`; the current
+clean branch uses the strict cam38 benchmark instead.
+
 # Scene1 Pilot Training and Evaluation Design
 
 ## Scope
@@ -52,7 +58,6 @@ aligned time/camera sample
   -> binaural prediction and RGB render
   -> audio + visual losses
 ```
-
 For imported GS-only AudioGS checkpoints, condition-off remains the native GS-only output.
 Condition-on uses the already implemented residual
 `native + conditioned U-Net - plain U-Net`, preserving the imported function at zero-init.

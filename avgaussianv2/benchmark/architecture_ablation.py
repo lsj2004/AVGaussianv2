@@ -5,8 +5,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import os
-import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -15,9 +13,12 @@ import yaml
 from torch import nn
 
 from avgaussianv2.benchmark.artifacts import (
+    atomic_write,
     canonical_json,
     load_generation,
+    load_json_mapping,
     publish_generation,
+    repository_identity,
 )
 from avgaussianv2.benchmark.assets import audit_protocol_config
 from avgaussianv2.benchmark.native import verify_native_contract
@@ -150,61 +151,6 @@ def build_aligned_worker_manifest(
     return manifest
 
 
-def _load_json_mapping(path: Path, label: str) -> dict:
-    try:
-        value = json.loads(path.read_text())
-    except (OSError, ValueError) as error:
-        raise ValueError(f"cannot load {label}: {path}") from error
-    if not isinstance(value, dict):
-        raise ValueError(f"{label} must be a JSON object")
-    return value
-
-
-def _atomic_write(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        with temporary.open("wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        descriptor = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-
-
-def repository_identity() -> dict[str, object]:
-    """Return the exact clean Git revision used by train and evaluation."""
-    root = Path(__file__).resolve().parents[2]
-
-    def git(*arguments: str) -> str:
-        result = subprocess.run(
-            ("git", "-C", str(root), *arguments),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        return result.stdout.strip()
-
-    revision = git("rev-parse", "HEAD")
-    status = git("status", "--porcelain", "--untracked-files=normal")
-    if status:
-        raise RuntimeError(
-            "architecture experiment requires a clean tracked/untracked worktree"
-        )
-    return {
-        "root": str(root),
-        "commit": revision,
-        "clean": True,
-    }
-
-
 def verify_architecture_preparation(
     protocol_dir: Path,
     *,
@@ -275,7 +221,7 @@ def prepare_architecture_run(
     base_manifest_path = (
         Path(base_protocol_dir) / "worker_manifests" / "joint_conditioned.json"
     )
-    base_manifest = _load_json_mapping(base_manifest_path, "base A worker manifest")
+    base_manifest = load_json_mapping(base_manifest_path, "base A worker manifest")
     base_compatibility = BenchmarkCompatibility.from_mapping(
         base_manifest["compatibility"]
     )
@@ -289,7 +235,7 @@ def prepare_architecture_run(
     if hash_shared_indices(shared_indices) != base_compatibility.index_sha256:
         raise ValueError("base A worker sample sequence hash mismatch")
 
-    base_preparation = _load_json_mapping(
+    base_preparation = load_json_mapping(
         Path(base_protocol_dir) / "preparation.json", "base A preparation"
     )
     base_runtime = base_preparation.get("runtime")
@@ -403,7 +349,7 @@ def prepare_architecture_run(
     )
     manifest_path = protocol / "worker_manifest.json"
     manifest_bytes = canonical_json(manifest)
-    _atomic_write(manifest_path, manifest_bytes)
+    atomic_write(manifest_path, manifest_bytes)
 
     evidence = {
         "schema": PREPARATION_SCHEMA,
@@ -441,7 +387,7 @@ def prepare_architecture_run(
         },
     }
     evidence_bytes = canonical_json(evidence)
-    _atomic_write(protocol / "preparation.json", evidence_bytes)
+    atomic_write(protocol / "preparation.json", evidence_bytes)
     publish_generation(
         protocol / "immutable",
         schema=PREPARATION_SCHEMA,

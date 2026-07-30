@@ -15,7 +15,7 @@ from torch import Tensor, nn
 from avgaussianv2.checkpoint import build_checkpoint_state, save_checkpoint
 from avgaussianv2.config import ProjectConfig, load_project_config
 from avgaussianv2.contracts import AlignedAVSample
-from avgaussianv2.experiment.evaluation import move_sample
+from avgaussianv2.data.tensor import DeviceSampleSequence
 from avgaussianv2.runtime import TrainingBundle, build_runtime
 from avgaussianv2.train import TrainStepStats, run_condition_warmup, run_joint_finetune
 
@@ -37,20 +37,6 @@ class TrainingResult:
 
 
 BackendFactory = Callable[[ProjectConfig, torch.device], TrainingBundle]
-
-
-class _DeviceSampleSequence(Sequence[AlignedAVSample]):
-    def __init__(self, samples: Sequence[AlignedAVSample], device: torch.device) -> None:
-        self.samples = samples
-        self.device = device
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, index):
-        if isinstance(index, slice):
-            return [move_sample(sample, self.device) for sample in self.samples[index]]
-        return move_sample(self.samples[index], self.device)
 
 
 def seed_everything(seed: int) -> None:
@@ -233,7 +219,7 @@ def run_training(
         if not hasattr(bundle.model, "condition_enabled"):
             raise TypeError("condition-off ablation requires AVGaussianFusionV2")
         bundle.model.condition_enabled = False
-    samples = _DeviceSampleSequence(bundle.train_samples, resolved_device)
+    samples = DeviceSampleSequence(bundle.train_samples, resolved_device)
     warmup_count = config.train.warmup_steps if warmup_steps is None else warmup_steps
     joint_count = config.train.joint_steps if joint_steps is None else joint_steps
     history: list[dict] = []

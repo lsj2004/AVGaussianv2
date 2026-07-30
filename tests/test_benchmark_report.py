@@ -23,7 +23,7 @@ from avgaussianv2.benchmark.report import (
     build_suite_report,
     load_report,
 )
-from avgaussianv2.experiment.metrics import aggregate_metrics
+from avgaussianv2.benchmark.metrics import aggregate_metrics
 
 
 def _sha(value: str) -> str:

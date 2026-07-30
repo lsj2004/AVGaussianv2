@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import os
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -13,14 +12,14 @@ from pathlib import Path
 import torch
 import yaml
 
-from avgaussianv2.benchmark.architecture_ablation import (
-    build_aligned_worker_manifest,
-    repository_identity,
-)
+from avgaussianv2.benchmark.architecture_ablation import build_aligned_worker_manifest
 from avgaussianv2.benchmark.artifacts import (
+    atomic_write,
     canonical_json,
     load_generation,
+    load_json_mapping,
     publish_generation,
+    repository_identity,
 )
 from avgaussianv2.benchmark.assets import audit_protocol_config
 from avgaussianv2.benchmark.native import verify_native_contract
@@ -60,35 +59,6 @@ def _load_yaml(path: Path) -> dict:
     if not isinstance(value, Mapping):
         raise ValueError(f"cross-attention config {path} must be a mapping")
     return copy.deepcopy(dict(value))
-
-
-def _load_json(path: Path, label: str) -> dict:
-    try:
-        value = json.loads(path.read_text())
-    except (OSError, ValueError) as error:
-        raise ValueError(f"cannot load {label}: {path}") from error
-    if not isinstance(value, dict):
-        raise ValueError(f"{label} must be a JSON object")
-    return value
-
-
-def _atomic_write(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        with temporary.open("wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        descriptor = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
 
 
 def validate_backend_only_delta(
@@ -184,7 +154,7 @@ def prepare_cross_attention_run(
     base_manifest_path = (
         Path(base_protocol_dir) / "worker_manifests" / "joint_conditioned.json"
     )
-    base_manifest = _load_json(base_manifest_path, "base A worker manifest")
+    base_manifest = load_json_mapping(base_manifest_path, "base A worker manifest")
     base_compatibility = BenchmarkCompatibility.from_mapping(
         base_manifest["compatibility"]
     )
@@ -198,7 +168,7 @@ def prepare_cross_attention_run(
     if hash_shared_indices(shared_indices) != base_compatibility.index_sha256:
         raise ValueError("base A sample sequence hash mismatch")
 
-    base_preparation = _load_json(
+    base_preparation = load_json_mapping(
         Path(base_protocol_dir) / "preparation.json",
         "base A preparation",
     )
@@ -320,7 +290,7 @@ def prepare_cross_attention_run(
         config=training,
     )
     worker_bytes = canonical_json(worker_manifest)
-    _atomic_write(protocol / "worker_manifest.json", worker_bytes)
+    atomic_write(protocol / "worker_manifest.json", worker_bytes)
 
     evidence = {
         "schema": PREPARATION_SCHEMA,
@@ -384,7 +354,7 @@ def prepare_cross_attention_run(
         "causal_evaluation_systems": list(CAUSAL_EVALUATION_SYSTEMS),
     }
     evidence_bytes = canonical_json(evidence)
-    _atomic_write(protocol / "preparation.json", evidence_bytes)
+    atomic_write(protocol / "preparation.json", evidence_bytes)
     publish_generation(
         protocol / "immutable",
         schema=PREPARATION_SCHEMA,

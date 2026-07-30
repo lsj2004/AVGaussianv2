@@ -17,6 +17,8 @@ For side-by-side Mermaid diagrams of every evaluated model architecture, see
 The previously published cam38 numbers predate the held-out visual-time fix. Before running
 or interpreting new experiments, follow
 [`docs/post-visual-time-fix-rerun-plan.zh-CN.md`](docs/post-visual-time-fix-rerun-plan.zh-CN.md).
+The retired pilot workflow and retained benchmark boundaries are documented in
+[`docs/code-cleanup-summary.zh-CN.md`](docs/code-cleanup-summary.zh-CN.md).
 
 ## Upstream models and environment
 
@@ -99,78 +101,6 @@ scripts/smoke_Scene7playing.sh
 Each command performs one condition warmup step and one joint fine-tuning step, then verifies
 finite losses, required files, and that condition-on audio differs from condition-off audio.
 Override only the output root with `AVGAUSSIANV2_OUTPUT=/absolute/path`.
-
-## Scene1 diagnostic pilot
-
-The bounded Scene1 diagnostic is launched with:
-
-```bash
-scripts/pilot_scene1_opera.sh
-```
-
-It uses GPUs 0, 1, and 2 and runs three training variants: joint conditioned, frozen visual,
-and condition off. The defaults are 200 condition-warmup steps and at most 500 joint steps,
-with quick validation every 50 joint steps. Early stopping starts only after 200 joint steps
-and requires four validations without at least 0.5% relative improvement. Quick validation
-uses 32 evenly spaced held-out samples; the final comparison evaluates the full held-out
-`cam10` split.
-
-The report contains five systems: imported baseline, joint conditioned on, the same joint
-checkpoint evaluated with conditioning off, frozen visual with conditioning on, and the
-separately trained condition-off system. It reports ten metrics and their directions:
-`audio_total`, `audio_mono`, `audio_diff`, `waveform_l1`, `mono_lsd`, `diff_lsd`,
-`lre_error_db`, and `rgb_l1` are lower-is-better; `rgb_psnr` and `rgb_ssim` are
-higher-is-better. The long-training recommendation is `READY` only when the joint worker's
-quick-best visual result stays within 0.5 dB PSNR and 0.01 SSIM of its baseline, the
-conditioned full-split `audio_total` mean beats the paired condition-off evaluation, the
-paired on-minus-off median is negative, and the audio-to-visual gradient is strictly
-positive. Mean, median, and gradient gates are distinct; full-split visual feasibility and
-the other system comparisons are descriptive.
-
-Runtime state is written under `runs/pilot_scene1_opera/`: `logs/` contains baseline, worker,
-and evaluation logs; `workers/<variant>/latest.pt` is the exact-resume checkpoint and
-`best.pt` is the selected quick-validation checkpoint. The authoritative report is the
-generation referenced by `report/current`; its `comparison.json`, `comparison.csv`, and
-`comparison.md` must agree with `status.json`. Resume a compatible partial run with:
-
-```bash
-AVGAUSSIANV2_PYTHON=/path/to/python python -m avgaussianv2.cli.pilot \
-  --config configs/scene1_opera.yaml \
-  --output-dir runs/pilot_scene1_opera \
-  --gpus 0,1,2 \
-  --resume \
-  --trust-upstream-artifacts
-```
-
-Verify an already complete run without launching runtime or GPU processes with:
-
-```bash
-AVGAUSSIANV2_PYTHON=/path/to/python python -m avgaussianv2.cli.pilot \
-  --config configs/scene1_opera.yaml \
-  --output-dir runs/pilot_scene1_opera \
-  --gpus 0,1,2 \
-  --verify-only
-```
-
-The production worker requires `--trust-upstream-artifacts`. FreeTimeGS++ and AudioGS are
-loaded through the configured Python interpreter, and their legacy checkpoints may execute
-code while being deserialized. SHA-256 hashes establish artifact identity, not safety: use
-this flag only for known local upstream roots and checkpoints. The legacy `train` command
-preserves its old implicit trusted-loading behavior for compatibility.
-
-Configuration paths that are relative now resolve against the configuration file's directory,
-not the caller's current working directory. Existing configs that relied on the old working
-directory behavior must migrate their relative paths.
-
-Workers checkpoint after every completed step so resume restores the exact model, optimizer,
-selector, stopper, RNG, and progress state. This improves failure recovery but can create
-substantial write amplification for large Gaussian checkpoints. Provision disk space and
-inspect the report's checkpoint I/O metrics (`save_count`, bytes, duration, backup-copy
-counts/bytes/duration, and failures) and any durability warnings.
-
-The pilot never starts a long training run automatically. `READY` is only a recommendation;
-review the metrics, logs, I/O cost, and durability warnings before separately authorizing a
-long run.
 
 ## Dual-dataset cam38 benchmark
 

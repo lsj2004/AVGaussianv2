@@ -36,6 +36,7 @@ from avgaussianv2.config import (
 from avgaussianv2.models.fusion import AVGaussianFusionV2
 from avgaussianv2.models.rgbd import RGBDConditionEncoder
 from avgaussianv2.contracts import AlignedAVSample
+from avgaussianv2.data.tensor import DeviceSampleSequence
 
 
 def test_benchmark_worker_moves_every_training_sample_tensor_to_device() -> None:
@@ -54,7 +55,7 @@ def test_benchmark_worker_moves_every_training_sample_tensor_to_device() -> None
         image_size=(2, 3),
     )
 
-    moved = benchmark_worker._DeviceSampleSequence(
+    moved = DeviceSampleSequence(
         (sample,), torch.device("meta")
     )[0]
 

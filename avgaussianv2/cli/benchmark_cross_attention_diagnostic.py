@@ -18,7 +18,7 @@ from avgaussianv2.benchmark.cross_attention_ablation import (
 )
 from avgaussianv2.benchmark.runtime import BenchmarkRuntime, build_production_runtime
 from avgaussianv2.benchmark.training import make_shared_indices
-from avgaussianv2.cli.benchmark_worker import _DeviceSampleSequence
+from avgaussianv2.data.tensor import DeviceSampleSequence
 from avgaussianv2.losses import capture_visual_anchor
 from avgaussianv2.train import (
     build_joint_optimizer,
@@ -96,7 +96,7 @@ def run_diagnostic(
     if not isinstance(runtime, BenchmarkRuntime):
         raise TypeError("diagnostic runtime must be BenchmarkRuntime")
     with runtime:
-        samples = _DeviceSampleSequence(runtime.train_samples, device)
+        samples = DeviceSampleSequence(runtime.train_samples, device)
         warmup_indices = make_shared_indices(len(samples), steps, seed)
         main_indices = tuple(worker_manifest["shared_indices"][:steps])
         probe = samples[main_indices[0]]

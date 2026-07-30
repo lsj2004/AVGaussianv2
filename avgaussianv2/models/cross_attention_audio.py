@@ -9,7 +9,7 @@ from torch import Tensor, nn
 from avgaussianv2.backends.audio_audiogs import (
     AudioCheckpointError,
     ModelFactory,
-    _upstream_model_factory,
+    _load_audiogs_model,
     build_audiogs_criterion,
 )
 from avgaussianv2.models.acoustic_gaussian_tokens import (
@@ -271,36 +271,12 @@ class AudioVisualTokenAudioBackend(nn.Module):
                 "cross-attention backend requires Audio3DGSMonoDiffGSOnly "
                 "so its base prediction is guaranteed to come from AudioGS gaussians"
             )
-        checkpoint_path = Path(checkpoint)
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(
-                f"AudioGS checkpoint does not exist: {checkpoint_path}"
-            )
-        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        if not isinstance(payload, dict) or "model_state_dict" not in payload:
-            raise AudioCheckpointError("AudioGS checkpoint is missing model_state_dict")
-        if model_factory is None:
-            if upstream_root is None:
-                raise AudioCheckpointError(
-                    "upstream_root is required when model_factory is not provided"
-                )
-            model_factory = _upstream_model_factory(Path(upstream_root), model_class)
-        checkpoint_config = payload.get("cfg")
-        model = model_factory(checkpoint_config)
-        if not isinstance(model, nn.Module):
-            raise AudioCheckpointError("AudioGS model factory must return a torch module")
-        if not hasattr(model, "renderer"):
-            raise AudioCheckpointError("AudioGS model is missing renderer")
-        checkpoint_state = dict(payload["model_state_dict"])
-        initialized_state = model.state_dict()
-        for cache_name in (
-            "static_source_mag",
-            "static_phase_L",
-            "static_phase_R",
-        ):
-            if cache_name in checkpoint_state and cache_name in initialized_state:
-                checkpoint_state[cache_name] = initialized_state[cache_name]
-        model.load_state_dict(checkpoint_state, strict=True)
+        model, checkpoint_config, checkpoint_path = _load_audiogs_model(
+            checkpoint,
+            model_factory=model_factory,
+            upstream_root=upstream_root,
+            model_class=model_class,
+        )
         return cls(
             model,
             checkpoint_path,

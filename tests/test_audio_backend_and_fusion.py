@@ -276,7 +276,7 @@ def test_gs_only_bridge_forces_inherited_unet_forward() -> None:
         source_path=Path("audio.pth"),
         forward_override=TinyGSOnlyAudioModel.inherited_unet_forward,
     )
-    source = torch.randn(1, 2, 32)
+    source = torch.randn(1, 2, 32, generator=torch.Generator().manual_seed(11))
     pose = torch.zeros(1, 12)
 
     native_gs_only = model(pose, source)
@@ -306,7 +306,7 @@ def _gs_only_backend(strategy: AudioRenderStrategy) -> AudioGSBackend:
 
 def test_direct_conditioned_unet_replaces_gs_only_output() -> None:
     backend = _gs_only_backend(AudioRenderStrategy.DIRECT_CONDITIONED_UNET)
-    source = torch.randn(1, 2, 32)
+    source = torch.randn(1, 2, 32, generator=torch.Generator().manual_seed(7))
     pose = torch.zeros(1, 12)
     condition = torch.ones(1, 8)
 

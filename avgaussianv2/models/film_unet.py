@@ -29,7 +29,6 @@ def _block_output_channels(block: nn.Module, name: str) -> int:
 
 
 class FiLMConditionedAudioUNet(nn.Module):
-    _BLOCK_NAMES = ("e1", "e2", "e3", "e4", "d4", "d3", "d2", "d1")
     _BASE_BLOCKS = {
         "e1": "enc1",
         "e2": "enc2",

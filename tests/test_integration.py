@@ -100,7 +100,12 @@ def fake_backend_factory(config, device):
     def audio_loss(predicted, target):
         return {"total_loss": torch.nn.functional.mse_loss(predicted, target)}
 
-    return TrainingBundle(model=model, samples=[sample()], audio_loss_fn=audio_loss)
+    return TrainingBundle(
+        model=model,
+        train_samples=[sample()],
+        eval_samples=None,
+        audio_loss_fn=audio_loss,
+    )
 
 
 def test_cpu_warmup_then_joint_smoke_writes_reproducible_artifacts(tmp_path) -> None:
