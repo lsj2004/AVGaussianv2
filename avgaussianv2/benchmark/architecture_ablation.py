@@ -288,6 +288,10 @@ def prepare_architecture_run(
 
     base_project = load_project_config(base_config)
     derived_project = load_project_config(derived_config)
+    derived_raw = _load_yaml_mapping(derived_config)
+    derived_paths = derived_raw.get("paths")
+    if not isinstance(derived_paths, Mapping):
+        raise ValueError("derived paths config must be a mapping")
     if base_project.scene.scene_id != derived_project.scene.scene_id:
         raise ValueError("base and derived architecture scenes differ")
     scene_id = derived_project.scene.scene_id
@@ -328,10 +332,10 @@ def prepare_architecture_run(
         contract = native_verifier(
             contract_dir, expected_scene=scene_id, expected_model_kind=kind
         )
-        configured = (
-            derived_project.paths.audio_checkpoint
+        configured = Path(
+            derived_paths["audio_checkpoint"]
             if kind == "audiogs"
-            else derived_project.paths.visual_checkpoint
+            else derived_paths["visual_checkpoint"]
         )
         configured = (
             configured
