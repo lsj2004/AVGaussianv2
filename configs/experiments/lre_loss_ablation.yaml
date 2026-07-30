@@ -3,6 +3,14 @@ version: 1
 objective: >
   Test whether a sign-sensitive left/right energy-ratio loss reduces held-out
   LRE without materially degrading the native AudioGS reconstruction metrics.
+execution_policy:
+  mode: priority_driven_dynamic_pruning
+  candidate_matrix_is_upper_bound: true
+  gpu_count_expected: 2
+  gpu_memory_gb: 48
+  initial_processes_per_gpu: 2
+  max_processes_per_gpu: 4
+  multi_seed_priority: last
 
 base_configs:
   scene1_opera: ../benchmark_cam38/scene1_opera.yaml
@@ -31,7 +39,7 @@ screening:
   seeds: [42]
   lambda_lre: [0.0, 0.01, 0.02, 0.05]
   report_steps: [5000]
-  keep_nonzero_candidates: 2
+  keep_nonzero_candidates_max: 2
   selection:
     unit: scene_system
     candidates_must_be_nonzero: true
@@ -42,9 +50,8 @@ screening:
       - macro_lre_error_db_ascending
       - lambda_lre_ascending
     fallback: >
-      Always select exactly two nonzero candidates using the full ranking, even
-      when fewer than two pass every gate. Record gate failures; selection does
-      not make a failed candidate acceptable.
+      Select at most two nonzero candidates. Select fewer, or none, when the
+      remaining candidates fail the guardrails or are dominated.
   gates:
     both_scenes_required: true
     all_systems_required: true
@@ -54,7 +61,7 @@ screening:
     nonfinite_samples_max: 0
 
 confirmation:
-  seeds: [17, 42, 73]
+  seeds: [42]
   lambda_lre:
     source: screening_winners_plus_zero
   report_steps: [5000, 10000, 30000]
@@ -69,6 +76,13 @@ confirmation:
     bootstrap_confidence: 0.95
     bootstrap_resamples: 10000
     nonfinite_samples_max: 0
+
+robustness:
+  priority: last
+  seeds: [17, 73]
+  lambda_lre:
+    source: final_survivor_plus_zero
+  report_steps: [30000]
 
 reporting:
   primary_metric: lre_error_db
@@ -104,10 +118,12 @@ reporting:
     resamples: 10000
   expected_counts:
     reference_baseline_rows: 846
-    screening_training_runs: 16
-    confirmation_training_runs: 36
-    screening_per_sample_rows: 3384
-    confirmation_per_sample_rows: 22842
+    screening_training_runs_max: 16
+    confirmation_training_runs_max: 12
+    robustness_training_runs_max: 16
+    screening_per_sample_rows_max: 3384
+    confirmation_per_sample_rows_max: 7614
+    robustness_per_sample_rows_max: 3384
 
 output:
   generated_configs: ../../configs/generated/lre_loss_ablation

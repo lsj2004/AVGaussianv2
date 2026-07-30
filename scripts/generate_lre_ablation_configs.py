@@ -93,10 +93,10 @@ def _selection_weights(
     ):
         raise ValueError("screening winner file does not bind the generated manifest")
     selected = tuple(float(value) for value in selection["selected_lambda_lre"])
-    expected_count = int(screening["keep_nonzero_candidates"])
-    if len(selected) != expected_count or len(set(selected)) != len(selected):
+    maximum_count = int(screening["keep_nonzero_candidates_max"])
+    if len(selected) > maximum_count or len(set(selected)) != len(selected):
         raise ValueError(
-            f"winner file must contain {expected_count} unique nonzero weights"
+            f"winner file may contain at most {maximum_count} unique nonzero weights"
         )
     if any(value == 0.0 or value not in available for value in selected):
         raise ValueError("winner weights must be nonzero screening candidates")

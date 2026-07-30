@@ -94,9 +94,9 @@ def test_confirmation_requires_winners_bound_to_screening_manifest(
         winners_path=winners,
     )
 
-    assert len(generated["configs"]) == 18
-    assert len(generated["runs"]) == 36
-    assert {record["seed"] for record in generated["runs"]} == {17, 42, 73}
+    assert len(generated["configs"]) == 6
+    assert len(generated["runs"]) == 12
+    assert {record["seed"] for record in generated["runs"]} == {42}
     assert {record["lambda_lre"] for record in generated["runs"]} == {
         0.0,
         0.01,
@@ -118,7 +118,50 @@ def test_confirmation_requires_winners_bound_to_screening_manifest(
     )
 
 
-def test_confirmation_rejects_unbound_or_invalid_winners(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("selected", "expected_configs", "expected_runs", "expected_weights"),
+    [
+        ([], 2, 4, {0.0}),
+        ([0.02], 4, 8, {0.0, 0.02}),
+    ],
+)
+def test_confirmation_supports_dynamic_survivor_count(
+    tmp_path: Path,
+    selected: list[float],
+    expected_configs: int,
+    expected_runs: int,
+    expected_weights: set[float],
+) -> None:
+    module = _load_generator()
+    module.generate(_manifest(), tmp_path, stage="screening")
+    screening_manifest = tmp_path / "screening/manifest.json"
+    winners = tmp_path / "winners.json"
+    winners.write_text(
+        json.dumps(
+            {
+                "schema": "avgaussianv2.lre-loss-screening-selection",
+                "version": 1,
+                "source_screening_manifest_sha256": hashlib.sha256(
+                    screening_manifest.read_bytes()
+                ).hexdigest(),
+                "selected_lambda_lre": selected,
+            }
+        )
+    )
+
+    generated = module.generate(
+        _manifest(),
+        tmp_path,
+        stage="confirmation",
+        winners_path=winners,
+    )
+
+    assert len(generated["configs"]) == expected_configs
+    assert len(generated["runs"]) == expected_runs
+    assert {record["lambda_lre"] for record in generated["runs"]} == expected_weights
+
+
+def test_confirmation_rejects_unbound_or_too_many_winners(tmp_path: Path) -> None:
     module = _load_generator()
     module.generate(_manifest(), tmp_path, stage="screening")
     winners = tmp_path / "winners.json"
@@ -128,12 +171,33 @@ def test_confirmation_rejects_unbound_or_invalid_winners(tmp_path: Path) -> None
                 "schema": "avgaussianv2.lre-loss-screening-selection",
                 "version": 1,
                 "source_screening_manifest_sha256": "0" * 64,
-                "selected_lambda_lre": [0.0, 0.02],
+                "selected_lambda_lre": [0.01, 0.02],
             }
         )
     )
 
     with pytest.raises(ValueError, match="does not bind"):
+        module.generate(
+            _manifest(),
+            tmp_path,
+            stage="confirmation",
+            winners_path=winners,
+        )
+
+    screening_manifest = tmp_path / "screening/manifest.json"
+    winners.write_text(
+        json.dumps(
+            {
+                "schema": "avgaussianv2.lre-loss-screening-selection",
+                "version": 1,
+                "source_screening_manifest_sha256": hashlib.sha256(
+                    screening_manifest.read_bytes()
+                ).hexdigest(),
+                "selected_lambda_lre": [0.01, 0.02, 0.05],
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="at most 2"):
         module.generate(
             _manifest(),
             tmp_path,
