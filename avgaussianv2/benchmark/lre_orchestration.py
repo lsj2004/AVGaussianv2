@@ -324,6 +324,7 @@ def build_lre_pipelines(
                     / str(evaluation_system)
                     / f"step_{int(step):06d}"
                 )
+                evaluation.parent.mkdir(parents=True, exist_ok=True)
                 command = [
                     python_executable,
                     "-m",

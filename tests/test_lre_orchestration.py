@@ -243,6 +243,12 @@ def test_architecture_pipeline_schedules_main_and_causal_evaluations(tmp_path):
     assert stages[3].command[stages[3].command.index("--output-dir") + 1].endswith(
         "evaluations/query_dependent_p1_no_rgbd/step_005000"
     )
+    assert (
+        pipelines[0].run_dir / "evaluations/query_dependent_p1_no_rgbd"
+    ).is_dir()
+    assert (
+        pipelines[0].run_dir / "evaluations/query_dependent_p1_wrong_camera"
+    ).is_dir()
 
 
 def test_lre_manifest_and_gpu_preflight_fail_closed(tmp_path):
