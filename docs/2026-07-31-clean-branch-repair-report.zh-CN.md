@@ -67,6 +67,7 @@
 - Native 合同不再绑定 continuation-only 字段的完整 YAML SHA。新增 Native-affecting 投影：保留场景、路径、模型、`train.crop_seconds` 和 Native 预算，排除 continuation 优化器/损失、seed、步数、warmup 和报告里程碑；因此 seed/LRE continuation 变体可以安全复用同一份经过验证的 AudioGS/FTGS++ Native 合同，架构、裁剪长度或资产变化仍会被拒绝。
 - resolved config 即使自身能通过资产审计，也必须验证 origin 合同、原始配置 SHA 和 resolved SHA，修复了绝对路径物化后错误使用 resolved SHA 充当 source SHA 的问题。
 - Source Audio 的 Hilbert envelope 在 FFT 前显式物化连续张量，修复 PyTorch/oneMKL 对 `expand` 零步长布局报错而导致 `paper_env` 无法计算的问题。
+- 真实暂停恢复 smoke 进一步发现 rolling checkpoint 删除后，sidecar 仍保留已删除文件名。写入顺序现改为先淘汰旧 checkpoint，再原子发布仅包含实际保留文件的 committed inventory；否则严格恢复验证会拒绝有效暂停目录。
 
 精确暂停/恢复单测验证了：3 步暂停后从同一 checkpoint 恢复至 6 步，不重启、不改合同、最终状态与连续执行一致。Native 投影测试验证 seed/LRE 变化可复用合同，而模型配置变化必然改变投影。
 
@@ -111,7 +112,24 @@ python -m avgaussianv2.cli.benchmark_film_causal_report \
 - Bash 语法检查：通过。
 - `git diff --check`：通过。
 - P0 定向单元/合同测试：88 项通过。
-- 全量单元/合同测试：375 项通过（37.13 秒）；包括任意 seed、精确暂停/恢复、Native 投影、30k/5k LRE 合同，以及 Source Audio 论文指标。
+- 全量单元/合同测试：375 项通过（最终复跑 37.46 秒）；包括任意 seed、精确暂停/恢复、Native 投影、30k/5k LRE 合同，以及 Source Audio 论文指标。
 - 两份真实 scene1 配置（seed 42、73）均通过资产审计，且其 Native-affecting 投影与现有 AudioGS Native 合同一致。
 
-未执行真实 30k GPU 训练。本报告证明代码与实验合同闭环，不把单元测试冒充实验结果；新结果必须按修复后的协议重新运行。两个短 GPU smoke 已完成配置与 Native 合同预检，但当前 Codex GPU 提权审批服务中断，尚未进入 CUDA runtime；因此不能把准备失败误报为 smoke 通过。
+## 6. 真实 GPU smoke
+
+执行环境：NVIDIA RTX 5880 Ada 48GB，FTGS++ Python、PyTorch 2.9.1+cu128、gsplat、tiny-cuda-nn。执行时物理 GPU 1 被其他任务占用 46.1GB 且利用率 100%，因此没有争抢；以下两条 smoke 均在空闲物理 GPU 2 上顺序执行。
+
+| smoke | seed | 30k 合同 | 实际路径 | 结果 |
+|---|---:|---|---|---|
+| 暂停/恢复 | 42 | 保持 | `0→100→200→300` | 每次精确恢复，最终 `resumed_from_main_step=200`、`redone_main_updates=0` |
+| 多 seed / Native 复用 | 73 | 保持 | `0→100` | AudioGS/FTGS++ Native 合同投影匹配并成功训练 |
+
+最终只读核验结果：
+
+- 两个目录均通过 `verify_resume_artifacts`，checkpoint 内容、SHA、progress、sidecar committed inventory 和 fingerprint 一致。
+- seed 42 保留 `main_step_000200.pt` 与 `main_step_000300.pt`，精确进度为 300。
+- seed 73 保留 `main_step_000000.pt` 与 `main_step_000100.pt`，精确进度为 100。
+- 两个 smoke 均为 `selection=paused`，且均不存在 `final.pt`，不会进入正式结果汇总。
+- seed 42 三次恢复的 runtime contract SHA-256 始终为 `6812100985def93ef11f9976dc2c95b9045f54793a256eccc02a3b2e0d927c6d`。
+
+未执行真实 30k GPU 训练。smoke 证明真实 CUDA、Native 合同复用、非默认 seed、精确暂停和无重做恢复链路闭环；正式性能结论仍必须按修复后的协议重新运行。

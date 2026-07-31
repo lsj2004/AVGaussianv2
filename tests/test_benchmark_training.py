@@ -488,6 +488,8 @@ def test_atomic_final_milestones_retention_and_io_counters(tmp_path) -> None:
     ]
     periodic = sorted(path.name for path in (tmp_path / "checkpoints").iterdir())
     assert periodic == ["main_step_000005.pt", "main_step_000006.pt"]
+    sidecar = json.loads((tmp_path / "checkpoint_io.json").read_text())
+    assert sorted(sidecar["committed_checkpoints"]) == periodic
     assert result.io.checkpoint_writes >= 6
     assert result.io.checkpoint_bytes > 0
     assert result.io.journal_writes >= 6

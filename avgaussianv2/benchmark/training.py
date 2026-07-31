@@ -1349,19 +1349,22 @@ class FixedBudgetTrainer:
                 int(path.stem.rsplit("_", 1)[1]),
             ),
         )
+        # Milestones have their own immutable copies.  Retire stale rolling
+        # checkpoints before publishing the authoritative committed inventory;
+        # otherwise the sidecar names files that no longer exist and strict
+        # resume verification rejects an otherwise valid pause.
+        for stale in periodic[:-2]:
+            stale.unlink()
+        retained = periodic[-2:]
         _persist_io_sidecar(
             output,
             fingerprint["sha256"],
             io_counters,
             committed_checkpoints={
                 path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-                for path in periodic
+                for path in retained
             },
         )
-        # Milestones have their own immutable copies.  The rolling directory
-        # therefore contains only the newest exact point and its predecessor.
-        for stale in periodic[:-2]:
-            stale.unlink()
 
     def run(
         self,
