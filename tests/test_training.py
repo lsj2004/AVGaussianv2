@@ -165,6 +165,39 @@ def test_audio_objective_keeps_base_metric_separate_from_lre_regularizer() -> No
     assert parts["target_lre_db"] > 0
 
 
+def test_zero_lre_weight_matches_legacy_loss_gradient_and_updates() -> None:
+    target = torch.stack(
+        (torch.full((32,), 0.7), torch.full((32,), 0.2)), dim=0
+    ).unsqueeze(0)
+    legacy = nn.Parameter(torch.stack((target[:, 1], target[:, 0]), dim=1))
+    current = nn.Parameter(legacy.detach().clone())
+    legacy_optimizer = torch.optim.SGD([legacy], lr=0.03)
+    current_optimizer = torch.optim.SGD([current], lr=0.03)
+
+    for _ in range(10):
+        legacy_optimizer.zero_grad(set_to_none=True)
+        legacy_loss = audio_loss(legacy, target)["total_loss"]
+        legacy_loss.backward()
+        legacy_gradient = legacy.grad.detach().clone()
+        legacy_optimizer.step()
+
+        current_optimizer.zero_grad(set_to_none=True)
+        current_loss, parts = compute_audio_objective(
+            current,
+            target,
+            weights=JointLossWeights(audio=1.0, lre=0.0),
+            audio_loss_fn=audio_loss,
+        )
+        current_loss.backward()
+        current_gradient = current.grad.detach().clone()
+        current_optimizer.step()
+
+        torch.testing.assert_close(current_loss, legacy_loss, rtol=0, atol=0)
+        torch.testing.assert_close(parts["audio_lre_weighted"], torch.zeros(()))
+        torch.testing.assert_close(current_gradient, legacy_gradient, rtol=0, atol=0)
+        torch.testing.assert_close(current, legacy, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     ("criterion", "error", "message"),
     [
