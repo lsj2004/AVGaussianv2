@@ -4,10 +4,17 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+# Keep the documented ``python scripts/...`` entry point working in production
+# environments where the repository itself is not installed as a package.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from avgaussianv2.benchmark.architecture_ablation import (
     validate_strategy_only_delta,
@@ -18,7 +25,6 @@ from avgaussianv2.benchmark.cross_attention_ablation import (
 )
 
 
-ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_STRICT_RUN_ROOT = (ROOT / "runs/cam38_strict").resolve()
 FILM_EVALUATION_SYSTEMS = (
     "joint_conditioned",
