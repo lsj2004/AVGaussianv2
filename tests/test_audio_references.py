@@ -1,5 +1,6 @@
 import hashlib
 import json
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -8,12 +9,36 @@ import torch
 import yaml
 
 from avgaussianv2.benchmark.audio_references import (
+    CDPAMMetric,
     evaluate_reference_baselines,
     paper_audio_metrics,
     reference_prediction,
     verify_reference_evaluation,
     write_reference_evaluation,
 )
+
+
+class _CDPAMState(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+
+
+class _CDPAMWrapper:
+    def __init__(self) -> None:
+        self.model = _CDPAMState()
+
+
+def test_cdpam_protocol_hashes_wrapped_model_state() -> None:
+    metric = CDPAMMetric.__new__(CDPAMMetric)
+    metric._model = _CDPAMWrapper()
+    metric._cdpam = SimpleNamespace(__file__=__file__)
+
+    protocol = metric.protocol
+
+    assert protocol["implementation"].endswith("._CDPAMWrapper")
+    assert protocol["weight_module"].endswith("._CDPAMState")
+    assert len(protocol["model_state_sha256"]) == 64
 
 
 def _write_config(root: Path, scene: str, offset: float) -> Path:

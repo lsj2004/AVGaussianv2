@@ -119,8 +119,12 @@ class CDPAMMetric:
     def protocol(self) -> dict[str, object]:
         import inspect
 
+        state_owner = getattr(self._model, "model", self._model)
+        state_dict = getattr(state_owner, "state_dict", None)
+        if not callable(state_dict):
+            raise RuntimeError("cannot locate CDPAM model state for hashing")
         state_digest = hashlib.sha256()
-        for name, value in sorted(self._model.state_dict().items()):
+        for name, value in sorted(state_dict().items()):
             tensor = value.detach().cpu().contiguous()
             state_digest.update(name.encode())
             state_digest.update(str(tensor.dtype).encode())
@@ -135,6 +139,9 @@ class CDPAMMetric:
         class_path = Path(class_path_value).resolve()
         return {
             "implementation": f"{type(self._model).__module__}.{type(self._model).__qualname__}",
+            "weight_module": (
+                f"{type(state_owner).__module__}.{type(state_owner).__qualname__}"
+            ),
             "module_path": str(module_path),
             "module_sha256": _sha256(module_path),
             "class_source_path": str(class_path),
