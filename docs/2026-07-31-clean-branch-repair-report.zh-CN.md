@@ -122,7 +122,7 @@ python -m avgaussianv2.cli.benchmark_film_causal_report \
 - Bash 语法检查：通过。
 - `git diff --check`：通过。
 - P0 定向单元/合同测试：88 项通过。
-- 全量单元/合同测试：382 项通过（最终复跑 39.50 秒）；包括任意 seed、精确暂停/恢复、Native 投影、30k/5k LRE 合同、两卡 runner、screening selector，以及 Source Audio 论文指标。
+- 全量单元/合同测试：383 项通过（最终复跑 45.19 秒）；包括任意 seed、精确暂停/恢复、Native 投影、30k/5k LRE 合同、两卡 runner、screening selector，以及 Source Audio 论文指标。
 - 两份真实 scene1 配置（seed 42、73）均通过资产审计，且其 Native-affecting 投影与现有 AudioGS Native 合同一致。
 - 使用本机外部严格资产根生成 16 份 LRE screening 配置，逐项检查 96 个路径，缺失数为 0。
 
@@ -144,3 +144,15 @@ python -m avgaussianv2.cli.benchmark_film_causal_report \
 - seed 42 三次恢复的 runtime contract SHA-256 始终为 `6812100985def93ef11f9976dc2c95b9045f54793a256eccc02a3b2e0d927c6d`。
 
 未执行真实 30k GPU 训练。smoke 证明真实 CUDA、Native 合同复用、非默认 seed、精确暂停和无重做恢复链路闭环；正式性能结论仍必须按修复后的协议重新运行。
+
+### 6.1 统一 LRE runner 真实端到端 smoke（2026-08-01）
+
+- 配置：`scene1_opera / joint_conditioned / seed=42 / lambda_lre=0.02`。
+- 设备：物理 GPU 2；GPU 1 当时占用约 46 GiB，预检规则拒绝抢占。
+- 合同：保持正式 2,000 warmup + 30,000 main 合同，在精确 5,000 main milestone 暂停；不存在 `final.pt`。
+- 训练：约 22 分 38 秒；joint 阶段人工观测显存至少 2.9 GiB；单个 joint checkpoint 约 613 MiB，暂停目录约 1.8 GiB。
+- 评测：130 个 cam38 样本，smoke 按协议跳过 DPAM；成功 generation 的 content SHA-256 为 `d0791e59d77f47ae9321836d9794d49b897f5274550868fc54399e2f39d7e20b`。
+- 独立验证：`verify_resume_artifacts`、`verify_evaluation` 和 runner `--resume` verify-only 均通过；恢复没有重新准备、训练或计算指标。
+- 边界：没有 `lambda_lre=0` 配对控制，且未计算 DPAM，因此这些数值不得进入性能排名。
+
+真实 smoke 额外发现并修复三个流水线问题：生成器错误地把绝对 upstream root 改成相对路径；runner 未创建首次 evaluation 的父目录，导致 130 个样本计算后发布失败；verify-only 会覆盖首次运行的耗时/显存记录。修复后绝对 upstream 路径保持不变、evaluation root 在启动前创建、每次结果写入不可变 `result_history`。runner CLI 现在强制显式指定包含 FTGS++/`gsplat`/`tinycudann` 的生产 Python。

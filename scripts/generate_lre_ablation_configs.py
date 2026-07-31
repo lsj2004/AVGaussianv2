@@ -46,9 +46,8 @@ def _rebase_paths(
             raise ValueError(f"base config paths.{name} must be a string or null")
         path = Path(raw_path)
         if path.is_absolute():
-            absolute = path.resolve()
-        else:
-            absolute = (source_directory / path).resolve()
+            continue
+        absolute = (source_directory / path).resolve()
         if strict_run_root is not None:
             try:
                 relative = absolute.relative_to(DEFAULT_STRICT_RUN_ROOT)
@@ -72,6 +71,16 @@ def _selection_weights(
         raise ValueError("screening.lambda_lre must be unique and include 0.0")
     if any(value < 0 for value in available):
         raise ValueError("screening.lambda_lre must be nonnegative")
+    if stage == "smoke":
+        smoke = manifest["smoke"]
+        weights = tuple(float(value) for value in smoke["lambda_lre"])
+        if not weights or len(set(weights)) != len(weights) or any(
+            value <= 0 for value in weights
+        ):
+            raise ValueError("smoke.lambda_lre must contain unique nonzero weights")
+        if winners_path is not None:
+            raise ValueError("--winners is not valid for smoke")
+        return tuple(sorted(weights))
     if stage == "screening":
         if winners_path is not None:
             raise ValueError("--winners is only valid after screening")
@@ -132,8 +141,8 @@ def generate(
         or manifest.get("version") != 1
     ):
         raise ValueError("unsupported LRE ablation manifest")
-    if stage not in {"screening", "confirmation", "robustness"}:
-        raise ValueError("stage must be screening, confirmation, or robustness")
+    if stage not in {"smoke", "screening", "confirmation", "robustness"}:
+        raise ValueError("stage must be smoke, screening, confirmation, or robustness")
     fixed = manifest["fixed_loss"]
     stage_config = manifest[stage]
     seeds = tuple(int(seed) for seed in stage_config["seeds"])
@@ -174,7 +183,7 @@ def generate(
         training_mode = specification.get("training_mode")
         if training_mode not in {"audio_only", "joint_conditioned"}:
             raise ValueError(f"invalid training mode for architecture {system}")
-        scenes = manifest.get("scenes")
+        scenes = stage_config.get("scenes", manifest.get("scenes"))
         if not isinstance(scenes, list) or not scenes:
             raise ValueError("scenes must be a nonempty list")
         for scene in scenes:
@@ -199,7 +208,8 @@ def generate(
                     )
                     derived["benchmark"]["seed"] = int(seed)
                     continuation_id = (
-                        f"{system}__{scene}__seed{seed}"
+                        ("smoke__" if stage == "smoke" else "")
+                        + f"{system}__{scene}__seed{seed}"
                         f"__lre{_weight_slug(weight)}"
                     )
                     config_id = continuation_id
@@ -231,10 +241,14 @@ def generate(
                             "config_sha256": hashlib.sha256(data).hexdigest(),
                         }
                     )
-                    run_id = f"{stage}__{continuation_id}"
+                    run_id = (
+                        continuation_id
+                        if stage == "smoke"
+                        else f"{stage}__{continuation_id}"
+                    )
                     control_run_id = (
                         None
-                        if weight == 0.0
+                        if weight == 0.0 or stage == "smoke"
                         else (
                             f"{stage}__{system}__{scene}__seed{seed}"
                             f"__lre{_weight_slug(0.0)}"
@@ -289,7 +303,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--stage",
-        choices=("screening", "confirmation", "robustness"),
+        choices=("smoke", "screening", "confirmation", "robustness"),
         default="screening",
     )
     parser.add_argument(

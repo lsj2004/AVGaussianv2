@@ -24,10 +24,11 @@ def _manifest() -> Path:
 
 
 def _generate(module, output: Path, **kwargs):
+    systems = kwargs.pop("systems", ("audio_only", "joint_conditioned"))
     return module.generate(
         _manifest(),
         output,
-        systems=("audio_only", "joint_conditioned"),
+        systems=systems,
         **kwargs,
     )
 
@@ -61,6 +62,9 @@ def test_screening_generation_only_expands_screening_seed(tmp_path: Path) -> Non
         and record["lambda_lre"] == pytest.approx(0.02)
     )
     config = yaml.safe_load(Path(scene1["config"]).read_text())
+    assert Path(config["paths"]["visual_upstream_root"]).is_absolute()
+    assert Path(config["paths"]["audio_upstream_root"]).is_absolute()
+    assert Path(config["paths"]["visual_memmap"]).is_absolute()
     assert config["train"]["joint_steps"] == 30_000
     assert config["benchmark"]["continuation_updates"] == 30_000
     assert config["benchmark"]["report_steps"] == [5_000, 10_000, 30_000]
@@ -71,6 +75,30 @@ def test_screening_generation_only_expands_screening_seed(tmp_path: Path) -> Non
         ROOT / "runs/cam38_strict/scene1_opera/ftgspp/native/"
         "scene1_opera/00/gaussians.pt"
     ).resolve()
+
+
+def test_smoke_generation_is_strict_isolated_and_nonzero(tmp_path: Path) -> None:
+    generated = _generate(
+        _load_generator(),
+        tmp_path,
+        stage="smoke",
+        systems=("query_dependent_p1",),
+    )
+
+    assert len(generated["runs"]) == 1
+    run = generated["runs"][0]
+    assert run["scene"] == "scene1_opera"
+    assert run["training_mode"] == "joint_conditioned"
+    assert run["lambda_lre"] == pytest.approx(0.02)
+    assert run["report_steps"] == [5_000]
+    assert run["stop_after_step"] == 5_000
+    assert run["continuation_id"].startswith("smoke__")
+    config = yaml.safe_load(Path(generated["configs"][0]["config"]).read_text())
+    assert config["train"]["warmup_steps"] == 2_000
+    assert config["train"]["joint_steps"] == 30_000
+    assert config["benchmark"]["conditioner_warmup_steps"] == 2_000
+    assert config["benchmark"]["continuation_updates"] == 30_000
+    assert config["benchmark"]["report_steps"] == [5_000, 10_000, 30_000]
 
 
 def test_confirmation_requires_winners_bound_to_screening_manifest(

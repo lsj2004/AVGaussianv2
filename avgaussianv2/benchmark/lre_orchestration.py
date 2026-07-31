@@ -50,6 +50,17 @@ def _atomic_json(path: Path, value: object) -> None:
         raise
 
 
+def _publish_result(path: Path, value: object) -> Path:
+    history = path.parent / "result_history" / path.stem
+    sequence = 0
+    while (history / f"attempt-{sequence:06d}.json").exists():
+        sequence += 1
+    immutable = history / f"attempt-{sequence:06d}.json"
+    _atomic_json(immutable, value)
+    _atomic_json(path, value)
+    return immutable
+
+
 def load_lre_run_manifest(path: Path) -> dict[str, object]:
     path = Path(path).resolve()
     try:
@@ -60,7 +71,8 @@ def load_lre_run_manifest(path: Path) -> dict[str, object]:
         not isinstance(value, dict)
         or value.get("schema") != "avgaussianv2.lre-loss-run-manifest"
         or value.get("version") != 1
-        or value.get("stage") not in {"screening", "confirmation", "robustness"}
+        or value.get("stage")
+        not in {"smoke", "screening", "confirmation", "robustness"}
         or not isinstance(value.get("configs"), list)
         or not isinstance(value.get("runs"), list)
     ):
@@ -113,7 +125,14 @@ def load_lre_run_manifest(path: Path) -> dict[str, object]:
             )
             or report_steps != sorted(set(report_steps))
             or max_steps != report_steps[-1]
-            or max_steps not in {5_000, 10_000, 30_000}
+            or (
+                value["stage"] == "smoke"
+                and max_steps != 5_000
+            )
+            or (
+                value["stage"] != "smoke"
+                and max_steps not in {5_000, 10_000, 30_000}
+            )
             or stop_after
             != (max_steps if max_steps < 30_000 else None)
         ):
@@ -230,6 +249,7 @@ def build_lre_pipelines(
         if not audiogs.is_dir() or not ftgspp.is_dir():
             raise FileNotFoundError(f"native contracts are incomplete for {scene}")
         _bind_continuation_identity(run_dir, run, config_record)
+        evaluation_root.mkdir(parents=True, exist_ok=True)
         log_dir = _next_attempt_log_dir(run_dir)
         stages: list[LREStage] = []
         common_trust = ("--trust-upstream-artifacts",) if trust_upstream_artifacts else ()
@@ -474,7 +494,7 @@ def execute_lre_pipelines(
                         "stages": [stage.name for stage in pipeline.stages],
                         **usage[pipeline.run_id],
                     }
-                    _atomic_json(
+                    _publish_result(
                         pipeline.run_dir / f"run_result.{pipeline.stage}.json",
                         record,
                     )
@@ -526,7 +546,7 @@ def run_lre_manifest(
         gpus=list(devices),
         gpu_preflight=gpu_status,
     )
-    _atomic_json(
+    _publish_result(
         Path(output_root).resolve() / f"runner_result.{manifest['stage']}.json",
         result,
     )

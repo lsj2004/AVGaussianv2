@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
 from avgaussianv2.benchmark.lre_orchestration import run_lre_manifest
@@ -21,7 +20,11 @@ def main() -> None:
         help="root containing <scene>/{audiogs,ftgspp}/native_contract",
     )
     parser.add_argument("--gpus", default="0,1")
-    parser.add_argument("--python", default=sys.executable)
+    parser.add_argument(
+        "--python",
+        required=True,
+        help="audited production Python containing AVGaussianV2 and FTGS++ dependencies",
+    )
     parser.add_argument("--trust-upstream-artifacts", action="store_true")
     parser.add_argument("--skip-dpam", action="store_true")
     parser.add_argument("--resume", action="store_true")

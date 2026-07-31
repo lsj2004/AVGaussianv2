@@ -82,6 +82,12 @@ reference_metrics:
   - paper_lre_db
   - paper_dpam
 
+smoke:
+  scenes: [scene1_opera]
+  seeds: [42]
+  lambda_lre: [0.02]
+  report_steps: [5000]
+
 screening:
   seeds: [42]
   lambda_lre: [0.0, 0.01, 0.02, 0.05]

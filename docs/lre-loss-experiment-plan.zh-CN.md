@@ -15,15 +15,21 @@
 
 ## 2. 服务器与并发
 
-服务器预计有两张空闲的 48 GB GPU。先为每个架构各跑一个短 smoke，记录单进程
-峰值显存和吞吐，再决定并发：
+服务器有两张获准使用的 48 GB GPU，但不能假设两张始终空闲。每次启动只使用通过
+预检（至少 8 GiB 空闲、利用率不超过 10%）的设备。2026-08-01 smoke 时 GPU 1
+被其他任务占用约 46 GiB，因此只使用 GPU 2，没有抢占。
 
 - 当前 runner 每张卡只启动 1 个训练进程，先保证严格隔离和失败可恢复；
 - runner 记录单任务峰值显存、利用率和耗时。只有后续实现了显存预算调度，且实测
   总峰值低于显存的 80%、没有 OOM、单任务吞吐下降不超过 20% 时，才允许提高并发；
 - 两张卡尽量同时保持有任务，不要串行等待；
+- 两卡候选错开至少 60 秒启动，降低每 500 步约 600 MiB checkpoint 同时写盘的概率；
 - 同一组 control / treatment 尽量分配到相同型号 GPU；
 - OOM 时先降低单卡并发，不修改 batch size 或实验语义。
+
+真实 FiLM + LRE smoke 观测到 joint 阶段至少约 2.9 GiB GPU 显存，单个 joint
+checkpoint 约 613 MiB，完整暂停目录约 1.8 GiB。这个显存观测不足以授权单卡多
+进程；提高并发前必须额外做单卡 1×/2× pipeline 吞吐 A/B。
 
 Agent 必须记录每个进程的 GPU、峰值显存、运行时间和失败原因。并发数量应动态
 调整，不要求固定。
@@ -42,6 +48,20 @@ Agent 必须记录每个进程的 GPU、峰值显存、运行时间和失败原�
 - 检查两张 GPU 的可用显存，并确定每卡并发数。
 
 P0 失败时不启动大规模训练。
+
+已完成的真实 GPU gate（不作为性能结果）：
+
+- `scene1_opera / joint_conditioned / seed=42 / lambda_lre=0.02`；
+- 严格 2,000 warmup + 5,000 main update，GPU 2；
+- 训练约 22 分 38 秒，130 样本无 DPAM 评测约 7 分 36 秒；
+- 5k paused milestone、resume inventory、evaluation generation 和 verify-only 均通过；
+- evaluation content SHA-256 为
+  `d0791e59d77f47ae9321836d9794d49b897f5274550868fc54399e2f39d7e20b`；
+- 该结果没有 `lambda_lre=0` 配对控制且跳过 DPAM，禁止用于架构或权重排名。
+
+smoke 同时暴露并修复：绝对 upstream root 被错误相对化、首次 evaluation 发布缺少
+父目录、verify-only 覆盖运行统计。正式启动前必须确认生成配置的绝对 upstream
+路径不变、空 evaluation root 可发布、result history 会保留每次运行。
 
 架构来源：
 
@@ -152,6 +172,23 @@ Agent 可以在以下条件满足后停止本轮实验：
 `continuation_id` 和配置字节，因此入选候选会续训，不会从零开始：
 
 ```bash
+PRODUCTION_PYTHON=/mnt/sda/lisujing/Dataset/FreeTimeGSPlusPlus/.venv/bin/python
+STRICT_RUN_ROOT=/path/to/verified/runs/cam38_strict
+
+python scripts/generate_lre_ablation_configs.py \
+  --stage smoke \
+  --system joint_conditioned \
+  --strict-run-root "$STRICT_RUN_ROOT"
+
+"$PRODUCTION_PYTHON" -m avgaussianv2.cli.benchmark_lre_run \
+  --manifest configs/generated/lre_loss_ablation/smoke/manifest.json \
+  --output-root runs/lre_loss_ablation_visual_time_v2_smoke \
+  --native-root "$STRICT_RUN_ROOT" \
+  --gpus <idle-gpu> \
+  --python "$PRODUCTION_PYTHON" \
+  --trust-upstream-artifacts \
+  --skip-dpam
+
 python scripts/generate_lre_ablation_configs.py \
   --stage screening \
   --system audio_only \
@@ -163,6 +200,7 @@ python -m avgaussianv2.cli.benchmark_lre_run \
   --output-root runs/lre_loss_ablation_visual_time_v2 \
   --native-root /path/to/verified/runs/cam38_strict \
   --gpus 0,1 \
+  --python "$PRODUCTION_PYTHON" \
   --trust-upstream-artifacts
 
 python -m avgaussianv2.cli.benchmark_lre_select \
@@ -182,6 +220,7 @@ python -m avgaussianv2.cli.benchmark_lre_run \
   --output-root runs/lre_loss_ablation_visual_time_v2 \
   --native-root /path/to/verified/runs/cam38_strict \
   --gpus 0,1 \
+  --python "$PRODUCTION_PYTHON" \
   --trust-upstream-artifacts \
   --resume
 ```
@@ -192,3 +231,9 @@ checkpoint SHA 后即可评测，但不会生成或伪装成 `final.pt`。screen
 非零候选在所有 scene/system 单元逐一通过门槛；winner 文件绑定 screening manifest
 的 SHA-256。confirmation 使用同一 `continuation_id`、配置 SHA 和运行目录，从 5k
 精确续训到 30k。
+
+`--python` 必须显式指向同时具有 AVGaussianV2、FTGS++、`gsplat`、
+`tinycudann`、音频依赖和可用 CUDA 的生产环境。评测目前只在完整 130/293 样本
+结束后原子发布，没有逐样本恢复；调度时设置阶段超时并保留日志，后续应补只读
+heartbeat。每次 runner/verify-only 结果都写入不可变 `result_history`，顶层 result
+仅作为最新指针。

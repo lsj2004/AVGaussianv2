@@ -115,6 +115,7 @@ def test_lre_runner_consumes_stop_step_and_keeps_one_pipeline_per_gpu(tmp_path):
     )
     assert len(pipelines) == 2
     for pipeline in pipelines:
+        assert (pipeline.run_dir / "evaluations").is_dir()
         assert [stage.name for stage in pipeline.stages] == [
             "prepare",
             "train",
@@ -129,6 +130,9 @@ def test_lre_runner_consumes_stop_step_and_keeps_one_pipeline_per_gpu(tmp_path):
         pipelines, gpus=(1, 2), runner=runner, poll_seconds=0
     )
     assert len(result["runs"]) == 2
+    for pipeline in pipelines:
+        history = pipeline.run_dir / f"result_history/run_result.{pipeline.stage}"
+        assert len(tuple(history.glob("attempt-*.json"))) == 1
     assert [assignment[1]["CUDA_VISIBLE_DEVICES"] for assignment in runner.assignments] == [
         "1",
         "2",
