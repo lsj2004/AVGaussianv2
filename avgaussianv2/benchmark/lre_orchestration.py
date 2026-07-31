@@ -23,6 +23,7 @@ from avgaussianv2.benchmark.orchestration import (
     _terminate_handles,
     parse_gpus,
 )
+from avgaussianv2.benchmark.evaluation import EVALUATION_CONTINUATION_SYSTEMS
 
 
 SCHEMA = "avgaussianv2.lre-loss-runner-result"
@@ -72,7 +73,7 @@ def load_lre_run_manifest(path: Path) -> dict[str, object]:
         or value.get("schema") != "avgaussianv2.lre-loss-run-manifest"
         or value.get("version") != 1
         or value.get("stage")
-        not in {"smoke", "screening", "confirmation", "robustness"}
+        not in {"smoke", "architecture", "screening", "confirmation", "robustness"}
         or not isinstance(value.get("configs"), list)
         or not isinstance(value.get("runs"), list)
     ):
@@ -105,6 +106,7 @@ def load_lre_run_manifest(path: Path) -> dict[str, object]:
         continuation_id = run.get("continuation_id")
         config_id = run.get("config_id")
         report_steps = run.get("report_steps")
+        evaluation_systems = run.get("evaluation_systems", [run.get("system")])
         max_steps = run.get("max_steps")
         stop_after = run.get("stop_after_step")
         if (
@@ -117,6 +119,12 @@ def load_lre_run_manifest(path: Path) -> dict[str, object]:
             or config_id not in configs
             or run.get("scene") not in {"scene1_opera", "Scene7playing"}
             or run.get("training_mode") not in {"audio_only", "joint_conditioned"}
+            or not isinstance(evaluation_systems, list)
+            or not evaluation_systems
+            or evaluation_systems[0] != run.get("system")
+            or len(set(evaluation_systems)) != len(evaluation_systems)
+            or any(not isinstance(system, str) or not system for system in evaluation_systems)
+            or any(system not in EVALUATION_CONTINUATION_SYSTEMS for system in evaluation_systems)
             or not isinstance(report_steps, list)
             or not report_steps
             or any(
@@ -306,39 +314,52 @@ def build_lre_pipelines(
             stages.append(
                 LREStage("train", tuple(worker_command), log_dir / "train.log")
             )
-        for step in run["report_steps"]:
-            evaluation = evaluation_root / f"step_{int(step):06d}"
-            command = [
-                python_executable,
-                "-m",
-                "avgaussianv2.cli.benchmark_eval",
-                "--scene",
-                scene,
-                "--system",
-                system,
-                "--step",
-                str(step),
-                "--resolved-config",
-                str(protocol / "resolved_project.yaml"),
-                "--source",
-                str(worker),
-                "--output-dir",
-                str(evaluation),
-                "--device",
-                "cuda:0",
-                *common_trust,
-            ]
-            if compute_dpam:
-                command.append("--compute-dpam")
-            if (evaluation / "current.json").is_file():
-                command.append("--verify-only")
-            stages.append(
-                LREStage(
-                    f"eval_{int(step):06d}",
-                    tuple(command),
-                    log_dir / f"eval_{int(step):06d}.log",
+        evaluation_systems = run.get("evaluation_systems", [system])
+        for evaluation_system in evaluation_systems:
+            for step in run["report_steps"]:
+                evaluation = (
+                    evaluation_root / f"step_{int(step):06d}"
+                    if evaluation_system == system
+                    else evaluation_root
+                    / str(evaluation_system)
+                    / f"step_{int(step):06d}"
                 )
-            )
+                command = [
+                    python_executable,
+                    "-m",
+                    "avgaussianv2.cli.benchmark_eval",
+                    "--scene",
+                    scene,
+                    "--system",
+                    str(evaluation_system),
+                    "--step",
+                    str(step),
+                    "--resolved-config",
+                    str(protocol / "resolved_project.yaml"),
+                    "--source",
+                    str(worker),
+                    "--output-dir",
+                    str(evaluation),
+                    "--device",
+                    "cuda:0",
+                    *common_trust,
+                ]
+                if compute_dpam:
+                    command.append("--compute-dpam")
+                if (evaluation / "current.json").is_file():
+                    command.append("--verify-only")
+                stage_name = (
+                    f"eval_{int(step):06d}"
+                    if evaluation_system == system
+                    else f"eval_{evaluation_system}_{int(step):06d}"
+                )
+                stages.append(
+                    LREStage(
+                        stage_name,
+                        tuple(command),
+                        log_dir / f"{stage_name}.log",
+                    )
+                )
         pipelines.append(
             LREPipeline(run_id, str(manifest["stage"]), run_dir, tuple(stages))
         )

@@ -101,6 +101,73 @@ def test_smoke_generation_is_strict_isolated_and_nonzero(tmp_path: Path) -> None
     assert config["benchmark"]["report_steps"] == [5_000, 10_000, 30_000]
 
 
+def test_architecture_generation_is_fair_and_schedules_causal_checks(
+    tmp_path: Path,
+) -> None:
+    systems = (
+        "audio_only",
+        "plain_unet",
+        "joint_conditioned",
+        "cross_attention_masks",
+        "query_dependent_p1",
+    )
+    generated = _generate(
+        _load_generator(), tmp_path, stage="architecture", systems=systems
+    )
+
+    assert len(generated["runs"]) == 10
+    assert {record["seed"] for record in generated["runs"]} == {42}
+    assert {record["lambda_lre"] for record in generated["runs"]} == {0.0}
+    assert all(record["report_steps"] == [5_000] for record in generated["runs"])
+    by_system = {
+        record["system"]: tuple(record["evaluation_systems"])
+        for record in generated["runs"]
+        if record["scene"] == "scene1_opera"
+    }
+    assert by_system["audio_only"] == ("audio_only",)
+    assert by_system["joint_conditioned"] == (
+        "joint_conditioned",
+        "joint_conditioned_no_rgbd",
+        "joint_conditioned_wrong_camera",
+    )
+    assert by_system["cross_attention_masks"] == (
+        "cross_attention_masks",
+        "cross_attention_masks_no_rgbd",
+        "cross_attention_masks_shuffled_rgbd",
+    )
+    assert by_system["query_dependent_p1"] == (
+        "query_dependent_p1",
+        "query_dependent_p1_no_rgbd",
+        "query_dependent_p1_wrong_camera",
+    )
+
+
+def test_architecture_generation_rejects_non_axis_config_delta(
+    tmp_path: Path,
+) -> None:
+    module = _load_generator()
+    manifest = yaml.safe_load(_manifest().read_text())
+    source = ROOT / "configs/benchmark_cam38/scene1_opera_plain_unet.yaml"
+    invalid = tmp_path / "invalid.yaml"
+    config = yaml.safe_load(source.read_text())
+    config["train"]["seed"] = 73
+    invalid.write_text(yaml.safe_dump(config, sort_keys=False))
+    manifest["architecture_configs"]["audio_only"]["scene1_opera"] = str(
+        ROOT / "configs/benchmark_cam38/scene1_opera.yaml"
+    )
+    manifest["architecture_configs"]["plain_unet"]["scene1_opera"] = str(invalid)
+    local_manifest = tmp_path / "manifest.yaml"
+    local_manifest.write_text(yaml.safe_dump(manifest, sort_keys=False))
+
+    with pytest.raises(ValueError, match="only audio_render_strategy"):
+        module.generate(
+            local_manifest,
+            tmp_path / "generated",
+            stage="architecture",
+            systems=("plain_unet",),
+        )
+
+
 def test_confirmation_requires_winners_bound_to_screening_manifest(
     tmp_path: Path,
 ) -> None:

@@ -138,6 +138,7 @@ def run_ablation_evaluation(
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--trust-upstream-artifacts", action="store_true")
+    parser.add_argument("--compute-dpam", action="store_true")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 

@@ -23,6 +23,7 @@ fixed_loss:
 architecture_screening:
   seed: 42
   lambda_lre: 0.0
+  report_steps: [5000]
   required:
     - audio_only
     - plain_unet
@@ -47,26 +48,46 @@ architecture_screening:
 architecture_configs:
   audio_only:
     training_mode: audio_only
+    evaluation_systems: [audio_only]
     scene1_opera: ../benchmark_cam38/scene1_opera.yaml
     Scene7playing: ../benchmark_cam38/Scene7playing.yaml
   joint_conditioned:
     training_mode: joint_conditioned
+    evaluation_systems:
+      - joint_conditioned
+      - joint_conditioned_no_rgbd
+      - joint_conditioned_wrong_camera
     scene1_opera: ../benchmark_cam38/scene1_opera.yaml
     Scene7playing: ../benchmark_cam38/Scene7playing.yaml
   plain_unet:
     training_mode: audio_only
+    evaluation_systems: [plain_unet]
     scene1_opera: ../benchmark_cam38/scene1_opera_plain_unet.yaml
     Scene7playing: ../benchmark_cam38/Scene7playing_plain_unet.yaml
   cross_attention:
     training_mode: joint_conditioned
+    evaluation_systems:
+      - cross_attention
+      - cross_attention_no_rgbd
+      - cross_attention_shuffled_rgbd
+      - cross_attention_no_gaussians
+      - cross_attention_no_pose
     scene1_opera: ../benchmark_cam38/scene1_opera_cross_attention.yaml
     Scene7playing: ../benchmark_cam38/Scene7playing_cross_attention.yaml
   cross_attention_masks:
     training_mode: joint_conditioned
+    evaluation_systems:
+      - cross_attention_masks
+      - cross_attention_masks_no_rgbd
+      - cross_attention_masks_shuffled_rgbd
     scene1_opera: ../benchmark_cam38/scene1_opera_cross_attention_masks.yaml
     Scene7playing: ../benchmark_cam38/Scene7playing_cross_attention_masks.yaml
   query_dependent_p1:
     training_mode: joint_conditioned
+    evaluation_systems:
+      - query_dependent_p1
+      - query_dependent_p1_no_rgbd
+      - query_dependent_p1_wrong_camera
     scene1_opera: ../benchmark_cam38/scene1_opera_query_dependent_p1.yaml
     Scene7playing: ../benchmark_cam38/Scene7playing_query_dependent_p1.yaml
 

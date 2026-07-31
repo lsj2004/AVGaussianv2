@@ -9,9 +9,22 @@ from typing import Any
 
 import yaml
 
+from avgaussianv2.benchmark.architecture_ablation import (
+    validate_strategy_only_delta,
+)
+from avgaussianv2.benchmark.cross_attention_ablation import (
+    cross_attention_variant,
+    validate_backend_only_delta,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_STRICT_RUN_ROOT = (ROOT / "runs/cam38_strict").resolve()
+FILM_EVALUATION_SYSTEMS = (
+    "joint_conditioned",
+    "joint_conditioned_no_rgbd",
+    "joint_conditioned_wrong_camera",
+)
 
 
 def _weight_slug(value: float) -> str:
@@ -27,6 +40,54 @@ def _load_mapping(path: Path) -> dict[str, Any]:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _validate_architecture_source(
+    *,
+    system: str,
+    canonical_config: Path,
+    architecture_config: Path,
+    evaluation_systems: tuple[str, ...],
+) -> None:
+    """Reject architecture inputs that change anything beyond the tested axis."""
+    if system in {"audio_only", "joint_conditioned"}:
+        if architecture_config.read_bytes() != canonical_config.read_bytes():
+            raise ValueError(
+                f"{system} must use the byte-identical canonical scene config"
+            )
+        expected_evaluations = (
+            ("audio_only",) if system == "audio_only" else FILM_EVALUATION_SYSTEMS
+        )
+    elif system == "plain_unet":
+        validate_strategy_only_delta(
+            canonical_config,
+            architecture_config,
+            expected_strategy="plain_unet",
+        )
+        expected_evaluations = ("plain_unet",)
+    else:
+        expected_backends = {
+            "cross_attention": "cross_attention_tokens",
+            "cross_attention_masks": "cross_attention_masks",
+            "query_dependent_p1": "query_dependent_p1",
+        }
+        try:
+            expected_backend = expected_backends[system]
+        except KeyError as error:
+            raise ValueError(f"unsupported architecture system: {system}") from error
+        validate_backend_only_delta(
+            canonical_config,
+            architecture_config,
+            expected_backend=expected_backend,
+        )
+        expected_evaluations = cross_attention_variant(
+            expected_backend
+        ).evaluation_systems
+    if evaluation_systems != expected_evaluations:
+        raise ValueError(
+            f"architecture {system} evaluation systems must be "
+            f"{list(expected_evaluations)}"
+        )
 
 
 def _rebase_paths(
@@ -71,6 +132,13 @@ def _selection_weights(
         raise ValueError("screening.lambda_lre must be unique and include 0.0")
     if any(value < 0 for value in available):
         raise ValueError("screening.lambda_lre must be nonnegative")
+    if stage == "architecture":
+        architecture = manifest["architecture_screening"]
+        if float(architecture["lambda_lre"]) != 0.0:
+            raise ValueError("architecture screening requires lambda_lre=0")
+        if winners_path is not None:
+            raise ValueError("--winners is not valid for architecture screening")
+        return (0.0,)
     if stage == "smoke":
         smoke = manifest["smoke"]
         weights = tuple(float(value) for value in smoke["lambda_lre"])
@@ -141,11 +209,25 @@ def generate(
         or manifest.get("version") != 1
     ):
         raise ValueError("unsupported LRE ablation manifest")
-    if stage not in {"smoke", "screening", "confirmation", "robustness"}:
-        raise ValueError("stage must be smoke, screening, confirmation, or robustness")
+    if stage not in {
+        "smoke",
+        "architecture",
+        "screening",
+        "confirmation",
+        "robustness",
+    }:
+        raise ValueError("unsupported LRE experiment stage")
     fixed = manifest["fixed_loss"]
-    stage_config = manifest[stage]
-    seeds = tuple(int(seed) for seed in stage_config["seeds"])
+    stage_config = (
+        manifest["architecture_screening"]
+        if stage == "architecture"
+        else manifest[stage]
+    )
+    seeds = (
+        (int(stage_config["seed"]),)
+        if stage == "architecture"
+        else tuple(int(seed) for seed in stage_config["seeds"])
+    )
     if not seeds or len(set(seeds)) != len(seeds):
         raise ValueError(f"{stage}.seeds must be nonempty and unique")
     weights = _selection_weights(
@@ -183,6 +265,15 @@ def generate(
         training_mode = specification.get("training_mode")
         if training_mode not in {"audio_only", "joint_conditioned"}:
             raise ValueError(f"invalid training mode for architecture {system}")
+        evaluation_systems = specification.get("evaluation_systems")
+        if (
+            not isinstance(evaluation_systems, list)
+            or not evaluation_systems
+            or evaluation_systems[0] != system
+            or len(set(evaluation_systems)) != len(evaluation_systems)
+            or any(not isinstance(value, str) or not value for value in evaluation_systems)
+        ):
+            raise ValueError(f"invalid evaluation systems for architecture {system}")
         scenes = stage_config.get("scenes", manifest.get("scenes"))
         if not isinstance(scenes, list) or not scenes:
             raise ValueError("scenes must be a nonempty list")
@@ -191,6 +282,16 @@ def generate(
             if not isinstance(relative, str):
                 raise ValueError(f"architecture {system} has no config for {scene}")
             base_path = (manifest_path.parent / relative).resolve()
+            canonical_relative = catalog["audio_only"].get(scene)
+            if not isinstance(canonical_relative, str):
+                raise ValueError(f"audio_only has no canonical config for {scene}")
+            canonical_path = (manifest_path.parent / canonical_relative).resolve()
+            _validate_architecture_source(
+                system=system,
+                canonical_config=canonical_path,
+                architecture_config=base_path,
+                evaluation_systems=tuple(evaluation_systems),
+            )
             base = _load_mapping(base_path)
             for seed in seeds:
                 for weight in weights:
@@ -266,6 +367,11 @@ def generate(
                             "seed": seed,
                             "lambda_lre": weight,
                             "control_run_id": control_run_id,
+                            "evaluation_systems": (
+                                list(evaluation_systems)
+                                if stage == "architecture"
+                                else [system]
+                            ),
                             "report_steps": list(report_steps),
                             "max_steps": max_steps,
                             "stop_after_step": (
@@ -303,7 +409,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--stage",
-        choices=("smoke", "screening", "confirmation", "robustness"),
+        choices=(
+            "smoke",
+            "architecture",
+            "screening",
+            "confirmation",
+            "robustness",
+        ),
         default="screening",
     )
     parser.add_argument(

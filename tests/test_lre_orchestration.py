@@ -205,6 +205,46 @@ def test_lre_runner_refuses_unbound_or_mismatched_continuation(tmp_path):
         )
 
 
+def test_architecture_pipeline_schedules_main_and_causal_evaluations(tmp_path):
+    path, value = _manifest(tmp_path)
+    value["stage"] = "architecture"
+    run = value["runs"][1]
+    run["stage"] = "architecture"
+    run["evaluation_systems"] = [
+        "query_dependent_p1",
+        "query_dependent_p1_no_rgbd",
+        "query_dependent_p1_wrong_camera",
+    ]
+    value["configs"] = value["configs"][1:]
+    value["runs"] = value["runs"][1:]
+    path.write_text(json.dumps(value))
+
+    pipelines = build_lre_pipelines(
+        load_lre_run_manifest(path),
+        output_root=tmp_path / "runs",
+        native_root=_native_root(tmp_path),
+        python_executable="python",
+        compute_dpam=True,
+        trust_upstream_artifacts=True,
+        resume=False,
+    )
+
+    stages = pipelines[0].stages
+    assert [stage.name for stage in stages] == [
+        "prepare",
+        "train",
+        "eval_005000",
+        "eval_query_dependent_p1_no_rgbd_005000",
+        "eval_query_dependent_p1_wrong_camera_005000",
+    ]
+    assert stages[2].command[stages[2].command.index("--output-dir") + 1].endswith(
+        "evaluations/step_005000"
+    )
+    assert stages[3].command[stages[3].command.index("--output-dir") + 1].endswith(
+        "evaluations/query_dependent_p1_no_rgbd/step_005000"
+    )
+
+
 def test_lre_manifest_and_gpu_preflight_fail_closed(tmp_path):
     path, value = _manifest(tmp_path)
     Path(value["configs"][0]["config"]).write_text("tampered\n")
