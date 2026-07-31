@@ -1,6 +1,6 @@
 # post-fix 双 48GB GPU 实验计划（执行版）
 
-更新日期：2026-08-01
+更新日期：2026-08-01（smoke 后修订版）
 
 ## 1. 本轮要回答的问题
 
@@ -83,8 +83,10 @@ smoke 时 GPU 1 被其他任务占用约 46GB，因此只安全使用 GPU 2。
 6. 只有完成单卡 1×/2× pipeline 吞吐 A/B，且总显存低于 38.4GB、无 OOM、总吞吐提升、
    单任务吞吐下降不超过 20%，才允许单卡 2 pipeline。
 
-已测得 FiLM 5k smoke 峰值至少约 2.9GiB，P1 smoke 训练中约 2.3GiB；这只证明显存
-充足，不证明多开能提速。P1 利用率明显低于显存占比，CPU、数据和渲染可能是瓶颈。
+FiLM/P1 训练期间人工观测的设备占用约 2.9/2.3GiB；P1 三路评测的首个完整 runner
+attempt 用时 836.22 秒，采样到的设备占用峰值 1,033MiB、利用率峰值 16%。随后
+verify-only 仅用 27.00 秒、14MiB，因此不能用最新指针估算训练或完整评测成本。这些
+数据只证明显存充足，不证明多开能提速；CPU、数据读取和渲染可能是主要瓶颈。
 
 ## 5. 已完成 smoke 与剩余开跑门禁
 
@@ -107,17 +109,27 @@ P1 smoke 真实验证了 5k 暂停、三路因果评测、失败后恢复和 ver
 - 嵌套因果 evaluation 父目录未创建；
 - 已完成主评测恢复时必须 verify-only，不能覆盖。
 
-### 5.2 正式长任务前仍必须完成
+2026-08-01 再次对三路现有产物执行独立 verifier，样本数和上述三个 content SHA-256
+完全一致。smoke 至此完成，但它明确没有覆盖 DPAM，也不能用于比较架构性能。
 
-- 全量测试、`git diff --check` 通过，冻结单一 commit；
-- generated config 不能使 worktree dirty；run manifest 必须绑定 clean Git revision；
-- 失败 attempt 也必须保留阶段、耗时和资源证据，不能只发布成功/verify-only 最新指针；
-- 两场景 visual-time 机器断言通过，pre-fix/post-fix 输出根完全隔离；
-- Source Binaural 与 Mono 的 846 行参考结果完成 MAG/ENV/LRE/DPAM 并通过 verifier；
-- `lambda_lre=0` 与无 LRE objective 的 loss、gradient、短程参数更新一致性测试通过；
-- 主评测启用 DPAM；smoke 和因果反事实允许显式跳过 DPAM，但报告必须标注 incomplete。
+### 5.2 门禁状态与剩余阻塞项
 
-任一门禁失败，不启动正式架构队列。
+| 门禁 | 当前状态 | 正式开跑前动作 |
+|---|---|---|
+| clean revision / manifest / continuation identity | 已实现 | 最终提交后重新生成 manifest |
+| success、failure、peer-abort 的不可变 attempt history | 单元测试通过 | 全量测试复核 |
+| 两场景 visual-time 机器断言 | 已通过 | 最终 commit 再绑定一次审计结果 |
+| Source/Mono 846 行 MAG/ENV/LRE/DPAM | 已通过 verifier | 最终 commit 覆盖重跑并固化 SHA |
+| `lambda_lre=0` 等价于 legacy 更新 | loss、gradient、连续 10 次更新精确一致 | 全量测试复核 |
+| P1 三路真实 GPU smoke | 已完成 | 不再重复训练 |
+| 正式主评测 DPAM | **未打通** | 拆分模型评测 Python 与 CDPAM Python，并做 130 样本集成 smoke |
+| P1 自动化筛选 | **未冻结** | 实现 fail-closed selector，避免训练后人工改口径 |
+| 最终代码质量 | 未完成 | 全量 pytest、静态检查、clean worktree 后冻结 commit |
+
+正式训练 Python 没有 `cdpam`；已有 CDPAM 环境又没有 `gsplat/tinycudann`。因此主评测
+必须以持久化子进程或等价的双运行时方式调用 CDPAM，并把其解释器、实现、权重哈希写入
+metric protocol。禁止临时给训练环境安装未经锁定的依赖，也禁止因环境问题在正式主表
+跳过 DPAM。上述两个粗体阻塞项和最终代码质量任一未通过，不启动正式架构队列。
 
 ## 6. 分阶段实验矩阵
 
@@ -146,6 +158,12 @@ P1 smoke 真实验证了 5k 暂停、三路因果评测、失败后恢复和 ver
   wrong-camera 稳定击败；
 - LRE、ILD、IPD 不出现不可接受退化；
 - Pareto 近似等价时优先参数更少、GPU-hours 更低的模型。
+
+自动 selector 按以下固定顺序决策，不构造加权总分：先检查覆盖、身份、样本集合和有限性；
+再执行条件因果门禁；随后剔除被 `audio_only` 全面支配的候选并形成 Pareto front；若前沿
+超过 2 个，依次用两场景等权 macro `audio_total`、MAG、ENV、DPAM、waveform L1、LRE
+和资源成本作词典序 tie-break。selector 必须同时输出全部候选、淘汰原因和至多 2 个
+`selected_systems`；任何输入缺失都 fail closed，不允许人工补齐默认值。
 
 最多保留 2 个架构。5k 边界不清楚时只把边界候选延长到 10k，不凭微小均值差淘汰。
 
@@ -222,6 +240,7 @@ $PRODUCTION_PYTHON scripts/generate_lre_ablation_configs.py \
   --output-dir "$GENERATED_ROOT" \
   --strict-run-root "$STRICT_RUN_ROOT"
 
+# 仅在 DPAM 双运行时集成 smoke 通过后执行；正式主评测不得使用 --skip-dpam。
 $PRODUCTION_PYTHON -m avgaussianv2.cli.benchmark_lre_run \
   --manifest "$GENERATED_ROOT/architecture/manifest.json" \
   --output-root "$RUN_ROOT" \
@@ -254,12 +273,20 @@ confirmation、robustness 继续使用 `benchmark_lre_select` 和同一 `RUN_ROO
 Source/Mono 参考单独运行，并在正式报告前 verify-only：
 
 ```bash
-$PRODUCTION_PYTHON -m avgaussianv2.cli.evaluate_audio_references \
+CUDA_VISIBLE_DEVICES=2 PYTHONPATH="$PWD" \
+UV_CACHE_DIR=/tmp/avgaussianfusion-uv-cache \
+uv run --no-project \
+  --python /home/lisujing/miniconda3/envs/avcloud/bin/python \
+  --with tomli python -m avgaussianv2.cli.evaluate_audio_references \
   --config configs/benchmark_cam38/scene1_opera.yaml \
   --config configs/benchmark_cam38/Scene7playing.yaml \
   --output-dir results/lre_loss_ablation_visual_time_v2/audio_references
 
-$PRODUCTION_PYTHON -m avgaussianv2.cli.evaluate_audio_references \
+CUDA_VISIBLE_DEVICES=2 PYTHONPATH="$PWD" \
+UV_CACHE_DIR=/tmp/avgaussianfusion-uv-cache \
+uv run --no-project \
+  --python /home/lisujing/miniconda3/envs/avcloud/bin/python \
+  --with tomli python -m avgaussianv2.cli.evaluate_audio_references \
   --output-dir results/lre_loss_ablation_visual_time_v2/audio_references \
   --verify-only
 ```
