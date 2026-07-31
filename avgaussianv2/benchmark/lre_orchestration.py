@@ -203,6 +203,7 @@ def _bind_continuation_identity(
     run_dir: Path,
     run: Mapping[str, object],
     config_record: Mapping[str, object],
+    repository: Mapping[str, object],
 ) -> None:
     identity = {
         "schema": "avgaussianv2.lre-loss-continuation-identity",
@@ -214,6 +215,7 @@ def _bind_continuation_identity(
         "training_mode": run["training_mode"],
         "seed": run["seed"],
         "lambda_lre": run["lambda_lre"],
+        "repository": dict(repository),
     }
     path = run_dir / "continuation_identity.json"
     if path.is_file():
@@ -269,7 +271,12 @@ def build_lre_pipelines(
         ftgspp = native_scene / "ftgspp" / "native_contract"
         if not audiogs.is_dir() or not ftgspp.is_dir():
             raise FileNotFoundError(f"native contracts are incomplete for {scene}")
-        _bind_continuation_identity(run_dir, run, config_record)
+        _bind_continuation_identity(
+            run_dir,
+            run,
+            config_record,
+            manifest["repository"],  # type: ignore[arg-type]
+        )
         evaluation_root.mkdir(parents=True, exist_ok=True)
         log_dir = _next_attempt_log_dir(run_dir)
         stages: list[LREStage] = []

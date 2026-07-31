@@ -196,6 +196,7 @@ def test_lre_runner_resume_verifies_existing_evaluation_without_retraining(tmp_p
 
 def test_lre_runner_refuses_unbound_or_mismatched_continuation(tmp_path):
     path, _ = _manifest(tmp_path)
+    native_root = _native_root(tmp_path)
     manifest = load_lre_run_manifest(path)
     subset = {
         **manifest,
@@ -209,9 +210,36 @@ def test_lre_runner_refuses_unbound_or_mismatched_continuation(tmp_path):
         build_lre_pipelines(
             subset,
             output_root=tmp_path / "runs",
-            native_root=_native_root(tmp_path),
+            native_root=native_root,
             python_executable="python",
             compute_dpam=True,
+            trust_upstream_artifacts=True,
+            resume=True,
+        )
+
+    path, value = _manifest(tmp_path)
+    first = {**value, "configs": value["configs"][:1], "runs": value["runs"][:1]}
+    run = tmp_path / "bound-runs/continuation-0"
+    build_lre_pipelines(
+        first,
+        output_root=tmp_path / "bound-runs",
+        native_root=native_root,
+        python_executable="python",
+        compute_dpam=False,
+        trust_upstream_artifacts=True,
+        resume=False,
+    )
+    changed = {
+        **first,
+        "repository": {**first["repository"], "commit": "2" * 40},
+    }
+    with pytest.raises(OrchestrationError, match="identity mismatch"):
+        build_lre_pipelines(
+            changed,
+            output_root=tmp_path / "bound-runs",
+            native_root=native_root,
+            python_executable="python",
+            compute_dpam=False,
             trust_upstream_artifacts=True,
             resume=True,
         )
