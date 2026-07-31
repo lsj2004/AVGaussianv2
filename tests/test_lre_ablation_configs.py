@@ -93,6 +93,11 @@ def test_smoke_generation_is_strict_isolated_and_nonzero(tmp_path: Path) -> None
     assert run["report_steps"] == [5_000]
     assert run["stop_after_step"] == 5_000
     assert run["continuation_id"].startswith("smoke__")
+    assert run["evaluation_systems"] == [
+        "query_dependent_p1",
+        "query_dependent_p1_no_rgbd",
+        "query_dependent_p1_wrong_camera",
+    ]
     config = yaml.safe_load(Path(generated["configs"][0]["config"]).read_text())
     assert config["train"]["warmup_steps"] == 2_000
     assert config["train"]["joint_steps"] == 30_000

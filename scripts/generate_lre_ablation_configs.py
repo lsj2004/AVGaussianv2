@@ -369,7 +369,7 @@ def generate(
                             "control_run_id": control_run_id,
                             "evaluation_systems": (
                                 list(evaluation_systems)
-                                if stage == "architecture"
+                                if stage in {"smoke", "architecture"}
                                 else [system]
                             ),
                             "report_steps": list(report_steps),
