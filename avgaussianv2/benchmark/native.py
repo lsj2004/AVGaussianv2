@@ -81,6 +81,13 @@ def native_protocol_projection_sha256(
     # Native training does not consume continuation optimizer/loss settings,
     # but crop length defines the shared strict scene timeline.
     projected["train"] = {"crop_seconds": train["crop_seconds"]}
+    model = projected.get("model")
+    if isinstance(model, dict):
+        # These select only the post-native continuation architecture.  Native
+        # AudioGS/FTGS++ training never reads them, so they must not invalidate
+        # reuse of the exact same immutable native checkpoints.
+        model.pop("audio_backend", None)
+        model.pop("audio_render_strategy", None)
     benchmark = projected.get("benchmark")
     if not isinstance(benchmark, dict):
         raise ValueError("native protocol projection requires benchmark mapping")

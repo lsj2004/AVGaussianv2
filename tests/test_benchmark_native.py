@@ -692,6 +692,16 @@ def test_native_protocol_projection_ignores_continuation_only_fields(tmp_path):
         derived, base_dir=tmp_path
     )
 
+    derived["model"].update(
+        audio_backend="query_dependent_p1",
+        audio_render_strategy="plain_unet",
+    )
+    assert native_module.native_protocol_projection_sha256(
+        base, base_dir=tmp_path
+    ) == native_module.native_protocol_projection_sha256(
+        derived, base_dir=tmp_path
+    )
+
     derived["model"]["sample_rate"] = 48_000
     assert native_module.native_protocol_projection_sha256(
         base, base_dir=tmp_path
