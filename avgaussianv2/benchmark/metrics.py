@@ -112,7 +112,10 @@ def paper_magnitude_distance(
 
 def _hilbert_envelope(audio: Tensor) -> Tensor:
     length = audio.shape[-1]
-    spectrum = torch.fft.fft(audio, dim=-1)
+    # Reference baselines may use ``expand`` to share a mono waveform across
+    # channels.  oneMKL FFT rejects that zero-stride layout, so materialize the
+    # logical samples before applying the protocol metric.
+    spectrum = torch.fft.fft(audio.contiguous(), dim=-1)
     multiplier = torch.zeros(length, dtype=audio.dtype, device=audio.device)
     multiplier[0] = 1
     if length % 2 == 0:

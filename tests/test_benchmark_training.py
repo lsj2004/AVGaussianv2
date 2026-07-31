@@ -251,7 +251,7 @@ class NoEvalSequence:
         return value
 
 
-def run(tmp_path, mode, *, interrupt=None, resume=False, config=None):
+def run(tmp_path, mode, *, interrupt=None, stop=None, resume=False, config=None):
     config = config or tiny_config()
     indices = (0, 1, 2, 0, 1, 2)
     model = TinyFusion()
@@ -269,6 +269,7 @@ def run(tmp_path, mode, *, interrupt=None, resume=False, config=None):
         output_dir=tmp_path,
         compatibility=compatibility(mode, indices),
         resume=resume,
+        stop_after_main_step=stop,
         interrupt_after_main_step=interrupt,
     )
     return model, samples, result
@@ -304,6 +305,20 @@ def run_with_model(
         resume=resume,
         interrupt_after_main_step=interrupt,
     )
+
+
+def test_planned_budget_can_pause_at_exact_step_and_resume_same_contract(tmp_path):
+    _, _, paused = run(tmp_path, BenchmarkMode.AUDIO_ONLY, stop=3)
+    assert paused.selection == "paused"
+    assert paused.completed_main_updates == 3
+    assert paused.final_checkpoint.name == "main_step_000003.pt"
+    progress = json.loads((tmp_path / "progress.json").read_text())
+    assert progress["observed_main_step"] == progress["exact_main_step"] == 3
+
+    _, _, completed = run(tmp_path, BenchmarkMode.AUDIO_ONLY, resume=True)
+    assert completed.selection == "final"
+    assert completed.resumed_from_main_step == 3
+    assert completed.completed_main_updates == 6
 
 
 @pytest.mark.parametrize("mode", list(BenchmarkMode))

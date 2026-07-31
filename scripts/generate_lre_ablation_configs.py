@@ -181,10 +181,7 @@ def generate(
                     derived["train"]["lre_smooth_l1_beta"] = float(
                         fixed["lre_smooth_l1_beta"]
                     )
-                    derived["train"]["joint_steps"] = max_steps
                     derived["benchmark"]["seed"] = int(seed)
-                    derived["benchmark"]["continuation_updates"] = max_steps
-                    derived["benchmark"]["report_steps"] = list(report_steps)
                     config_id = (
                         f"{stage}__{system}__{scene}__seed{seed}"
                         f"__lre{_weight_slug(weight)}"
@@ -232,6 +229,9 @@ def generate(
                             "control_run_id": control_run_id,
                             "report_steps": list(report_steps),
                             "max_steps": max_steps,
+                            "stop_after_step": (
+                                max_steps if max_steps < 30_000 else None
+                            ),
                         }
                     )
     result = {

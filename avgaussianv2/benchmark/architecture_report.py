@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from avgaussianv2.benchmark.artifacts import canonical_json, publish_generation, sha256
-from avgaussianv2.benchmark.evaluation import AUDIO_METRICS, BenchmarkEvaluationResult
+from avgaussianv2.benchmark.evaluation import BenchmarkEvaluationResult
 from avgaussianv2.benchmark.report import BenchmarkReportError, _paired, _validate_result
 
 SCHEMA = "avgaussianv2.audio-architecture-scene-report"
@@ -56,7 +56,8 @@ def build_architecture_scene_report(
         "primary_step": primary,
         "systems": ["audio_only", system],
         "comparison_scope": "audio_postprocessor_main_update_matched",
-        "total_compute_matched": True,
+        "total_optimizer_updates_matched": True,
+        "total_compute_matched": False,
         "scaling": {
             str(step): {name: indexed[(name, step)].summary for name in ("audio_only", system)}
             for step in steps
@@ -64,7 +65,9 @@ def build_architecture_scene_report(
         "paired_by_step": {
             str(step): {
                 "plain_unet_vs_native_residual": _paired(
-                    indexed[(system, step)], indexed[("audio_only", step)], AUDIO_METRICS
+                    indexed[(system, step)],
+                    indexed[("audio_only", step)],
+                    tuple(sorted(indexed[(system, step)].summary)),
                 )
             }
             for step in steps

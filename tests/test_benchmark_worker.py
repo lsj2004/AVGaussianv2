@@ -385,14 +385,16 @@ def test_production_runtime_executes_only_pinned_inputs_during_live_replacement(
     assert result.config_sha256 == hashlib.sha256(b"pinned-config").hexdigest()
 
 
-def _write_worker_manifest(path: Path, identity: dict[str, str]) -> None:
-    indices = make_shared_indices(1)
+def _write_worker_manifest(
+    path: Path, identity: dict[str, str], *, seed: int = 42
+) -> None:
+    indices = make_shared_indices(1, seed=seed)
     compatibility = BenchmarkCompatibility(
         scene_id="scene1_opera",
         mode=BenchmarkMode.AUDIO_ONLY.value,
         train_cameras=tuple(f"cam{i:02d}" for i in range(38)),
         test_camera="cam38",
-        seed=42,
+        seed=seed,
         index_sha256=hashlib.sha256(
             json.dumps(list(indices), separators=(",", ":")).encode()
         ).hexdigest(),
@@ -401,7 +403,7 @@ def _write_worker_manifest(path: Path, identity: dict[str, str]) -> None:
     path.write_text(
         json.dumps(
             build_worker_manifest(
-                config=BenchmarkConfig(),
+                config=BenchmarkConfig(seed=seed),
                 compatibility=compatibility,
                 shared_indices=indices,
             )
@@ -409,8 +411,9 @@ def _write_worker_manifest(path: Path, identity: dict[str, str]) -> None:
     )
 
 
+@pytest.mark.parametrize("seed", [42, 73])
 def test_worker_seeds_before_internal_builder_and_checks_identity(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, seed
 ) -> None:
     monkeypatch.setenv("PYTHONHASHSEED", "42")
     monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -422,7 +425,7 @@ def test_worker_seeds_before_internal_builder_and_checks_identity(
         "config_sha256": "4" * 64,
     }
     manifest = tmp_path / "worker.json"
-    _write_worker_manifest(manifest, identity)
+    _write_worker_manifest(manifest, identity, seed=seed)
     observed = {}
 
     class Lease:
@@ -444,7 +447,7 @@ def test_worker_seeds_before_internal_builder_and_checks_identity(
         return BenchmarkRuntime(
             model=_Model(),
             train_samples=[object()],
-            train_config=TrainConfig(seed=42, warmup_steps=2_000, joint_steps=30_000),
+            train_config=TrainConfig(seed=seed, warmup_steps=2_000, joint_steps=30_000),
             audio_loss_fn=nn.L1Loss(),
             dataset_identity_sha256="5" * 64,
             dataset_sample_ids=("sample-0",),
@@ -452,9 +455,9 @@ def test_worker_seeds_before_internal_builder_and_checks_identity(
             **identity,
         )
 
-    expected_python = random.Random(42).random()
-    expected_numpy = float(np.random.RandomState(42).random_sample())
-    generator = torch.Generator().manual_seed(42)
+    expected_python = random.Random(seed).random()
+    expected_numpy = float(np.random.RandomState(seed).random_sample())
+    generator = torch.Generator().manual_seed(seed)
     expected_torch = float(torch.rand((), generator=generator))
     fake_result = SimpleNamespace(
         mode=BenchmarkMode.AUDIO_ONLY,
@@ -485,6 +488,7 @@ def test_worker_seeds_before_internal_builder_and_checks_identity(
         device="cpu",
         trust_upstream_artifacts=True,
         resume=False,
+        stop_after_step=100,
         _runtime_builder=builder,
     )
 
@@ -493,6 +497,7 @@ def test_worker_seeds_before_internal_builder_and_checks_identity(
     )
     assert observed["kwargs"]["trusted_upstream_artifacts"] is True
     assert len(observed["run"]["train_samples"]) == 1
+    assert observed["run"]["stop_after_main_step"] == 100
     assert lease.active is False
     assert str(observed["run"]["output_dir"]).startswith("/proc/self/fd/")
     assert result["completed_main_updates"] == 30_000

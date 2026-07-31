@@ -137,8 +137,8 @@ def _atomic_runtime_contract(
 
 
 def _seed_everything(seed: int) -> None:
-    if seed != 42:
-        raise ValueError("strict benchmark seed must be 42")
+    if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
+        raise ValueError("strict benchmark seed must be a nonnegative integer")
     mismatches = {
         name: os.environ.get(name)
         for name, expected in _REQUIRED_PROCESS_ENVIRONMENT.items()
@@ -164,6 +164,7 @@ def run_worker(
     device: torch.device | str,
     trust_upstream_artifacts: bool,
     resume: bool,
+    stop_after_step: int | None = None,
     _runtime_builder: RuntimeBuilder = build_production_runtime,
 ) -> dict[str, object]:
     raw = _load_json(manifest_path)
@@ -234,6 +235,7 @@ def run_worker(
                 output_dir=pinned_output,
                 compatibility=compatibility,
                 resume=resume,
+                stop_after_main_step=stop_after_step,
             )
             runtime_contract_sha256 = _atomic_runtime_contract(
                 pinned_output,
@@ -247,7 +249,11 @@ def run_worker(
                 "resumed_from_main_step": result.resumed_from_main_step,
                 "redone_main_updates": result.redone_main_updates,
                 "selection": result.selection,
-                "final_checkpoint": str(original_output / "final.pt"),
+                "final_checkpoint": str(
+                    original_output / "final.pt"
+                    if result.selection == "final"
+                    else original_output / "checkpoints" / result.final_checkpoint.name
+                ),
                 "milestones": [
                     str(original_output / "milestones" / path.name)
                     for path in result.milestones
@@ -283,6 +289,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--trust-upstream-artifacts", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--stop-after-step", type=int)
     args = parser.parse_args()
     print(
         json.dumps(
@@ -293,6 +300,7 @@ def main() -> None:
                 device=args.device,
                 trust_upstream_artifacts=args.trust_upstream_artifacts,
                 resume=args.resume,
+                stop_after_step=args.stop_after_step,
             ),
             sort_keys=True,
             allow_nan=False,

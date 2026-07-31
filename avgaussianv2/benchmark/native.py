@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -9,6 +10,7 @@ import pickletools
 import stat
 import subprocess
 import tempfile
+
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10
@@ -64,6 +66,41 @@ _TOP_FIELDS = {
     "completion",
     "derived_initialization",
 }
+
+
+def native_protocol_projection_sha256(
+    value: Mapping[str, Any], *, base_dir: Path | None = None
+) -> str:
+    """Hash only configuration that can affect immutable native assets."""
+    projected = copy.deepcopy(dict(value))
+    train = projected.get("train")
+    if not isinstance(train, dict) or "crop_seconds" not in train:
+        raise ValueError(
+            "native protocol projection requires train.crop_seconds"
+        )
+    # Native training does not consume continuation optimizer/loss settings,
+    # but crop length defines the shared strict scene timeline.
+    projected["train"] = {"crop_seconds": train["crop_seconds"]}
+    benchmark = projected.get("benchmark")
+    if not isinstance(benchmark, dict):
+        raise ValueError("native protocol projection requires benchmark mapping")
+    for name in (
+        "seed",
+        "continuation_updates",
+        "conditioner_warmup_steps",
+        "report_steps",
+    ):
+        benchmark.pop(name, None)
+    paths = projected.get("paths")
+    if base_dir is not None and isinstance(paths, dict):
+        for name, raw_path in paths.items():
+            if raw_path is None or not isinstance(raw_path, str):
+                continue
+            path = Path(raw_path)
+            paths[name] = str(
+                path.resolve() if path.is_absolute() else (base_dir / path).resolve()
+            )
+    return hashlib.sha256(canonical_json(projected)).hexdigest()
 
 
 class NativeContractError(RuntimeError):
@@ -940,6 +977,30 @@ def verify_native_contract(
     return {**contract, "_manifest_sha256": manifest_sha256}
 
 
+def native_contract_protocol_projection_sha256(path: str | Path) -> str:
+    """Return the native-affecting projection from the immutable config snapshot."""
+    try:
+        with BenchmarkOutputReadLock(Path(path)) as pinned:
+            files, _, _ = _load_native_generation(pinned)
+            contract = json.loads(files["contract.json"])
+            record = contract["inputs"]["protocol_config"]
+            data = files[record["snapshot"]]
+            if _digest_bytes(data) != record["sha256"]:
+                raise NativeContractError("native protocol config snapshot hash mismatch")
+            raw = yaml.safe_load(data)
+            if not isinstance(raw, Mapping):
+                raise NativeContractError("native protocol config snapshot is invalid")
+            return native_protocol_projection_sha256(
+                raw, base_dir=Path(record["path"]).parent
+            )
+    except (BenchmarkOutputError, KeyError, TypeError, ValueError, yaml.YAMLError) as error:
+        if isinstance(error, NativeContractError):
+            raise
+        raise NativeContractError(
+            f"cannot derive native protocol projection: {error}"
+        ) from error
+
+
 def _verify_native_snapshot(
     value: object,
     files: Mapping[str, bytes],
@@ -1321,6 +1382,8 @@ __all__ = [
     "NativeContractError",
     "finalize_native_contract",
     "inspect_native_checkpoint",
+    "native_contract_protocol_projection_sha256",
+    "native_protocol_projection_sha256",
     "verify_native_contract",
     "write_audiogs_seed_record",
 ]

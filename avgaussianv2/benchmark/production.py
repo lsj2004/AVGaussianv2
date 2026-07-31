@@ -33,7 +33,11 @@ from avgaussianv2.benchmark.evaluation import (
     EvaluationIdentity,
     TrainingEvidence,
 )
-from avgaussianv2.benchmark.native import verify_native_contract
+from avgaussianv2.benchmark.native import (
+    native_contract_protocol_projection_sha256,
+    native_protocol_projection_sha256,
+    verify_native_contract,
+)
 from avgaussianv2.benchmark.output import _proc_fd_parts
 from avgaussianv2.benchmark.runtime import (
     BenchmarkRuntime,
@@ -271,6 +275,11 @@ def materialize_strict_scene_manifest(
     if raw["benchmark"]["expected_test_samples"] != expected_frames:
         raise ValueError("strict scene manifest frame count contract mismatch")
     config_sha256 = sha256_file(config_path)
+    config_projection_sha256 = (
+        native_protocol_projection_sha256(raw, base_dir=config_path.parent)
+        if native_verifier is verify_native_contract
+        else None
+    )
     contracts = {
         kind: native_verifier(
             Path(native_contract_dirs[kind]).absolute(),
@@ -280,9 +289,17 @@ def materialize_strict_scene_manifest(
         for kind in ("audiogs", "ftgspp")
     }
     for kind, contract in contracts.items():
+        contract_projection_sha256 = (
+            native_contract_protocol_projection_sha256(
+                Path(native_contract_dirs[kind]).absolute()
+            )
+            if native_verifier is verify_native_contract
+            else contract.get("_protocol_projection_sha256")
+        )
+        legacy_config_sha256 = contract["inputs"]["protocol_config"]["sha256"]
         if (
-            contract["inputs"]["protocol_config"]["sha256"]
-            != config_sha256
+            contract_projection_sha256 != config_projection_sha256
+            and legacy_config_sha256 != config_sha256
         ):
             raise ValueError(f"{kind} native contract does not bind protocol config")
 
@@ -707,12 +724,26 @@ def prepare_worker_manifests(
         if source_config is None or audited_config is None:
             raise RuntimeError("production runtime snapshot has no config")
         source_sha256 = input_snapshot.source_config_sha256
+        benchmark_config_path = getattr(input_snapshot, "config_proc_path", None)
+        benchmark_raw = yaml.safe_load(
+            Path(benchmark_config_path or resolved).read_text()
+        )
+        if not isinstance(benchmark_raw, Mapping):
+            raise ValueError("benchmark config must be a mapping")
+        native_projection_sha256 = native_protocol_projection_sha256(
+            benchmark_raw, base_dir=resolved.parent
+        )
         for kind in ("audiogs", "ftgspp"):
             contract_dir = Path(native_contract_dirs[kind]).absolute()
             contract = native_verifier(
                 contract_dir,
                 expected_scene=source_config.scene.scene_id,
                 expected_model_kind=kind,
+            )
+            contract_projection_sha256 = (
+                native_contract_protocol_projection_sha256(contract_dir)
+                if native_verifier is verify_native_contract
+                else contract.get("_protocol_projection_sha256")
             )
             configured_checkpoint = getattr(
                 audited_config.paths,
@@ -739,7 +770,11 @@ def prepare_worker_manifests(
                 for record in source_audits
             }
             if (
-                contract["inputs"]["protocol_config"]["sha256"] != source_sha256
+                not (
+                    contract_projection_sha256 == native_projection_sha256
+                    or contract["inputs"]["protocol_config"]["sha256"]
+                    == source_sha256
+                )
                 or Path(contract["checkpoint"]["path"]).absolute()
                 != configured_checkpoint.absolute()
                 or contract["checkpoint"]["sha256"] != expected_checkpoint_sha256
@@ -753,10 +788,6 @@ def prepare_worker_manifests(
                 "checkpoint_sha256": contract["checkpoint"]["sha256"],
             }
         input_snapshot.verify()
-        benchmark_config_path = getattr(input_snapshot, "config_proc_path", None)
-        benchmark_raw = yaml.safe_load(
-            Path(benchmark_config_path or resolved).read_text()
-        )
         benchmark_section = benchmark_raw.get("benchmark", {})
         benchmark_seed = int(benchmark_section.get("seed", source_config.train.seed))
         training = BenchmarkConfig(

@@ -1971,8 +1971,7 @@ def run_scene_benchmark(
         _record_status(pinned_output, scene=scene, phase="prepare", detail="complete")
         _run_parallel(runner, workers)
         _record_status(pinned_output, scene=scene, phase="training", detail="complete")
-        for offset in range(0, len(evaluations), 3):
-            _run_parallel(runner, evaluations[offset : offset + 3])
+        _run_parallel(runner, evaluations)
         _record_status(
             pinned_output, scene=scene, phase="evaluation", detail="complete"
         )

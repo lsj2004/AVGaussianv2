@@ -667,3 +667,42 @@ def test_strict_native_evidence_to_eval_scene_and_suite_chain(
         "Scene7playing": 1,
         "scene1_opera": 1,
     }
+
+
+def test_native_protocol_projection_ignores_continuation_only_fields(tmp_path):
+    base = {
+        "scene": {"id": "scene1_opera"},
+        "paths": {"audio_checkpoint": "audio.pt"},
+        "model": {"sample_rate": 16_000},
+        "train": {"crop_seconds": 0.5, "seed": 42, "lambda_lre": 0.0},
+        "benchmark": {
+            "protocol": "dual_dataset_cam38_v1",
+            "seed": 42,
+            "continuation_updates": 30_000,
+            "conditioner_warmup_steps": 2_000,
+            "report_steps": [5_000, 10_000, 30_000],
+        },
+    }
+    derived = json.loads(json.dumps(base))
+    derived["train"].update(seed=73, lambda_lre=0.02)
+    derived["benchmark"]["seed"] = 73
+    assert native_module.native_protocol_projection_sha256(
+        base, base_dir=tmp_path
+    ) == native_module.native_protocol_projection_sha256(
+        derived, base_dir=tmp_path
+    )
+
+    derived["model"]["sample_rate"] = 48_000
+    assert native_module.native_protocol_projection_sha256(
+        base, base_dir=tmp_path
+    ) != native_module.native_protocol_projection_sha256(
+        derived, base_dir=tmp_path
+    )
+
+    derived = json.loads(json.dumps(base))
+    derived["train"]["crop_seconds"] = 1.0
+    assert native_module.native_protocol_projection_sha256(
+        base, base_dir=tmp_path
+    ) != native_module.native_protocol_projection_sha256(
+        derived, base_dir=tmp_path
+    )

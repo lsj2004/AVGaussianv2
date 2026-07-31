@@ -405,6 +405,11 @@ def load_audited_benchmark_config(
             semantic_path=semantic_path,
             snapshot_data=config_data,
         )
+        # A resolved config is a transport representation, not the canonical
+        # protocol source.  Even when its absolute paths pass the asset audit,
+        # its origin contract must still bind and audit the immutable source.
+        if origin_path is not None or semantic_path.name == "resolved_project.yaml":
+            raise AssetAuditError("resolved config requires source-origin audit")
     except AssetAuditError:
         # Orchestration materializes an absolute-path copy outside configs/.
         # Bind it back to the audited immutable source instead of weakening the

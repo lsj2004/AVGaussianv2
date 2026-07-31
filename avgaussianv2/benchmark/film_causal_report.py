@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from avgaussianv2.benchmark.artifacts import canonical_json, publish_generation, sha256
-from avgaussianv2.benchmark.evaluation import ALL_METRICS, BenchmarkEvaluationResult
+from avgaussianv2.benchmark.evaluation import BenchmarkEvaluationResult
 from avgaussianv2.benchmark.report import BenchmarkReportError, _paired, _validate_result
 
 SCHEMA = "avgaussianv2.film-causal-scene-report"
@@ -39,9 +39,10 @@ def build_film_causal_report(
             raise BenchmarkReportError("FiLM causal variants must reuse one checkpoint")
         if len({canonical_json(value.metric_protocol) for value in values}) != 1:
             raise BenchmarkReportError("FiLM causal variants require one metric protocol")
+        metrics = tuple(sorted(values[0].summary))
         paired[str(step)] = {
-            "rgbd_on_vs_off": _paired(values[0], values[1], ALL_METRICS),
-            "correct_vs_wrong_camera": _paired(values[0], values[2], ALL_METRICS),
+            "rgbd_on_vs_off": _paired(values[0], values[1], metrics),
+            "correct_vs_wrong_camera": _paired(values[0], values[2], metrics),
         }
     base: dict[str, object] = {
         "schema": SCHEMA, "version": 1, "scene_id": scene_id,

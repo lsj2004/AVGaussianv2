@@ -1375,6 +1375,7 @@ class FixedBudgetTrainer:
         output_dir: str | Path,
         compatibility: BenchmarkCompatibility,
         resume: bool = False,
+        stop_after_main_step: int | None = None,
         interrupt_after_main_step: int | None = None,
     ) -> BenchmarkTrainingResult:
         resolved_mode = BenchmarkMode(mode)
@@ -1396,6 +1397,15 @@ class FixedBudgetTrainer:
             raise ValueError("training dataset must not be empty")
         if any(index < 0 or index >= len(train_samples) for index in shared_indices):
             raise ValueError("shared sample-index sequence is out of range")
+        if stop_after_main_step is not None and (
+            not isinstance(stop_after_main_step, int)
+            or isinstance(stop_after_main_step, bool)
+            or stop_after_main_step <= 0
+            or stop_after_main_step >= self.config.main_updates
+        ):
+            raise ValueError(
+                "stop_after_main_step must be between 1 and main_updates - 1"
+            )
 
         output = Path(output_dir)
         output.mkdir(parents=True, exist_ok=True)
@@ -1601,6 +1611,10 @@ class FixedBudgetTrainer:
                     parameter.requires_grad_(original_requires_grad[id(parameter)])
                 model.condition_enabled = original_condition_enabled
                 raise
+            if stop_after_main_step is not None and main_step >= stop_after_main_step:
+                raise BenchmarkResumeError(
+                    "stop_after_main_step must exceed the resumed main step"
+                )
         else:
             configure_benchmark_mode(
                 model, resolved_mode, "warmup" if stage == "warmup" else "main"
@@ -1807,7 +1821,12 @@ class FixedBudgetTrainer:
                     io_counters=io_counters,
                 )
             milestone = main_step in self.config.milestones
-            if main_step % self.config.checkpoint_every == 0 or milestone:
+            requested_stop = stop_after_main_step == main_step
+            if (
+                main_step % self.config.checkpoint_every == 0
+                or milestone
+                or requested_stop
+            ):
                 payload = self._checkpoint_payload(
                     model=model,
                     optimizer=optimizer,
@@ -1839,6 +1858,45 @@ class FixedBudgetTrainer:
                         fingerprint_sha256=str(fingerprint["sha256"]),
                         io_counters=io_counters,
                     )
+            if requested_stop:
+                self._write_journal(
+                    output,
+                    stage="main",
+                    observed_warmup_step=warmup_step,
+                    observed_main_step=main_step,
+                    exact_warmup_step=warmup_step,
+                    exact_main_step=main_step,
+                    fingerprint_sha256=str(fingerprint["sha256"]),
+                    io_counters=io_counters,
+                )
+                _persist_io_sidecar(
+                    output, str(fingerprint["sha256"]), io_counters
+                )
+                pause_checkpoint = (
+                    output / "checkpoints" / f"main_step_{main_step:06d}.pt"
+                )
+                if not pause_checkpoint.is_file():
+                    raise RuntimeError("pause checkpoint was not published")
+                return BenchmarkTrainingResult(
+                    mode=resolved_mode,
+                    completed_warmup_steps=warmup_step,
+                    completed_main_updates=main_step,
+                    resumed_from_main_step=resumed_from_main_step,
+                    redone_main_updates=max(
+                        0, observed_at_resume - resumed_from_main_step
+                    ),
+                    selection="paused",
+                    final_checkpoint=pause_checkpoint,
+                    milestones=tuple(
+                        output / "milestones" / f"step_{step:06d}.pt"
+                        for step in self.config.milestones
+                        if step <= main_step
+                        and (
+                            output / "milestones" / f"step_{step:06d}.pt"
+                        ).is_file()
+                    ),
+                    io=io_counters,
+                )
             if interrupt_after_main_step == main_step:
                 raise RuntimeError("injected benchmark interruption")
 

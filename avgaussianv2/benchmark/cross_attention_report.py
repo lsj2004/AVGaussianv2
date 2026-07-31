@@ -12,7 +12,6 @@ from avgaussianv2.benchmark.artifacts import (
     sha256,
 )
 from avgaussianv2.benchmark.evaluation import (
-    ALL_METRICS,
     REPORTING_STEPS,
     BenchmarkEvaluationResult,
 )
@@ -180,11 +179,12 @@ def build_cross_attention_scene_report(
     paired_by_step = {}
     for step in reporting_steps:
         cross = indexed[(main_system, step)]
+        common_metrics = tuple(sorted(cross.summary))
         paired = {
             f"{main_system}_vs_film_unet": _paired(
                 cross,
                 indexed[(FILM_SYSTEM, step)],
-                ALL_METRICS,
+                common_metrics,
             )
         }
         comparisons = {
@@ -199,7 +199,7 @@ def build_cross_attention_scene_report(
                 paired[label] = _paired(
                     cross,
                     indexed[(system, step)],
-                    ALL_METRICS,
+                    common_metrics,
                 )
         paired_by_step[str(step)] = paired
     scaling = {
@@ -225,13 +225,13 @@ def build_cross_attention_scene_report(
                 indexed[(FILM_SYSTEM, primary_step)].provenance["train_cameras"]
             ),
             "test_camera": "cam38",
-            "seed": 42,
+            "seed": indexed[(FILM_SYSTEM, primary_step)].provenance["seed"],
             "batch_size": 1,
             "index_sha256": indexed[
                 (FILM_SYSTEM, primary_step)
             ].provenance["index_sha256"],
             "visual_initialization_sha256": indexed[
-                (FILM_SYSTEM, PRIMARY_STEP)
+                (FILM_SYSTEM, primary_step)
             ].provenance["visual_initialization_sha256"],
             "audiogs_checkpoint_sha256": audio_contract["checkpoint_sha256"],
             "audio_criterion": alignment["audio_criterion"],

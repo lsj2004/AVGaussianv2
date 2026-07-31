@@ -224,8 +224,16 @@ def audit_protocol_config(
         camera: index for index, camera in enumerate(ALL_CAMERAS)
     }:
         raise AssetAuditError("scene.camera_mapping must map exactly cam00..cam38")
-    if project.train.seed != 42:
-        raise AssetAuditError("train.seed must equal benchmark.seed 42")
+    benchmark_seed = benchmark.get("seed")
+    if (
+        not isinstance(benchmark_seed, int)
+        or isinstance(benchmark_seed, bool)
+        or benchmark_seed < 0
+        or project.train.seed != benchmark_seed
+    ):
+        raise AssetAuditError(
+            "train.seed and benchmark.seed must be the same nonnegative integer"
+        )
     if project.train.warmup_steps != 2_000:
         raise AssetAuditError("train.warmup_steps must equal conditioner warmup 2000")
     if project.train.joint_steps != 30_000:
@@ -236,7 +244,7 @@ def audit_protocol_config(
         "protocol": PROTOCOL,
         "test_camera": TEST_CAMERA,
         "expected_test_samples": expected["test_samples"],
-        "seed": 42,
+        "seed": benchmark_seed,
         "continuation_updates": 30_000,
         "conditioner_warmup_steps": 2_000,
         "report_steps": [5_000, 10_000, 30_000],
@@ -258,8 +266,20 @@ def audit_protocol_config(
     if not _equals_typed(dict(budgets), wanted_budgets):
         raise AssetAuditError(f"benchmark.native_budgets must be {wanted_budgets!r}")
 
-    repository = semantic_config_path.parent.parent.parent.resolve()
-    scene_root = repository / "runs" / "cam38_strict" / project.scene.scene_id
+    audio_suffix = Path(
+        "audiogs",
+        "native",
+        "replayNVAS",
+        expected["audio_scene"],
+        "viewpoint_39",
+        "checkpoint_latest.pth",
+    )
+    audio_checkpoint = project.paths.audio_checkpoint.absolute()
+    if tuple(audio_checkpoint.parts[-len(audio_suffix.parts) :]) != audio_suffix.parts:
+        raise AssetAuditError(
+            "paths.audio_checkpoint does not use the strict native layout"
+        )
+    scene_root = Path(*audio_checkpoint.parts[: -len(audio_suffix.parts)])
     _require_exact_path(
         project.paths.visual_checkpoint,
         scene_root

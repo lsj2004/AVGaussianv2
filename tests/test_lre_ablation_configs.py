@@ -61,9 +61,10 @@ def test_screening_generation_only_expands_screening_seed(tmp_path: Path) -> Non
         and record["lambda_lre"] == pytest.approx(0.02)
     )
     config = yaml.safe_load(Path(scene1["config"]).read_text())
-    assert config["train"]["joint_steps"] == 5_000
-    assert config["benchmark"]["continuation_updates"] == 5_000
-    assert config["benchmark"]["report_steps"] == [5_000]
+    assert config["train"]["joint_steps"] == 30_000
+    assert config["benchmark"]["continuation_updates"] == 30_000
+    assert config["benchmark"]["report_steps"] == [5_000, 10_000, 30_000]
+    assert all(record["stop_after_step"] == 5_000 for record in generated["runs"])
     assert (
         Path(scene1["config"]).parent / config["paths"]["visual_checkpoint"]
     ).resolve() == (
