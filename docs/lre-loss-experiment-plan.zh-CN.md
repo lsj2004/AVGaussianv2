@@ -18,9 +18,9 @@
 服务器预计有两张空闲的 48 GB GPU。先为每个架构各跑一个短 smoke，记录单进程
 峰值显存和吞吐，再决定并发：
 
-- 初始每张卡启动 2 个训练进程；
-- 只有估算总峰值低于显存的 80%、没有 OOM，且单任务吞吐下降不超过 20% 时，
-  才可提高到每卡 3-4 个；
+- 当前 runner 每张卡只启动 1 个训练进程，先保证严格隔离和失败可恢复；
+- runner 记录单任务峰值显存、利用率和耗时。只有后续实现了显存预算调度，且实测
+  总峰值低于显存的 80%、没有 OOM、单任务吞吐下降不超过 20% 时，才允许提高并发；
 - 两张卡尽量同时保持有任务，不要串行等待；
 - 同一组 control / treatment 尽量分配到相同型号 GPU；
 - OOM 时先降低单卡并发，不修改 batch size 或实验语义。
@@ -101,8 +101,8 @@ seed: 42
 ```
 
 - 每个架构最多保留 1-2 个非零权重；
-- 先训练到 10k；
-- 10k 仍有稳定收益的候选再训练到 30k；
+- 先训练到 5k 并严格评测，最多保留 1-2 个非零权重；
+- 入选候选从同一 checkpoint 续训到 10k，10k 仍有稳定收益时再续训到 30k；
 - 输出逐样本指标和 Source Binaural / Mono / control / treatment 对比表。
 
 P2 的目标是选出“架构 + loss 权重”，不是补齐搜索网格。
@@ -145,3 +145,50 @@ Agent 可以在以下条件满足后停止本轮实验：
 6. 所有已完成结果通过独立 verifier，没有缺失、重复或 hash 不一致。
 
 本轮不要求机械完成整个候选池。详细统计协议和更多候选配置放到下一轮再补。
+
+## 6. 统一运行入口
+
+每一阶段先生成 manifest，再由 runner 消费。screening 与 confirmation 共用稳定的
+`continuation_id` 和配置字节，因此入选候选会续训，不会从零开始：
+
+```bash
+python scripts/generate_lre_ablation_configs.py \
+  --stage screening \
+  --system audio_only \
+  --system query_dependent_p1 \
+  --strict-run-root /path/to/verified/runs/cam38_strict
+
+python -m avgaussianv2.cli.benchmark_lre_run \
+  --manifest configs/generated/lre_loss_ablation/screening/manifest.json \
+  --output-root runs/lre_loss_ablation_visual_time_v2 \
+  --native-root /path/to/verified/runs/cam38_strict \
+  --gpus 0,1 \
+  --trust-upstream-artifacts
+
+python -m avgaussianv2.cli.benchmark_lre_select \
+  --manifest configs/generated/lre_loss_ablation/screening/manifest.json \
+  --run-root runs/lre_loss_ablation_visual_time_v2 \
+  --output results/lre_loss_ablation_visual_time_v2/screening_winners.json
+
+python scripts/generate_lre_ablation_configs.py \
+  --stage confirmation \
+  --winners results/lre_loss_ablation_visual_time_v2/screening_winners.json \
+  --system audio_only \
+  --system query_dependent_p1 \
+  --strict-run-root /path/to/verified/runs/cam38_strict
+
+python -m avgaussianv2.cli.benchmark_lre_run \
+  --manifest configs/generated/lre_loss_ablation/confirmation/manifest.json \
+  --output-root runs/lre_loss_ablation_visual_time_v2 \
+  --native-root /path/to/verified/runs/cam38_strict \
+  --gpus 0,1 \
+  --trust-upstream-artifacts \
+  --resume
+```
+
+runner 启动前要求每张卡至少空闲 8 GiB 且利用率不超过 10%；运行时每张卡最多
+一个活动 pipeline。5k 暂停产物通过 resume state、progress、milestone journal 和
+checkpoint SHA 后即可评测，但不会生成或伪装成 `final.pt`。screening selector 要求
+非零候选在所有 scene/system 单元逐一通过门槛；winner 文件绑定 screening manifest
+的 SHA-256。confirmation 使用同一 `continuation_id`、配置 SHA 和运行目录，从 5k
+精确续训到 30k。

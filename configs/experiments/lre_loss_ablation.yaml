@@ -8,8 +8,8 @@ execution_policy:
   candidate_matrix_is_upper_bound: true
   gpu_count_expected: 2
   gpu_memory_gb: 48
-  initial_processes_per_gpu: 2
-  max_processes_per_gpu: 4
+  initial_processes_per_gpu: 1
+  max_processes_per_gpu: 1
   multi_seed_priority: last
 
 scenes: [scene1_opera, Scene7playing]

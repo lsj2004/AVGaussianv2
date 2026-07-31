@@ -57,7 +57,7 @@ def test_preflight_probes_every_gpu_in_each_production_environment(
         env = kwargs.get("env")
         calls.append((argv, None if env is None else dict(env)))  # type: ignore[arg-type]
         if argv[0] == "nvidia-smi":
-            return _completed("2, 10000\n5, 11000\n7, 12000\n")
+            return _completed("2, 10000, 0\n5, 11000, 1\n7, 12000, 2\n")
         gpu = kwargs["env"]["CUDA_VISIBLE_DEVICES"]  # type: ignore[index]
         return _completed(_probe_payload(argv, gpu))
 
@@ -103,6 +103,8 @@ def test_preflight_probes_every_gpu_in_each_production_environment(
         "ftgspp",
         "audiogs",
     }
+    assert result["gpu_free_mib"] == {"2": 10000, "5": 11000, "7": 12000}
+    assert result["gpu_utilization_percent"] == {"2": 0, "5": 1, "7": 2}
 
 
 def test_preflight_fails_closed_on_environment_cuda_probe_error(
@@ -113,7 +115,7 @@ def test_preflight_fails_closed_on_environment_cuda_probe_error(
 
     def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         if command[0] == "nvidia-smi":
-            return _completed("0, 10000\n1, 10000\n2, 10000\n")
+            return _completed("0, 10000, 0\n1, 10000, 0\n2, 10000, 0\n")
         if command[0].endswith("FreeTimeGSPlusPlus/.venv/bin/python"):
             raise subprocess.CalledProcessError(
                 1, command, stderr="tinycudann import failed"

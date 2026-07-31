@@ -71,6 +71,16 @@
 
 精确暂停/恢复单测验证了：3 步暂停后从同一 checkpoint 恢复至 6 步，不重启、不改合同、最终状态与连续执行一致。Native 投影测试验证 seed/LRE 变化可复用合同，而模型配置变化必然改变投影。
 
+### 2.6 LRE 两卡流水线闭环
+
+- 新增统一 LRE runner，严格按 `prepare → train → eval` 依赖顺序执行，每张 GPU 同时最多一个 pipeline；两张卡并行不同候选，单个阶段失败会终止其他活动阶段。
+- GPU 预检从“显存大于零”收紧为至少 8 GiB 空闲且利用率不超过 10%，运行结果记录峰值已用显存和最高利用率。
+- screening 的 5k 暂停 checkpoint 现在可以通过 progress、resume sidecar、artifact journal 与 SHA-256 独立验证并评测；30k 正式结果仍必须具有完整 5k/10k/30k 里程碑、`final.pt` 和最终资产清单。
+- screening 与 confirmation 使用稳定 `continuation_id`、共享配置字节和同一输出目录。每个续训目录新增不可变身份文件，绑定配置 SHA、场景、架构、seed 和 LRE 权重，拒绝无身份或身份不匹配的目录复用。
+- 配置生成器新增 `--strict-run-root`，可把配置中的规范 `runs/cam38_strict` 路径显式映射到本机已验证资产根，避免在准备阶段才发现 worktree 路径不存在。
+- 新增 screening selector：候选必须在所有 scene/system 单元分别满足 LRE 相对改善、`audio_total` 与 waveform L1 退化门槛，才按配置约定的宏平均 LRE error 排序保留最多两个。winner 文件与 screening manifest SHA-256 绑定。
+- prepare CLI 不再向终端展开 4,940 个样本 ID，只输出样本数；完整 ID 序列仍保存在可审计 preparation artifact 中。
+
 ## 3. 公平比较边界
 
 ### 可以严格横向比较
@@ -112,8 +122,9 @@ python -m avgaussianv2.cli.benchmark_film_causal_report \
 - Bash 语法检查：通过。
 - `git diff --check`：通过。
 - P0 定向单元/合同测试：88 项通过。
-- 全量单元/合同测试：375 项通过（最终复跑 37.46 秒）；包括任意 seed、精确暂停/恢复、Native 投影、30k/5k LRE 合同，以及 Source Audio 论文指标。
+- 全量单元/合同测试：382 项通过（最终复跑 39.50 秒）；包括任意 seed、精确暂停/恢复、Native 投影、30k/5k LRE 合同、两卡 runner、screening selector，以及 Source Audio 论文指标。
 - 两份真实 scene1 配置（seed 42、73）均通过资产审计，且其 Native-affecting 投影与现有 AudioGS Native 合同一致。
+- 使用本机外部严格资产根生成 16 份 LRE screening 配置，逐项检查 96 个路径，缺失数为 0。
 
 ## 6. 真实 GPU smoke
 

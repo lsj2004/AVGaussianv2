@@ -39,7 +39,18 @@ def main() -> None:
         trusted_upstream_artifacts=args.trust_upstream_artifacts,
         native_contract_dirs=native_contract_dirs,
     )
-    print(json.dumps(result, sort_keys=True))
+    runtime = dict(result["runtime"])
+    sample_ids = runtime.pop("dataset_sample_ids")
+    runtime["dataset_sample_count"] = len(sample_ids)
+    print(
+        json.dumps(
+            {
+                **result,
+                "runtime": runtime,
+            },
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":

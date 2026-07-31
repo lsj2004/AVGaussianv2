@@ -81,7 +81,7 @@ def test_confirmation_requires_winners_bound_to_screening_manifest(
     with pytest.raises(ValueError, match="requires --winners"):
         _generate(module, tmp_path, stage="confirmation")
 
-    _generate(module, tmp_path, stage="screening")
+    screening = _generate(module, tmp_path, stage="screening")
     screening_manifest = tmp_path / "screening/manifest.json"
     winners = tmp_path / "winners.json"
     winners.write_text(
@@ -126,6 +126,40 @@ def test_confirmation_requires_winners_bound_to_screening_manifest(
         for record in generated["runs"]
         if record["lambda_lre"] != 0.0
     )
+    screening_configs = {
+        record["config_id"]: (record["config"], record["config_sha256"])
+        for record in screening["configs"]
+    }
+    assert all(
+        screening_configs[record["config_id"]]
+        == (record["config"], record["config_sha256"])
+        for record in generated["configs"]
+    )
+    assert all(
+        record["continuation_id"] == record["config_id"]
+        for record in generated["runs"]
+    )
+
+
+def test_generation_can_bind_configs_to_external_strict_asset_root(tmp_path: Path) -> None:
+    external = tmp_path / "external-strict-runs"
+    generated = _generate(
+        _load_generator(),
+        tmp_path / "generated",
+        strict_run_root=external,
+    )
+    scene1 = next(
+        record
+        for record in generated["configs"]
+        if record["scene"] == "scene1_opera"
+        and record["system"] == "audio_only"
+        and record["lambda_lre"] == 0.0
+    )
+    config = yaml.safe_load(Path(scene1["config"]).read_text())
+    checkpoint = (
+        Path(scene1["config"]).parent / config["paths"]["visual_checkpoint"]
+    ).resolve()
+    assert checkpoint.is_relative_to(external.resolve())
 
 
 @pytest.mark.parametrize(

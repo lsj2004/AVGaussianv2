@@ -10,6 +10,10 @@ from typing import Any
 import yaml
 
 
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_STRICT_RUN_ROOT = (ROOT / "runs/cam38_strict").resolve()
+
+
 def _weight_slug(value: float) -> str:
     return f"{value:.3f}".replace(".", "")
 
@@ -30,6 +34,7 @@ def _rebase_paths(
     *,
     source_directory: Path,
     destination_directory: Path,
+    strict_run_root: Path | None,
 ) -> None:
     paths = config.get("paths")
     if not isinstance(paths, dict):
@@ -41,8 +46,16 @@ def _rebase_paths(
             raise ValueError(f"base config paths.{name} must be a string or null")
         path = Path(raw_path)
         if path.is_absolute():
-            continue
-        absolute = (source_directory / path).resolve()
+            absolute = path.resolve()
+        else:
+            absolute = (source_directory / path).resolve()
+        if strict_run_root is not None:
+            try:
+                relative = absolute.relative_to(DEFAULT_STRICT_RUN_ROOT)
+            except ValueError:
+                pass
+            else:
+                absolute = strict_run_root.resolve() / relative
         paths[name] = os.path.relpath(absolute, destination_directory.resolve())
 
 
@@ -73,7 +86,7 @@ def _selection_weights(
         "source_screening_manifest_sha256",
         "selected_lambda_lre",
     }
-    if not isinstance(selection, dict) or set(selection) != expected_fields:
+    if not isinstance(selection, dict) or not expected_fields.issubset(selection):
         raise ValueError("screening winner fields mismatch")
     if (
         selection["schema"] != "avgaussianv2.lre-loss-screening-selection"
@@ -110,6 +123,7 @@ def generate(
     stage: str = "screening",
     winners_path: Path | None = None,
     systems: tuple[str, ...] | None = None,
+    strict_run_root: Path | None = None,
 ) -> dict[str, object]:
     manifest_path = manifest_path.resolve()
     manifest = _load_mapping(manifest_path)
@@ -145,7 +159,9 @@ def generate(
         raise ValueError(f"{stage}.report_steps must be sorted, unique, and positive")
     max_steps = report_steps[-1]
     stage_dir = output_dir.resolve() / stage
+    config_dir = output_dir.resolve() / "configs"
     stage_dir.mkdir(parents=True, exist_ok=True)
+    config_dir.mkdir(parents=True, exist_ok=True)
     catalog = manifest.get("architecture_configs")
     if not isinstance(catalog, dict):
         raise ValueError("architecture_configs must be a mapping")
@@ -182,18 +198,26 @@ def generate(
                         fixed["lre_smooth_l1_beta"]
                     )
                     derived["benchmark"]["seed"] = int(seed)
-                    config_id = (
-                        f"{stage}__{system}__{scene}__seed{seed}"
+                    continuation_id = (
+                        f"{system}__{scene}__seed{seed}"
                         f"__lre{_weight_slug(weight)}"
                     )
-                    destination = stage_dir / f"{config_id}.yaml"
+                    config_id = continuation_id
+                    destination = config_dir / f"{config_id}.yaml"
                     _rebase_paths(
                         derived,
                         source_directory=base_path.parent,
                         destination_directory=destination.parent,
+                        strict_run_root=strict_run_root,
                     )
                     data = yaml.safe_dump(derived, sort_keys=False).encode()
-                    destination.write_bytes(data)
+                    if destination.exists():
+                        if destination.read_bytes() != data:
+                            raise ValueError(
+                                f"continuation config changed across stages: {config_id}"
+                            )
+                    else:
+                        destination.write_bytes(data)
                     configs.append(
                         {
                             "config_id": config_id,
@@ -207,7 +231,7 @@ def generate(
                             "config_sha256": hashlib.sha256(data).hexdigest(),
                         }
                     )
-                    run_id = config_id
+                    run_id = f"{stage}__{continuation_id}"
                     control_run_id = (
                         None
                         if weight == 0.0
@@ -219,6 +243,7 @@ def generate(
                     runs.append(
                         {
                             "run_id": run_id,
+                            "continuation_id": continuation_id,
                             "stage": stage,
                             "config_id": config_id,
                             "scene": scene,
@@ -251,17 +276,16 @@ def generate(
 
 
 def main() -> None:
-    root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--manifest",
         type=Path,
-        default=root / "configs/experiments/lre_loss_ablation.yaml",
+        default=ROOT / "configs/experiments/lre_loss_ablation.yaml",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=root / "configs/generated/lre_loss_ablation",
+        default=ROOT / "configs/generated/lre_loss_ablation",
     )
     parser.add_argument(
         "--stage",
@@ -279,6 +303,14 @@ def main() -> None:
         dest="systems",
         help="architecture survivor system; repeat for multiple systems",
     )
+    parser.add_argument(
+        "--strict-run-root",
+        type=Path,
+        help=(
+            "override the canonical runs/cam38_strict asset root in generated "
+            "config paths"
+        ),
+    )
     args = parser.parse_args()
     result = generate(
         args.manifest,
@@ -286,6 +318,7 @@ def main() -> None:
         stage=args.stage,
         winners_path=args.winners,
         systems=tuple(args.systems or ()),
+        strict_run_root=args.strict_run_root,
     )
     print(
         json.dumps(

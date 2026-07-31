@@ -31,6 +31,7 @@ from avgaussianv2.benchmark.training import (
     SCHEMA,
     SCHEMA_VERSION,
     BenchmarkCompatibility,
+    CheckpointIO,
     hash_shared_indices,
 )
 from avgaussianv2.contracts import AlignedAVSample
@@ -99,7 +100,7 @@ def _hold_artifact_lock(path, ready, release):
         release.wait(10)
 
 
-def _task12_evidence(tmp_path, *, step=5_000):
+def _task12_evidence(tmp_path, *, step=5_000, paused=False):
     output = tmp_path / "worker"
     milestones = output / "milestones"
     milestones.mkdir(parents=True)
@@ -203,6 +204,55 @@ def _task12_evidence(tmp_path, *, step=5_000):
             }
         )
     )
+    if paused:
+        if step != 5_000:
+            raise ValueError("paused Task12 fixture supports only step 5000")
+        for stale_step in (10_000, 30_000):
+            (milestones / f"step_{stale_step:06d}.pt").unlink()
+        (output / "final.pt").unlink()
+        (output / "artifact_hashes.json").unlink()
+        milestone_name = "milestones/step_005000.pt"
+        (output / "artifact_journal.json").write_text(
+            json.dumps(
+                {
+                    "schema": f"{SCHEMA}.artifact-journal",
+                    "version": SCHEMA_VERSION,
+                    "fingerprint_sha256": fingerprint["sha256"],
+                    "sha256": {milestone_name: hashes[milestone_name]},
+                }
+            )
+        )
+        checkpoints = output / "checkpoints"
+        checkpoints.mkdir()
+        rolling = checkpoints / "main_step_005000.pt"
+        rolling.write_bytes((milestones / "step_005000.pt").read_bytes())
+        rolling_sha256 = hashlib.sha256(rolling.read_bytes()).hexdigest()
+        (output / "checkpoint_io.json").write_text(
+            json.dumps(
+                {
+                    "schema": f"{SCHEMA}.checkpoint-io",
+                    "version": SCHEMA_VERSION,
+                    "fingerprint_sha256": fingerprint["sha256"],
+                    "io": CheckpointIO().to_mapping(),
+                    "committed_checkpoints": {rolling.name: rolling_sha256},
+                }
+            )
+        )
+        (output / "progress.json").write_text(
+            json.dumps(
+                {
+                    "schema": f"{SCHEMA}.progress",
+                    "version": SCHEMA_VERSION,
+                    "stage": "main",
+                    "observed_warmup_step": 2_000,
+                    "observed_main_step": 5_000,
+                    "exact_warmup_step": 2_000,
+                    "exact_main_step": 5_000,
+                    "maximum_replay_updates": 500,
+                    "fingerprint_sha256": fingerprint["sha256"],
+                }
+            )
+        )
     checkpoint = milestones / f"step_{step:06d}.pt"
     return TrainingEvidence(
         system_name="joint_conditioned",
@@ -476,6 +526,27 @@ def test_strict_task12_contract_adapter_accepts_real_checkpoint_layout(tmp_path)
         130,
     )
     audit_training_evidence(evidence, identity)
+
+
+def test_strict_task12_accepts_audited_paused_milestone_without_final(tmp_path):
+    evidence = _task12_evidence(tmp_path, paused=True)
+    identity = EvaluationIdentity(
+        "scene1_opera",
+        "joint_conditioned",
+        5_000,
+        tuple(f"scene1_opera/cam38/{index:06d}" for index in range(130)),
+        130,
+    )
+
+    audit_training_evidence(evidence, identity)
+    assert not (Path(evidence.training_output_dir) / "final.pt").exists()
+
+    journal = Path(evidence.training_output_dir) / "artifact_journal.json"
+    value = json.loads(journal.read_text())
+    value["sha256"] = {}
+    journal.write_text(json.dumps(value))
+    with pytest.raises(BenchmarkEvaluationError, match="transaction hash|manifest"):
+        audit_training_evidence(evidence, identity)
 
 
 def test_cross_attention_causal_label_reuses_joint_training_contract(tmp_path):

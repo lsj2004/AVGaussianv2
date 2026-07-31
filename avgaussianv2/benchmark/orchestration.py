@@ -61,6 +61,8 @@ MIN_FREE_BYTES = 300 * 1024**3
 FTGSPP_PYTHON = Path("/mnt/sda/lisujing/Dataset/FreeTimeGSPlusPlus/.venv/bin/python")
 GPU_PROBE_TIMEOUT_SECONDS = 120.0
 GPU_PROBE_TERMINATE_SECONDS = 5.0
+MIN_GPU_FREE_MIB = 8 * 1024
+MAX_IDLE_GPU_UTILIZATION_PERCENT = 10
 
 
 def _cuda_probe_source(modules: Sequence[str]) -> str:
@@ -1065,16 +1067,19 @@ def _preflight(
         query = _run_probe_command(
             [
                 "nvidia-smi",
-                "--query-gpu=index,memory.free",
+                "--query-gpu=index,memory.free,utilization.gpu",
                 "--format=csv,noheader,nounits",
             ],
             environment=os.environ,
         ).stdout
-        available = {
-            int(line.split(",", 1)[0].strip()): int(line.split(",", 1)[1].strip())
-            for line in query.splitlines()
-            if line.strip()
-        }
+        available = {}
+        for line in query.splitlines():
+            if not line.strip():
+                continue
+            index, free_mib, utilization = (
+                int(value.strip()) for value in line.split(",")
+            )
+            available[index] = (free_mib, utilization)
     except (
         OSError,
         subprocess.CalledProcessError,
@@ -1082,8 +1087,19 @@ def _preflight(
         ValueError,
     ) as error:
         raise OrchestrationError(f"cannot verify assigned GPUs: {error}") from error
-    if any(gpu not in available or available[gpu] <= 0 for gpu in gpus):
-        raise OrchestrationError("assigned GPU is unavailable or has no free memory")
+    unavailable = {
+        gpu: available.get(gpu)
+        for gpu in gpus
+        if gpu not in available
+        or available[gpu][0] < MIN_GPU_FREE_MIB
+        or available[gpu][1] > MAX_IDLE_GPU_UTILIZATION_PERCENT
+    }
+    if unavailable:
+        raise OrchestrationError(
+            "assigned GPU is busy or below the minimum free-memory threshold: "
+            f"{unavailable}; require >= {MIN_GPU_FREE_MIB} MiB free and <= "
+            f"{MAX_IDLE_GPU_UTILIZATION_PERCENT}% utilization"
+        )
     runtime_probes = (
         dict(_runtime_probes)
         if _runtime_probes is not None
@@ -1111,7 +1127,14 @@ def _preflight(
         "free_bytes": free,
         "minimum_free_bytes": MIN_FREE_BYTES,
         "gpu_runtime_probes": runtime_probes,
-        "gpu_free_mib": {str(gpu): available[gpu] for gpu in gpus},
+        "gpu_free_mib": {str(gpu): available[gpu][0] for gpu in gpus},
+        "gpu_utilization_percent": {
+            str(gpu): available[gpu][1] for gpu in gpus
+        },
+        "minimum_gpu_free_mib": MIN_GPU_FREE_MIB,
+        "maximum_idle_gpu_utilization_percent": (
+            MAX_IDLE_GPU_UTILIZATION_PERCENT
+        ),
         "source_sha256": {
             str(path.relative_to(repository)): sha256_file(path)
             for path in source_files

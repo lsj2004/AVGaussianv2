@@ -35,9 +35,11 @@ from avgaussianv2.benchmark.training import (
     SCHEMA_VERSION as TRAINING_SCHEMA_VERSION,
     BenchmarkCompatibility,
     BenchmarkConfig,
+    BenchmarkResumeError,
     TEST_CAMERA,
     TRAIN_CAMERAS,
     hash_shared_indices,
+    verify_resume_artifacts,
 )
 from avgaussianv2.contracts import AlignedAVSample
 from avgaussianv2.data.tensor import move_sample
@@ -759,7 +761,10 @@ def _audit_continuation_snapshot(
     ):
         raise BenchmarkEvaluationError("Task12 fingerprint mismatch")
     try:
-        BenchmarkConfig.from_mapping(fingerprint["inputs"]["config"]).validate()
+        training_config = BenchmarkConfig.from_mapping(
+            fingerprint["inputs"]["config"]
+        )
+        training_config.validate()
     except (TypeError, ValueError) as error:
         raise BenchmarkEvaluationError(
             f"Task12 fingerprint training config mismatch: {error}"
@@ -810,25 +815,94 @@ def _audit_continuation_snapshot(
             _digest(runtime[field], field)
         except ValueError as error:
             raise BenchmarkEvaluationError(str(error)) from error
-    artifact_manifest = _load_exact_json(
-        output / "artifact_hashes.json",
-        {"schema", "version", "fingerprint_sha256", "sha256"},
-        "Task12 artifact hash manifest",
-    )
-    expected_artifacts = {
+    final_artifacts = {
         *(f"milestones/step_{step:06d}.pt" for step in REPORTING_STEPS),
         "final.pt",
     }
-    if (
-        artifact_manifest["schema"] != f"{TRAINING_SCHEMA}.artifacts"
-        or artifact_manifest["version"] != TRAINING_SCHEMA_VERSION
-        or artifact_manifest["fingerprint_sha256"] != fingerprint["sha256"]
-        or not isinstance(artifact_manifest["sha256"], Mapping)
-        or set(artifact_manifest["sha256"]) != expected_artifacts
-    ):
-        raise BenchmarkEvaluationError("Task12 artifact hash manifest mismatch")
     relative = f"milestones/{checkpoint.name}"
-    if artifact_manifest["sha256"][relative] != evidence.checkpoint_sha256:
+    final_manifest_path = output / "artifact_hashes.json"
+    if final_manifest_path.is_file():
+        artifact_manifest = _load_exact_json(
+            final_manifest_path,
+            {"schema", "version", "fingerprint_sha256", "sha256"},
+            "Task12 artifact hash manifest",
+        )
+        if (
+            artifact_manifest["schema"] != f"{TRAINING_SCHEMA}.artifacts"
+            or artifact_manifest["version"] != TRAINING_SCHEMA_VERSION
+            or artifact_manifest["fingerprint_sha256"] != fingerprint["sha256"]
+            or not isinstance(artifact_manifest["sha256"], Mapping)
+            or set(artifact_manifest["sha256"]) != final_artifacts
+        ):
+            raise BenchmarkEvaluationError("Task12 artifact hash manifest mismatch")
+        artifact_hashes = artifact_manifest["sha256"]
+    else:
+        # A planned screening pause is evaluable without pretending that the
+        # 30k contract is complete.  First validate the entire durable resume
+        # state, then bind the requested immutable milestone through the
+        # per-milestone transaction journal.
+        try:
+            verify_resume_artifacts(
+                output,
+                worker_manifest={
+                    "training": fingerprint["inputs"]["config"],
+                    "compatibility": contract["compatibility"],
+                    "shared_indices": contract["shared_indices"],
+                },
+            )
+        except BenchmarkResumeError as error:
+            raise BenchmarkEvaluationError(
+                f"Task12 paused resume state mismatch: {error}"
+            ) from error
+        progress = _load_exact_json(
+            output / "progress.json",
+            {
+                "schema",
+                "version",
+                "stage",
+                "observed_warmup_step",
+                "observed_main_step",
+                "exact_warmup_step",
+                "exact_main_step",
+                "maximum_replay_updates",
+                "fingerprint_sha256",
+            },
+            "Task12 paused progress journal",
+        )
+        exact_main_step = progress.get("exact_main_step")
+        if (
+            progress["schema"] != f"{TRAINING_SCHEMA}.progress"
+            or progress["version"] != TRAINING_SCHEMA_VERSION
+            or progress["stage"] != "main"
+            or progress["fingerprint_sha256"] != fingerprint["sha256"]
+            or not isinstance(exact_main_step, int)
+            or isinstance(exact_main_step, bool)
+            or exact_main_step < identity.reporting_step
+            or exact_main_step >= training_config.main_updates
+        ):
+            raise BenchmarkEvaluationError("Task12 paused progress mismatch")
+        artifact_manifest = _load_exact_json(
+            output / "artifact_journal.json",
+            {"schema", "version", "fingerprint_sha256", "sha256"},
+            "Task12 milestone transaction journal",
+        )
+        expected_milestones = {
+            f"milestones/step_{step:06d}.pt"
+            for step in training_config.milestones
+            if step <= exact_main_step
+        }
+        if (
+            artifact_manifest["schema"]
+            != f"{TRAINING_SCHEMA}.artifact-journal"
+            or artifact_manifest["version"] != TRAINING_SCHEMA_VERSION
+            or artifact_manifest["fingerprint_sha256"] != fingerprint["sha256"]
+            or not isinstance(artifact_manifest["sha256"], Mapping)
+            or set(artifact_manifest["sha256"]) != expected_milestones
+            or relative not in expected_milestones
+        ):
+            raise BenchmarkEvaluationError("Task12 paused milestone manifest mismatch")
+        artifact_hashes = artifact_manifest["sha256"]
+    if artifact_hashes[relative] != evidence.checkpoint_sha256:
         raise BenchmarkEvaluationError("Task12 milestone artifact hash mismatch")
     checkpoint_bytes = _verify_checkpoint(
         checkpoint, evidence.checkpoint_sha256, reject_components=False
