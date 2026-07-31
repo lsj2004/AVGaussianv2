@@ -59,14 +59,16 @@ case "${VARIANT}" in
     ;;
 esac
 CROSS_CONFIG="${ROOT}/configs/benchmark_cam38/${SCENE}_${CONFIG_SUFFIX}.yaml"
-BASE_PROTOCOL="${ROOT}/runs/cam38_benchmark/${SCENE}/protocol"
+BASE_RUN_ROOT="${AVGAUSSIANV2_BASE_RUN_ROOT:-${ROOT}/runs/cam38_benchmark_visual_time_v2}"
+ABLATION_RUN_ROOT="${AVGAUSSIANV2_ABLATION_RUN_ROOT:-${ROOT}/runs}"
+BASE_PROTOCOL="${BASE_RUN_ROOT}/${SCENE}/protocol"
 FTGSPP_CONTRACT="${ROOT}/runs/cam38_strict/${SCENE}/ftgspp/native_contract"
 AUDIOGS_CONTRACT="${ROOT}/runs/cam38_strict/${SCENE}/audiogs/native_contract"
-OUTPUT="${ROOT}/runs/${VARIANT}_ablation/${SCENE}"
+OUTPUT="${ABLATION_RUN_ROOT}/${VARIANT}_ablation/${SCENE}"
 PROTOCOL="${OUTPUT}/protocol"
 WORKER="${OUTPUT}/worker"
 EVALUATIONS="${OUTPUT}/evaluations"
-FILM_EVALUATIONS="${ROOT}/runs/cam38_benchmark/${SCENE}/evaluations/joint_conditioned"
+FILM_EVALUATIONS="${BASE_RUN_ROOT}/${SCENE}/evaluations/joint_conditioned"
 PYTHON="${AVGAUSSIANV2_PYTHON:-/mnt/sda/lisujing/Dataset/FreeTimeGSPlusPlus/.venv/bin/python}"
 if [[ ! -x "${PYTHON}" ]]; then
   echo "missing AVGaussianFusionv2 Python: ${PYTHON}" >&2
@@ -129,6 +131,7 @@ case "${ACTION}" in
       --system "${SYSTEM}" \
       --step "${STEP}" \
       --device cuda:0 \
+      --compute-dpam \
       --trust-upstream-artifacts
     ;;
   report)

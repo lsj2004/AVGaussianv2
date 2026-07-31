@@ -17,9 +17,14 @@ import avgaussianv2.benchmark.metrics as metrics_module
 from avgaussianv2.benchmark.artifacts import atomic_write, canonical_json
 from avgaussianv2.benchmark.metrics import (
     aggregate_metrics,
+    ild_error_db,
+    ipd_error_rad,
+    log_spectral_distance,
+    lre_error_db,
     paper_envelope_distance,
     paper_lre_error_db,
     paper_magnitude_distance,
+    waveform_l1,
 )
 from avgaussianv2.config import load_project_config
 from avgaussianv2.data.aligned import AlignedAVDataset
@@ -27,7 +32,18 @@ from avgaussianv2.data.aligned import AlignedAVDataset
 
 SCHEMA = "avgaussianv2.audiogs-paper-reference-baselines"
 BASELINES = ("source_binaural", "mono")
-METRICS = ("paper_mag", "paper_env", "paper_lre_db", "paper_dpam")
+METRICS = (
+    "waveform_l1",
+    "mono_lsd",
+    "diff_lsd",
+    "lre_error_db",
+    "paper_mag",
+    "paper_env",
+    "paper_lre_db",
+    "ild_error_db",
+    "ipd_error_rad",
+    "paper_dpam",
+)
 DPAMMetric = Callable[[Tensor, Tensor, int], float]
 
 
@@ -61,9 +77,15 @@ def paper_audio_metrics(
     ):
         raise ValueError("paper metric sample rate must be a positive integer")
     result = {
+        "waveform_l1": waveform_l1(predicted, target),
+        "mono_lsd": log_spectral_distance(predicted, target, "mono"),
+        "diff_lsd": log_spectral_distance(predicted, target, "diff"),
+        "lre_error_db": lre_error_db(predicted, target),
         "paper_mag": paper_magnitude_distance(predicted, target),
         "paper_env": paper_envelope_distance(predicted, target),
         "paper_lre_db": paper_lre_error_db(predicted, target),
+        "ild_error_db": ild_error_db(predicted, target),
+        "ipd_error_rad": ipd_error_rad(predicted, target),
     }
     if dpam_metric is not None:
         value = float(dpam_metric(predicted, target, sample_rate))

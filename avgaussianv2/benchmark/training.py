@@ -160,8 +160,8 @@ class BenchmarkConfig:
                 raise ValueError("strict benchmark checkpoint interval must be 500")
             if self.milestones != (5_000, 10_000, 30_000):
                 raise ValueError("strict benchmark milestones must be 5000/10000/30000")
-            if self.seed != 42:
-                raise ValueError("strict benchmark seed must be 42")
+            if self.seed < 0:
+                raise ValueError("strict benchmark seed must be nonnegative")
 
 
 def _digest(name: str, value: str) -> str:
@@ -201,8 +201,8 @@ class BenchmarkCompatibility:
             raise ValueError("test_camera must be exactly cam38")
         if not isinstance(self.seed, int) or isinstance(self.seed, bool):
             raise TypeError("benchmark seed must be an integer")
-        if self.seed != 42:
-            raise ValueError("benchmark seed must be 42")
+        if self.seed < 0:
+            raise ValueError("benchmark seed must be nonnegative")
         for name in (
             "index_sha256",
             "visual_initialization_sha256",

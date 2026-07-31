@@ -1,4 +1,4 @@
-"""Prepare strict train-only Task12 manifests on three assigned GPUs."""
+"""Prepare strict train-only Task12 manifests on the assigned GPUs."""
 
 from __future__ import annotations
 
@@ -22,8 +22,8 @@ def main() -> None:
     parser.add_argument("--trust-upstream-artifacts", action="store_true")
     args = parser.parse_args()
     devices = tuple(item.strip() for item in args.devices.split(","))
-    if len(devices) != 3:
-        parser.error("--devices requires exactly three comma-separated devices")
+    if not devices or any(not item for item in devices) or len(set(devices)) != len(devices):
+        parser.error("--devices requires one or more distinct comma-separated devices")
     native_contract_dirs = {
         "audiogs": args.native_audiogs_contract,
         "ftgspp": args.native_ftgspp_contract,
@@ -35,7 +35,7 @@ def main() -> None:
     result = prepare_worker_manifests(
         config_path=args.config,
         output_dir=args.output_dir,
-        devices=devices,  # type: ignore[arg-type]
+        devices=devices,
         trusted_upstream_artifacts=args.trust_upstream_artifacts,
         native_contract_dirs=native_contract_dirs,
     )

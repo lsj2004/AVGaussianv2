@@ -9,7 +9,10 @@ import pickletools
 import stat
 import subprocess
 import tempfile
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 import zipfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path

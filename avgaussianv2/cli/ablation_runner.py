@@ -64,6 +64,7 @@ def run_ablation_worker(
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--trust-upstream-artifacts", action="store_true")
+    parser.add_argument("--compute-dpam", action="store_true")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
@@ -168,6 +169,7 @@ def run_ablation_evaluation(
         device=args.device,
         evidence=evidence,
         trusted_upstream_artifacts=args.trust_upstream_artifacts,
+        compute_dpam=args.compute_dpam,
     )
     result = BenchmarkEvaluator(args.device).evaluate(
         identity=identity,

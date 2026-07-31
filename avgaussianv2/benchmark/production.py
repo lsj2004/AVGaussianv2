@@ -526,8 +526,8 @@ def _snapshot_source_imports(
 
 def _seed_evaluation_runtime(seed: int) -> None:
     """Reproduce the worker's deterministic model-construction boundary."""
-    if seed != 42:
-        raise ValueError("strict benchmark seed must be 42")
+    if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
+        raise ValueError("strict benchmark seed must be a nonnegative integer")
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -681,7 +681,7 @@ def prepare_worker_manifests(
     *,
     config_path: Path,
     output_dir: Path,
-    devices: tuple[torch.device | str, torch.device | str, torch.device | str],
+    devices: tuple[torch.device | str, ...],
     trusted_upstream_artifacts: bool,
     native_contract_dirs: Mapping[str, Path],
     runtime_builder=build_production_runtime,
@@ -692,8 +692,8 @@ def prepare_worker_manifests(
     No eval dataset is constructed here.  All devices must independently
     produce the same immutable identity before manifests are published.
     """
-    if len({str(torch.device(item)) for item in devices}) != 3:
-        raise ValueError("preparation requires three distinct devices")
+    if not devices or len({str(torch.device(item)) for item in devices}) != len(devices):
+        raise ValueError("preparation requires one or more distinct devices")
     if set(native_contract_dirs) != {"audiogs", "ftgspp"}:
         raise ValueError("preparation requires exact AudioGS/FTGS++ native contracts")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -753,10 +753,32 @@ def prepare_worker_manifests(
                 "checkpoint_sha256": contract["checkpoint"]["sha256"],
             }
         input_snapshot.verify()
+        benchmark_config_path = getattr(input_snapshot, "config_proc_path", None)
+        benchmark_raw = yaml.safe_load(
+            Path(benchmark_config_path or resolved).read_text()
+        )
+        benchmark_section = benchmark_raw.get("benchmark", {})
+        benchmark_seed = int(benchmark_section.get("seed", source_config.train.seed))
+        training = BenchmarkConfig(
+            main_updates=int(benchmark_section.get("continuation_updates", 30_000)),
+            conditioner_warmup_steps=int(
+                benchmark_section.get("conditioner_warmup_steps", 2_000)
+            ),
+            milestones=tuple(
+                int(value)
+                for value in benchmark_section.get(
+                    "report_steps", (5_000, 10_000, 30_000)
+                )
+            ),
+            seed=benchmark_seed,
+        )
+        training.validate(strict_protocol=False)
+        if source_config.train.seed != training.seed:
+            raise ValueError("train.seed must equal benchmark.seed")
         for device in devices:
-            torch.manual_seed(42)
+            torch.manual_seed(training.seed)
             if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(42)
+                torch.cuda.manual_seed_all(training.seed)
             torch.use_deterministic_algorithms(True)
             torch.backends.cudnn.benchmark = False
             torch.backends.cudnn.deterministic = True
@@ -788,7 +810,6 @@ def prepare_worker_manifests(
         for runtime in runtimes[1:]
     ):
         raise RuntimeError("production runtime identity differs across assigned GPUs")
-    training = BenchmarkConfig()
     indices = make_shared_indices(
         len(reference.train_samples), training.main_updates, training.seed
     )
@@ -929,6 +950,9 @@ def continuation_training_evidence(
     compatibility = BenchmarkCompatibility.from_mapping(contract["compatibility"])
     checkpoint = worker_dir / "milestones" / f"step_{step:06d}.pt"
     runtime_contract = worker_dir / "runtime_contract.json"
+    fingerprint_config = contract["fingerprint"]["inputs"]["config"]
+    seed = int(fingerprint_config["seed"])
+    planned_updates = int(fingerprint_config["main_updates"])
     return TrainingEvidence(
         system_name=system,
         scene_id=scene_id,
@@ -936,8 +960,8 @@ def continuation_training_evidence(
         train_cameras=TRAIN_CAMERAS,
         test_camera=TEST_CAMERA,
         test_targets_read_during_training=False,
-        seed=42,
-        planned_updates=30_000,
+        seed=seed,
+        planned_updates=planned_updates,
         completed_updates=step,
         checkpoint_step=step,
         checkpoint_path=str(checkpoint.absolute()),
@@ -962,6 +986,7 @@ def build_evaluation_adapters(
     device: torch.device | str,
     evidence: TrainingEvidence,
     trusted_upstream_artifacts: bool,
+    compute_dpam: bool = False,
 ):
     """Return lazy common-runtime and modality-exact predictor factories."""
     holder: dict[str, object] = {}
@@ -1180,9 +1205,36 @@ def build_evaluation_adapters(
             )
             if pin is not None
         )
+        extra_metric_fns = None
+        extra_metric_directions = None
+        extra_metric_modalities = None
+        extra_metric_protocols = None
+        if compute_dpam:
+            from avgaussianv2.benchmark.audio_references import CDPAMMetric
+
+            dpam = CDPAMMetric()
+            stack.callback(dpam.close)
+            sample_rate = config.model.sample_rate
+            extra_metric_fns = {
+                "paper_dpam": lambda prediction, sample: dpam(
+                    prediction.predicted_audio,
+                    sample.target_audio,
+                    sample_rate,
+                )
+            }
+            extra_metric_directions = {"paper_dpam": "lower_is_better"}
+            extra_metric_modalities = {"paper_dpam": "audio"}
+            extra_metric_protocols = {"paper_dpam": dpam.protocol}
         holder["stack"] = stack
         holder["source_guards"] = (source_finder,)
-        return BenchmarkEvaluationRuntime(bundle.eval_samples, bundle.audio_loss_fn)
+        return BenchmarkEvaluationRuntime(
+            bundle.eval_samples,
+            bundle.audio_loss_fn,
+            extra_metric_fns=extra_metric_fns,
+            extra_metric_directions=extra_metric_directions,
+            extra_metric_modalities=extra_metric_modalities,
+            extra_metric_protocols=extra_metric_protocols,
+        )
 
     def predictor_factory(_runtime: BenchmarkEvaluationRuntime):
         bundle = holder.get("bundle")
@@ -1199,6 +1251,7 @@ def build_evaluation_adapters(
                 model.load_state_dict(raw["model"], strict=True)
                 model.condition_enabled = evidence.system_name in {
                     "joint_conditioned",
+                    "joint_conditioned_wrong_camera",
                     "cross_attention",
                     "cross_attention_shuffled_rgbd",
                     "cross_attention_no_gaussians",
@@ -1250,7 +1303,10 @@ def build_evaluation_adapters(
                 model.condition_enabled = False
             model.eval()
             wrong_camera_by_frame: dict[int, int] = {}
-            if evidence.system_name == "query_dependent_p1_wrong_camera":
+            if evidence.system_name in {
+                "query_dependent_p1_wrong_camera",
+                "joint_conditioned_wrong_camera",
+            }:
                 records = getattr(bundle.train_samples, "records", None)
                 if records is None:
                     raise TypeError(
@@ -1283,9 +1339,19 @@ def build_evaluation_adapters(
             if evidence.system_name == "plain_unet":
                 return BenchmarkPrediction(
                     predicted_audio=model.forward_audio_only(sample),
+                )
+            if evidence.system_name == "audio_only":
+                return BenchmarkPrediction(
+                    predicted_audio=model.forward_audio_only(sample),
+                )
+            if evidence.system_name == "visual_only":
+                return BenchmarkPrediction(
                     rendered_rgb=model.render_rgbd(sample).rgb,
                 )
-            if evidence.system_name == "query_dependent_p1_wrong_camera":
+            if evidence.system_name in {
+                "query_dependent_p1_wrong_camera",
+                "joint_conditioned_wrong_camera",
+            }:
                 try:
                     condition_index = wrong_camera_by_frame[int(sample.frame_index)]
                 except KeyError as error:

@@ -128,7 +128,7 @@ robustness:
   priority: last
   seeds: [17, 73]
   lambda_lre:
-    source: final_survivor_plus_zero
+    source: screening_winners_plus_zero
   report_steps: [30000]
 
 reporting:

@@ -11,6 +11,7 @@ dependencies = [
   "numpy>=1.24",
   "PyYAML>=6.0",
   "soundfile>=0.12",
+  "tomli>=2.0; python_version < '3.11'",
   "torch>=2.5,<2.6",
 ]
 

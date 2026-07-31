@@ -7,6 +7,8 @@ import copy
 import pytest
 
 from avgaussianv2.benchmark.evaluation import (
+    AUDIO_METRICS,
+    VIDEO_METRICS,
     BenchmarkEvaluationResult,
     EvaluationIdentity,
 )
@@ -17,6 +19,8 @@ from avgaussianv2.benchmark.cross_attention_ablation import (
 from avgaussianv2.benchmark.cross_attention_report import (
     build_cross_attention_scene_report,
 )
+from avgaussianv2.benchmark.architecture_report import build_architecture_scene_report
+from avgaussianv2.benchmark.film_causal_report import build_film_causal_report
 from avgaussianv2.benchmark.report import (
     BenchmarkReportError,
     build_scene_report,
@@ -46,6 +50,11 @@ def _result(scene, system, step, count, offset=0.0, role="continuation"):
             "mono_lsd": 0.2 + offset,
             "diff_lsd": 0.3 + offset,
             "lre_error_db": 0.4 + offset,
+            "paper_mag": 0.5 + offset,
+            "paper_env": 0.6 + offset,
+            "paper_lre_db": 0.7 + offset,
+            "ild_error_db": 0.8 + offset,
+            "ipd_error_rad": 0.9 + offset,
             "rgb_psnr": 20.0 - offset,
             "rgb_ssim": 0.8 - offset / 10,
             "rgb_l1": 0.05 + offset,
@@ -53,19 +62,11 @@ def _result(scene, system, step, count, offset=0.0, role="continuation"):
         for index, sample_id in enumerate(ids)
     )
     metadata = {"sample_id", "scene_id", "camera", "frame_index", "time_seconds"}
-    if system == "native_audiogs":
-        allowed = metadata | {
-            "audio_total",
-            "audio_mono",
-            "audio_diff",
-            "waveform_l1",
-            "mono_lsd",
-            "diff_lsd",
-            "lre_error_db",
-        }
+    if system in {"native_audiogs", "audio_only", "plain_unet"}:
+        allowed = metadata | set(AUDIO_METRICS)
         rows = tuple({name: value for name, value in row.items() if name in allowed} for row in rows)
-    elif system == "native_ftgspp":
-        allowed = metadata | {"rgb_psnr", "rgb_ssim", "rgb_l1"}
+    elif system in {"native_ftgspp", "visual_only"}:
+        allowed = metadata | set(VIDEO_METRICS)
         rows = tuple({name: value for name, value in row.items() if name in allowed} for row in rows)
     metrics = tuple(metric for metric in rows[0] if metric not in metadata)
     summary = aggregate_metrics(
@@ -191,7 +192,7 @@ def test_cross_attention_report_is_update_matched_and_reuses_causal_checkpoint(
 
     assert (
         report["comparison_scope"]
-        == "shared_audiogs_gaussians_postprocessor_update_matched"
+        == "shared_audiogs_gaussians_postprocessor_main_update_matched"
     )
     assert report["paired_by_step"]["30000"][
         "cross_attention_vs_film_unet"
@@ -324,3 +325,35 @@ def test_report_resume_is_zero_mutation_and_tamper_is_rejected(tmp_path):
     report_path.write_bytes(report_path.read_bytes() + b" ")
     with pytest.raises(BenchmarkReportError, match="report"):
         load_report(tmp_path)
+
+
+def test_plain_unet_and_film_causal_reports_are_paired(tmp_path):
+    architecture = [
+        _result("scene1_opera", name, 5_000, 2)
+        for name in ("audio_only", "plain_unet")
+    ]
+    causal = [
+        _result("scene1_opera", name, 5_000, 2)
+        for name in (
+            "joint_conditioned",
+            "joint_conditioned_no_rgbd",
+            "joint_conditioned_wrong_camera",
+        )
+    ]
+    for result in causal:
+        result.provenance["checkpoint_sha256"] = _sha("shared-film-5000")
+    architecture_report = build_architecture_scene_report(
+        scene_id="scene1_opera",
+        evaluations=architecture,
+        expected_sample_count=2,
+        output_dir=tmp_path / "architecture",
+        preparation={"scene_id": "scene1_opera", "evaluation_system": "plain_unet"},
+    )
+    causal_report = build_film_causal_report(
+        scene_id="scene1_opera",
+        evaluations=causal,
+        expected_sample_count=2,
+        output_dir=tmp_path / "causal",
+    )
+    assert architecture_report["reporting_steps"] == [5_000]
+    assert causal_report["same_checkpoint"] is True

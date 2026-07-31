@@ -937,17 +937,15 @@ def _verify_preflight_history(root: Path, scene: str) -> None:
         raise OrchestrationError("preflight current generation mismatch")
 
 
-def parse_gpus(value: str | Sequence[int]) -> tuple[int, int, int]:
+def parse_gpus(value: str | Sequence[int]) -> tuple[int, ...]:
     parts = value.split(",") if isinstance(value, str) else tuple(value)
     try:
         result = tuple(int(item) for item in parts)
     except (TypeError, ValueError) as error:
-        raise ValueError(
-            "GPUs must be three comma-separated nonnegative IDs"
-        ) from error
-    if len(result) != 3 or len(set(result)) != 3 or any(item < 0 for item in result):
-        raise ValueError("GPUs must be three distinct nonnegative IDs")
-    return result  # type: ignore[return-value]
+        raise ValueError("GPUs must be comma-separated nonnegative IDs") from error
+    if not result or len(set(result)) != len(result) or any(item < 0 for item in result):
+        raise ValueError("GPUs must be one or more distinct nonnegative IDs")
+    return result
 
 
 def _environment(gpu: int) -> dict[str, str]:
@@ -1007,34 +1005,39 @@ def _run_parallel(
     runner: ProcessRunner,
     jobs: Sequence[tuple[str, Sequence[str], int, Path]],
 ) -> None:
-    active: list[tuple[str, ProcessHandle, Path]] = []
-    try:
-        for name, command, gpu, log in jobs:
-            handle = runner.start(command, env=_environment(gpu), log_path=log)
-            active.append((name, handle, log))
-    except BaseException:
-        _terminate_handles(tuple(handle for _, handle, _ in active))
-        raise
+    queued = list(jobs)
+    active: dict[int, tuple[str, ProcessHandle, Path]] = {}
     failures: list[tuple[str, int, Path]] = []
-    pending = list(active)
+    failed_handles: list[ProcessHandle] = []
     try:
-        while pending:
-            cleanup_targets = tuple(handle for _, handle, _ in pending)
-            next_pending = []
-            for name, handle, log in pending:
+        while queued or active:
+            busy = set(active)
+            deferred = []
+            for name, command, gpu, log in queued:
+                if gpu in busy:
+                    deferred.append((name, command, gpu, log))
+                    continue
+                handle = runner.start(command, env=_environment(gpu), log_path=log)
+                active[gpu] = (name, handle, log)
+                busy.add(gpu)
+            queued = deferred
+            for gpu, (name, handle, log) in tuple(active.items()):
                 code = handle.poll()
                 if code is None:
-                    next_pending.append((name, handle, log))
-                elif code:
+                    continue
+                del active[gpu]
+                if code:
                     failures.append((name, code, log))
+                    failed_handles.append(handle)
             if failures:
-                _terminate_handles(cleanup_targets)
+                _terminate_handles(
+                    (*failed_handles, *(handle for _, handle, _ in active.values()))
+                )
                 break
-            pending = next_pending
-            if pending:
+            if queued or active:
                 time.sleep(0.05)
     except BaseException:
-        _terminate_handles(tuple(handle for _, handle, _ in pending))
+        _terminate_handles(tuple(handle for _, handle, _ in active.values()))
         raise
     if failures:
         raise OrchestrationError(
@@ -1047,7 +1050,7 @@ def _preflight(
     repository: Path,
     config: Path,
     output_parent: Path,
-    gpus: tuple[int, int, int],
+    gpus: tuple[int, ...],
     python_executable: str,
     *,
     _runtime_probes: Mapping[str, Mapping[str, object]] | None = None,
@@ -1200,7 +1203,7 @@ def _require_native_partial_resume_state(repository: Path) -> None:
 def _native_jobs(
     repository: Path,
     log_root: Path,
-    gpus: tuple[int, int, int],
+    gpus: tuple[int, ...],
     *,
     preflight_only: bool,
     scene: str | None = None,
@@ -1225,7 +1228,7 @@ def _native_jobs(
                 "--scene",
                 item,
             ),
-            gpus[SCENES.index(item)],
+            gpus[SCENES.index(item) % len(gpus)],
             log_root
             / f"native_{'preflight_' if preflight_only else ''}ftgspp_{item}.log",
         )
@@ -1241,7 +1244,7 @@ def _native_jobs(
                     mode,
                     *(("--scene", scene) if scene is not None else ()),
                 ),
-                gpus[2],
+                gpus[len(scenes) % len(gpus)],
                 log_root
                 / f"native_{'preflight_' if preflight_only else ''}audiogs.log",
             )
@@ -1746,7 +1749,7 @@ def _scene_commands(
     log_root: Path,
     config: Path,
     python: str,
-    gpus: tuple[int, int, int],
+    gpus: tuple[int, ...],
     resume_modes: frozenset[str],
 ) -> tuple[
     list[str],
@@ -1771,7 +1774,8 @@ def _scene_commands(
         "--trust-upstream-artifacts",
     ]
     workers = []
-    for mode, gpu in zip(GPU_ORDER, gpus, strict=True):
+    for index, mode in enumerate(GPU_ORDER):
+        gpu = gpus[index % len(gpus)]
         command = [
             python,
             "-m",
@@ -1795,6 +1799,11 @@ def _scene_commands(
     specs += [
         (name, step, stable_output / "workers" / name)
         for name in sorted(CONTINUATION_SYSTEMS)
+        for step in REPORTING_STEPS
+    ]
+    specs += [
+        (name, step, stable_output / "workers" / "joint_conditioned")
+        for name in ("joint_conditioned_no_rgbd", "joint_conditioned_wrong_camera")
         for step in REPORTING_STEPS
     ]
     for index, (system, step, source) in enumerate(specs):
@@ -1821,12 +1830,13 @@ def _scene_commands(
             "--device",
             "cuda:0",
             "--trust-upstream-artifacts",
+            "--compute-dpam",
         ]
         if step is not None:
             command += ["--step", str(step)]
         if (destination / "current.json").is_file():
             command.append("--resume")
-        gpu = gpus[index % 3]
+        gpu = gpus[index % len(gpus)]
         evals.append((label, command, gpu, log_root / f"eval_{label}.log"))
     return prepare, workers, evals
 
@@ -1835,7 +1845,7 @@ def run_scene_benchmark(
     *,
     config_path: Path,
     output_dir: Path,
-    gpus: Sequence[int] = (0, 1, 2),
+    gpus: Sequence[int] = (0, 1),
     python_executable: str = sys.executable,
     resume: bool = False,
     verify_only: bool = False,
@@ -2019,7 +2029,7 @@ def run_benchmark_suite(
     *,
     repository: Path,
     output_dir: Path,
-    gpus: Sequence[int] = (0, 1, 2),
+    gpus: Sequence[int] = (0, 1),
     python_executable: str = sys.executable,
     resume: bool = False,
     verify_only: bool = False,

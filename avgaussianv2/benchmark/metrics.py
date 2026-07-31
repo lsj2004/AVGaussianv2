@@ -145,6 +145,58 @@ def paper_lre_error_db(
     return lre_error_db(predicted, target, eps=eps)
 
 
+def _stereo_stft(
+    audio: Tensor,
+    *,
+    n_fft: int = 512,
+    hop_length: int = 160,
+    win_length: int = 400,
+) -> Tensor:
+    dtype = audio.dtype if audio.dtype not in {torch.float16, torch.bfloat16} else torch.float32
+    window = torch.hamming_window(win_length, device=audio.device, dtype=dtype)
+    return torch.stft(
+        audio.to(dtype).flatten(0, 1),
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window=window,
+        pad_mode="constant",
+        return_complex=True,
+    ).unflatten(0, audio.shape[:2])
+
+
+def ild_error_db(predicted: Tensor, target: Tensor, eps: float = 1e-7) -> float:
+    """Mean absolute interaural-level-difference error over STFT bins."""
+    _audio("ILD", predicted, target)
+    if not math.isfinite(eps) or eps <= 0:
+        raise ValueError("ILD eps must be a positive finite value")
+
+    def ild(audio: Tensor) -> Tensor:
+        magnitude = _stereo_stft(audio).abs()
+        return 20.0 * torch.log10(
+            (magnitude[:, 0] + eps) / (magnitude[:, 1] + eps)
+        )
+
+    return float((ild(predicted) - ild(target)).abs().mean().item())
+
+
+def ipd_error_rad(predicted: Tensor, target: Tensor, eps: float = 1e-7) -> float:
+    """Target-energy-weighted circular interaural phase-difference error."""
+    _audio("IPD", predicted, target)
+    if not math.isfinite(eps) or eps <= 0:
+        raise ValueError("IPD eps must be a positive finite value")
+    predicted_stft = _stereo_stft(predicted)
+    target_stft = _stereo_stft(target)
+    predicted_ipd = torch.angle(predicted_stft[:, 0] * predicted_stft[:, 1].conj())
+    target_ipd = torch.angle(target_stft[:, 0] * target_stft[:, 1].conj())
+    circular_error = torch.atan2(
+        torch.sin(predicted_ipd - target_ipd),
+        torch.cos(predicted_ipd - target_ipd),
+    ).abs()
+    weight = (target_stft[:, 0].abs() * target_stft[:, 1].abs()).sqrt()
+    return float(((circular_error * weight).sum() / weight.sum().clamp_min(eps)).item())
+
+
 def rgb_l1(predicted: Tensor, target: Tensor) -> float:
     """Return L1 error for nonempty floating BHWC RGB tensors."""
     _rgb("RGB L1", predicted, target)

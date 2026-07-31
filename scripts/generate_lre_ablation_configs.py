@@ -61,10 +61,10 @@ def _selection_weights(
         raise ValueError("screening.lambda_lre must be nonnegative")
     if stage == "screening":
         if winners_path is not None:
-            raise ValueError("--winners is only valid for confirmation")
+            raise ValueError("--winners is only valid after screening")
         return tuple(sorted(available))
     if winners_path is None:
-        raise ValueError("confirmation requires --winners")
+        raise ValueError(f"{stage} requires --winners")
     winners_path = winners_path.resolve()
     selection = json.loads(winners_path.read_text())
     expected_fields = {
@@ -118,8 +118,8 @@ def generate(
         or manifest.get("version") != 1
     ):
         raise ValueError("unsupported LRE ablation manifest")
-    if stage not in {"screening", "confirmation"}:
-        raise ValueError("stage must be screening or confirmation")
+    if stage not in {"screening", "confirmation", "robustness"}:
+        raise ValueError("stage must be screening, confirmation, or robustness")
     fixed = manifest["fixed_loss"]
     stage_config = manifest[stage]
     seeds = tuple(int(seed) for seed in stage_config["seeds"])
@@ -265,13 +265,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--stage",
-        choices=("screening", "confirmation"),
+        choices=("screening", "confirmation", "robustness"),
         default="screening",
     )
     parser.add_argument(
         "--winners",
         type=Path,
-        help="screening selection JSON; required for confirmation",
+        help="screening selection JSON; required for confirmation/robustness",
     )
     parser.add_argument(
         "--system",

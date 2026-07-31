@@ -550,13 +550,20 @@ def build_production_runtime(
             def audit_imports(_module, _inputs, _output):
                 snapshot.assert_no_import_failures()
 
-            object.__setattr__(
-                runtime,
-                "_import_guard_handle",
-                runtime.model.register_forward_hook(
-                    audit_imports, always_call=True
-                ),
+            try:
+                import inspect
+
+                supports_always_call = "always_call" in inspect.signature(
+                    runtime.model.register_forward_hook
+                ).parameters
+            except (TypeError, ValueError):
+                supports_always_call = False
+            hook = (
+                runtime.model.register_forward_hook(audit_imports, always_call=True)
+                if supports_always_call
+                else runtime.model.register_forward_hook(audit_imports)
             )
+            object.__setattr__(runtime, "_import_guard_handle", hook)
             return runtime
         except BaseException:
             snapshot.__exit__(*sys.exc_info())

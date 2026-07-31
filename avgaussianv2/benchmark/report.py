@@ -100,7 +100,9 @@ def _validate_result(
         provenance.get("test_camera") != TEST_CAMERA
         or tuple(provenance.get("train_cameras", ())) != TRAIN_CAMERAS
         or provenance.get("test_targets_read_during_training") is not False
-        or provenance.get("seed") != 42
+        or not isinstance(provenance.get("seed"), int)
+        or isinstance(provenance.get("seed"), bool)
+        or provenance.get("seed", -1) < 0
     ):
         raise BenchmarkReportError("split/no-test-pretraining evidence failed")
     try:
@@ -389,11 +391,11 @@ def build_scene_report(
                 "all systems/steps must use one exact metric protocol"
             )
         core = (
-            set(ALL_METRICS)
-            if system in CONTINUATION_SYSTEMS
-            else set(AUDIO_METRICS)
-            if system == "native_audiogs"
+            set(AUDIO_METRICS)
+            if system in {"audio_only", "native_audiogs"}
             else set(VIDEO_METRICS)
+            if system in {"visual_only", "native_ftgspp"}
+            else set(ALL_METRICS)
         )
         modalities: set[str] = set()
         if set(AUDIO_METRICS).issubset(core):

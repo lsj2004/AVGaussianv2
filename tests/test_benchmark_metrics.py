@@ -5,6 +5,8 @@ import torch
 
 from avgaussianv2.benchmark.metrics import (
     aggregate_metrics,
+    ild_error_db,
+    ipd_error_rad,
     log_spectral_distance,
     lre_error_db,
     paper_envelope_distance,
@@ -15,6 +17,22 @@ from avgaussianv2.benchmark.metrics import (
     ssim,
     waveform_l1,
 )
+
+
+def test_ild_and_ipd_are_zero_for_identical_stereo_audio() -> None:
+    audio = torch.randn(1, 2, 640)
+    assert ild_error_db(audio, audio) == pytest.approx(0.0)
+    assert ipd_error_rad(audio, audio) == pytest.approx(0.0, abs=1e-7)
+
+
+def test_ild_detects_channel_gain_and_ipd_detects_channel_delay() -> None:
+    target = torch.randn(1, 2, 640)
+    gained = target.clone()
+    gained[:, 0] *= 2
+    delayed = target.clone()
+    delayed[:, 1] = torch.roll(delayed[:, 1], 7, dims=-1)
+    assert ild_error_db(gained, target) > 1.0
+    assert ipd_error_rad(delayed, target) > 0.05
 
 
 def test_identical_audio_metrics_are_ideal() -> None:

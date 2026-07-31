@@ -600,9 +600,18 @@ def test_strict_native_evidence_to_eval_scene_and_suite_chain(
                     runtime_factory=lambda sample=sample: BenchmarkEvaluationRuntime(
                         [sample], _loss
                     ),
-                    predictor_factory=lambda _: lambda value: BenchmarkPrediction(
-                        value.target_audio + 0.001, value.target_rgb + 0.001
-                    ),
+                        predictor_factory=lambda _, system=system: lambda value: BenchmarkPrediction(
+                            predicted_audio=(
+                                value.target_audio + 0.001
+                                if system != "visual_only"
+                                else None
+                            ),
+                            rendered_rgb=(
+                                value.target_rgb + 0.001
+                                if system != "audio_only"
+                                else None
+                            ),
+                        ),
                     output_dir=output,
                 )
                 evaluations.append(result)

@@ -14,7 +14,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--gpus", default="0,1,2")
+    parser.add_argument("--gpus", default="0,1")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--verify-only", action="store_true")

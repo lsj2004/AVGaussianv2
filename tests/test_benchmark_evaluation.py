@@ -11,6 +11,9 @@ import torch
 
 import avgaussianv2.benchmark.evaluation as evaluation_module
 from avgaussianv2.benchmark.evaluation import (
+    ALL_METRICS,
+    AUDIO_METRICS,
+    VIDEO_METRICS,
     BenchmarkEvaluationError,
     BenchmarkEvaluationRuntime,
     BenchmarkEvaluator,
@@ -260,18 +263,7 @@ def test_evaluator_constructs_cam38_only_after_training_gate_and_publishes(tmp_p
     )
     assert calls == ["samples"]
     assert result.count == 2
-    assert set(result.summary) == {
-        "audio_total",
-        "audio_mono",
-        "audio_diff",
-        "waveform_l1",
-        "mono_lsd",
-        "diff_lsd",
-        "lre_error_db",
-        "rgb_psnr",
-        "rgb_ssim",
-        "rgb_l1",
-    }
+    assert set(result.summary) == set(ALL_METRICS)
     assert all(set(stats) == {"mean", "std", "median"} for stats in result.summary.values())
     assert (tmp_path / "current.json").is_file()
     assert load_evaluation(tmp_path, identity=identity).rows == result.rows
@@ -331,7 +323,7 @@ def test_resume_does_not_construct_test_samples_and_tamper_fails(tmp_path):
         evidence=_evidence("audio_only"),
         runtime_factory=lambda: _runtime([_sample(0)]),
         predictor_factory=lambda _: lambda sample: BenchmarkPrediction(
-            sample.target_audio + 0.001, sample.target_rgb + 0.001
+            predicted_audio=sample.target_audio + 0.001
         ),
         output_dir=tmp_path,
     )
@@ -387,6 +379,17 @@ def test_gate_rejects_test_leak_and_wrong_step_before_sample_construction(tmp_pa
     assert not called
 
 
+def test_training_evidence_accepts_nonnegative_multiseed_run() -> None:
+    identity = EvaluationIdentity(
+        "scene1_opera",
+        "audio_only",
+        30_000,
+        ("scene1_opera/cam38/000000",),
+        1,
+    )
+    replace(_evidence("audio_only"), seed=73).validate(identity)
+
+
 def test_native_audio_reference_allows_audio_only_and_labels_non_update_matched(tmp_path):
     native = TrainingEvidence(
         **{
@@ -415,15 +418,7 @@ def test_native_audio_reference_allows_audio_only_and_labels_non_update_matched(
         ),
         output_dir=tmp_path,
     )
-    assert set(result.summary) == {
-        "audio_total",
-        "audio_mono",
-        "audio_diff",
-        "waveform_l1",
-        "mono_lsd",
-        "diff_lsd",
-        "lre_error_db",
-    }
+    assert set(result.summary) == set(AUDIO_METRICS)
     assert result.provenance["update_matched"] is False
 
 
@@ -450,7 +445,7 @@ def test_overwrite_publishes_new_generation_and_verify_binds_checkpoint(tmp_path
         "evidence": evidence,
         "runtime_factory": lambda: _runtime([_sample(0)]),
         "predictor_factory": lambda _: lambda sample: BenchmarkPrediction(
-            sample.target_audio + 0.001, sample.target_rgb + 0.001
+            predicted_audio=sample.target_audio + 0.001
         ),
         "output_dir": tmp_path / "evaluation",
     }
@@ -683,6 +678,7 @@ def test_registered_extra_metric_persists_explicit_direction_and_modality(tmp_pa
     assert result.metric_protocol["extra_metric_registry"]["audio_custom"] == {
         "direction": "higher_is_better",
         "modality": "audio",
+        "protocol": None,
     }
 
 
@@ -699,7 +695,7 @@ def test_perfect_rgb_uses_documented_finite_psnr_cap(tmp_path):
         evidence=_evidence("visual_only"),
         runtime_factory=lambda: _runtime([_sample(0)]),
         predictor_factory=lambda _: lambda sample: BenchmarkPrediction(
-            sample.target_audio + 0.001, sample.target_rgb
+            rendered_rgb=sample.target_rgb
         ),
         output_dir=tmp_path,
     )
@@ -707,7 +703,7 @@ def test_perfect_rgb_uses_documented_finite_psnr_cap(tmp_path):
     assert result.metric_protocol["psnr_cap_db"] == 100.0
 
 
-def test_continuation_rejects_missing_required_audio_or_video_metrics(tmp_path):
+def test_continuation_rejects_unexpected_audio_for_visual_only(tmp_path):
     identity = EvaluationIdentity(
         "scene1_opera",
         "visual_only",
@@ -721,7 +717,8 @@ def test_continuation_rejects_missing_required_audio_or_video_metrics(tmp_path):
             evidence=_evidence("visual_only"),
             runtime_factory=lambda: _runtime([_sample(0)]),
             predictor_factory=lambda _: lambda sample: BenchmarkPrediction(
-                rendered_rgb=sample.target_rgb + 0.001
+                predicted_audio=sample.target_audio + 0.001,
+                rendered_rgb=sample.target_rgb + 0.001,
             ),
             output_dir=tmp_path,
         )

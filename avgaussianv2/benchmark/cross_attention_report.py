@@ -37,9 +37,10 @@ def _require_fair_protocol(
     *,
     main_system: str,
     evaluation_systems: Sequence[str],
+    reporting_steps: Sequence[int],
 ) -> None:
-    reference = indexed[(FILM_SYSTEM, REPORTING_STEPS[0])]
-    for step in REPORTING_STEPS:
+    reference = indexed[(FILM_SYSTEM, reporting_steps[0])]
+    for step in reporting_steps:
         film = indexed[(FILM_SYSTEM, step)]
         cross = indexed[(main_system, step)]
         for field in (
@@ -81,14 +82,14 @@ def _markdown(report: Mapping[str, object]) -> str:
     lines = [
         f"# Cross-attention vs FiLM+U-Net: {report['scene_id']}",
         "",
-        "This is an update-matched postprocessor comparison. Both systems start "
+        "This is a main-update-matched postprocessor comparison. Both systems start "
         "from the same audited AudioGS acoustic-Gaussian checkpoint and use its "
         "criterion; only the RGBD-conditioned postprocessor differs.",
         "",
         "| Step | System | Audio total | PSNR | SSIM | RGB L1 |",
         "|---:|---|---:|---:|---:|---:|",
     ]
-    for step in REPORTING_STEPS:
+    for step in report["reporting_steps"]:
         for system in report["systems"]:
             summary = report["scaling"][str(step)][system]
 
@@ -142,31 +143,42 @@ def build_cross_attention_scene_report(
             "report requires verified shared-AudioGS cross-attention preparation"
         )
     indexed = {_key(result): result for result in evaluations}
+    reporting_steps = tuple(
+        sorted(
+            step
+            for system, step in indexed
+            if system == FILM_SYSTEM and step is not None
+        )
+    )
+    if not reporting_steps or any(step not in REPORTING_STEPS for step in reporting_steps):
+        raise BenchmarkReportError("reporting steps must be a nonempty subset of 5k/10k/30k")
     expected = {
-        *((FILM_SYSTEM, step) for step in REPORTING_STEPS),
+        *((FILM_SYSTEM, step) for step in reporting_steps),
         *(
             (system, step)
             for system in evaluation_systems
-            for step in REPORTING_STEPS
+            for step in reporting_steps
         ),
     }
     if set(indexed) != expected or len(indexed) != len(evaluations):
         raise BenchmarkReportError(
-            "cross-attention report requires FiLM and all causal systems at 5k/10k/30k"
+            "cross-attention report requires FiLM and all causal systems at identical steps"
         )
     for result in indexed.values():
         _validate_result(result, scene_id, expected_sample_count)
-    sample_ids = indexed[(FILM_SYSTEM, PRIMARY_STEP)].identity.expected_sample_ids
+    primary_step = reporting_steps[-1]
+    sample_ids = indexed[(FILM_SYSTEM, primary_step)].identity.expected_sample_ids
     if any(result.identity.expected_sample_ids != sample_ids for result in indexed.values()):
         raise BenchmarkReportError("all comparison systems require identical sample IDs")
     _require_fair_protocol(
         indexed,
         main_system=main_system,
         evaluation_systems=evaluation_systems,
+        reporting_steps=reporting_steps,
     )
 
     paired_by_step = {}
-    for step in REPORTING_STEPS:
+    for step in reporting_steps:
         cross = indexed[(main_system, step)]
         paired = {
             f"{main_system}_vs_film_unet": _paired(
@@ -195,26 +207,28 @@ def build_cross_attention_scene_report(
             system: indexed[(system, step)].summary
             for system in (FILM_SYSTEM, *evaluation_systems)
         }
-        for step in REPORTING_STEPS
+        for step in reporting_steps
     }
     base: dict[str, object] = {
         "schema": SCHEMA,
         "version": 1,
         "scene_id": scene_id,
         "sample_count": expected_sample_count,
-        "primary_step": PRIMARY_STEP,
+        "primary_step": primary_step,
+        "reporting_steps": list(reporting_steps),
         "main_system": main_system,
         "systems": [FILM_SYSTEM, *evaluation_systems],
-        "comparison_scope": "shared_audiogs_gaussians_postprocessor_update_matched",
+        "comparison_scope": "shared_audiogs_gaussians_postprocessor_main_update_matched",
+        "total_compute_matched": False,
         "shared": {
             "train_cameras": list(
-                indexed[(FILM_SYSTEM, PRIMARY_STEP)].provenance["train_cameras"]
+                indexed[(FILM_SYSTEM, primary_step)].provenance["train_cameras"]
             ),
             "test_camera": "cam38",
             "seed": 42,
             "batch_size": 1,
             "index_sha256": indexed[
-                (FILM_SYSTEM, PRIMARY_STEP)
+                (FILM_SYSTEM, primary_step)
             ].provenance["index_sha256"],
             "visual_initialization_sha256": indexed[
                 (FILM_SYSTEM, PRIMARY_STEP)

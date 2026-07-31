@@ -225,7 +225,9 @@ def test_scene_starts_evaluation_only_after_training_and_supervises_failure(
         )
 
     modules = [_module(item[0]) for item in runner.assignments]
-    assert modules.count("avgaussianv2.cli.benchmark_worker") == 3
+    # With two GPUs only two workers may be active.  A first-wave failure must
+    # prevent the queued third worker and every evaluation from starting.
+    assert modules.count("avgaussianv2.cli.benchmark_worker") == 2
     assert "avgaussianv2.cli.benchmark_eval" not in modules
     sibling_handles = runner.handles[-2:]
     assert all(handle.terminated for handle in sibling_handles)

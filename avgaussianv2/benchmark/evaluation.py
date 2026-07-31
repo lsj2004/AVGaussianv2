@@ -43,8 +43,13 @@ from avgaussianv2.contracts import AlignedAVSample
 from avgaussianv2.data.tensor import move_sample
 from avgaussianv2.benchmark.metrics import (
     aggregate_metrics,
+    ild_error_db,
+    ipd_error_rad,
     log_spectral_distance,
     lre_error_db,
+    paper_envelope_distance,
+    paper_lre_error_db,
+    paper_magnitude_distance,
     psnr,
     rgb_l1,
     ssim,
@@ -60,6 +65,11 @@ AUDIO_METRICS = (
     "mono_lsd",
     "diff_lsd",
     "lre_error_db",
+    "paper_mag",
+    "paper_env",
+    "paper_lre_db",
+    "ild_error_db",
+    "ipd_error_rad",
 )
 VIDEO_METRICS = ("rgb_psnr", "rgb_ssim", "rgb_l1")
 ALL_METRICS = (*AUDIO_METRICS, *VIDEO_METRICS)
@@ -73,6 +83,10 @@ REPORTING_STEPS = (5_000, 10_000, 30_000)
 # them at 100 dB so every published value remains finite and JSON-portable.
 PSNR_CAP_DB = 100.0
 CONTINUATION_SYSTEMS = {"joint_conditioned", "audio_only", "visual_only"}
+FILM_CAUSAL_EVALUATION_SYSTEMS = {
+    "joint_conditioned_no_rgbd",
+    "joint_conditioned_wrong_camera",
+}
 CROSS_ATTENTION_CONTINUATION_SYSTEMS = {
     "cross_attention",
     "cross_attention_no_rgbd",
@@ -89,6 +103,7 @@ CROSS_ATTENTION_CONTINUATION_SYSTEMS = {
 ARCHITECTURE_CONTINUATION_SYSTEMS = {"plain_unet"}
 EVALUATION_CONTINUATION_SYSTEMS = (
     CONTINUATION_SYSTEMS
+    | FILM_CAUSAL_EVALUATION_SYSTEMS
     | CROSS_ATTENTION_CONTINUATION_SYSTEMS
     | ARCHITECTURE_CONTINUATION_SYSTEMS
 )
@@ -119,6 +134,8 @@ _TASK12_CHECKPOINT_FIELDS = {
 def _training_mode_for_evaluation_system(system_name: str) -> str:
     """Map inference-only causal labels to their shared training contract."""
     if system_name in CROSS_ATTENTION_CONTINUATION_SYSTEMS:
+        return "joint_conditioned"
+    if system_name in FILM_CAUSAL_EVALUATION_SYSTEMS:
         return "joint_conditioned"
     if system_name == "plain_unet":
         return "audio_only"
@@ -175,7 +192,12 @@ class TrainingEvidence:
             raise BenchmarkEvaluationError("benchmark split must be cam00..cam37/cam38")
         if self.test_targets_read_during_training is not False:
             raise BenchmarkEvaluationError("test target was read during training")
-        if self.seed != 42 or self.batch_size != 1:
+        if (
+            not isinstance(self.seed, int)
+            or isinstance(self.seed, bool)
+            or self.seed < 0
+            or self.batch_size != 1
+        ):
             raise BenchmarkEvaluationError("benchmark seed/batch size mismatch")
         if not isinstance(self.checkpoint_path, str) or not Path(
             self.checkpoint_path
@@ -309,6 +331,7 @@ class BenchmarkEvaluationRuntime:
     ] | None = None
     extra_metric_directions: Mapping[str, str] | None = None
     extra_metric_modalities: Mapping[str, str] | None = None
+    extra_metric_protocols: Mapping[str, Mapping[str, object] | None] | None = None
     lpips_fn: Callable[[Tensor, Tensor], object] | None = None
     lpips_implementation_sha256: str | None = None
 
@@ -450,7 +473,7 @@ def _validate_loaded_result(result: BenchmarkEvaluationResult) -> None:
             or name in _RESERVED_EXTRA_METRICS
             or "depth" in name.lower()
             or not isinstance(specification, Mapping)
-            or set(specification) != {"direction", "modality"}
+            or set(specification) != {"direction", "modality", "protocol"}
             or specification["direction"]
             not in {"lower_is_better", "higher_is_better"}
             or specification["modality"] not in {"audio", "video"}
@@ -501,7 +524,13 @@ def _validate_loaded_result(result: BenchmarkEvaluationResult) -> None:
         raise BenchmarkEvaluationError(
             f"evaluation provenance schema mismatch: {error}"
         ) from error
-    if set(provenance) != {*fields, "update_matched"}:
+    if set(provenance) != {
+        *fields,
+        "update_matched",
+        "main_update_matched",
+        "warmup_updates",
+        "total_optimizer_updates",
+    }:
         raise BenchmarkEvaluationError("evaluation provenance fields mismatch")
     evidence.validate(result.identity)
     if provenance["update_matched"] is not (evidence.role == "continuation"):
@@ -826,6 +855,8 @@ def _audit_continuation_snapshot(
             if evidence.system_name
             in {
                 "joint_conditioned",
+                "joint_conditioned_no_rgbd",
+                "joint_conditioned_wrong_camera",
                 "cross_attention",
                 "cross_attention_no_rgbd",
                 "cross_attention_shuffled_rgbd",
@@ -952,7 +983,7 @@ class BenchmarkEvaluator:
         predictor = predictor_factory(runtime)
         if not callable(predictor) or not callable(runtime.audio_loss_fn):
             raise BenchmarkEvaluationError("evaluation runtime factories are invalid")
-        registry, directions, modalities = self._validate_metric_runtime(runtime)
+        registry, directions, modalities, protocols = self._validate_metric_runtime(runtime)
         samples = tuple(runtime.samples)
         if len(samples) != identity.expected_sample_count:
             raise BenchmarkEvaluationError("cam38 sample count mismatch")
@@ -987,13 +1018,12 @@ class BenchmarkEvaluator:
             for row in rows
         ):
             raise BenchmarkEvaluationError("per-sample metric availability differs")
-        expected_core = (
-            set(ALL_METRICS)
-            if evidence.role == "continuation"
-            else set(AUDIO_METRICS)
-            if evidence.system_name == "native_audiogs"
-            else set(VIDEO_METRICS)
-        )
+        if evidence.system_name in {"audio_only", "plain_unet", "native_audiogs"}:
+            expected_core = set(AUDIO_METRICS)
+        elif evidence.system_name in {"visual_only", "native_ftgspp"}:
+            expected_core = set(VIDEO_METRICS)
+        else:
+            expected_core = set(ALL_METRICS)
         available_modalities: set[str] = set()
         if set(AUDIO_METRICS).issubset(expected_core):
             available_modalities.add("audio")
@@ -1037,6 +1067,7 @@ class BenchmarkEvaluator:
                 name: {
                     "direction": directions[name],
                     "modality": modalities[name],
+                    "protocol": protocols[name],
                 }
                 for name in sorted(registry)
             },
@@ -1095,7 +1126,22 @@ class BenchmarkEvaluator:
     def _provenance(evidence: TrainingEvidence) -> dict[str, object]:
         value = asdict(evidence)
         value["train_cameras"] = list(evidence.train_cameras)
-        value["update_matched"] = evidence.role == "continuation"
+        main_update_matched = evidence.role == "continuation"
+        warmup_updates = (
+            2_000
+            if main_update_matched
+            and _training_mode_for_evaluation_system(evidence.system_name)
+            == "joint_conditioned"
+            else 0
+        )
+        value["update_matched"] = main_update_matched
+        value["main_update_matched"] = main_update_matched
+        value["warmup_updates"] = warmup_updates
+        value["total_optimizer_updates"] = (
+            evidence.completed_updates + warmup_updates
+            if evidence.completed_updates is not None
+            else None
+        )
         return value
 
     @staticmethod
@@ -1105,14 +1151,23 @@ class BenchmarkEvaluator:
         Mapping[str, Callable[[BenchmarkPrediction, AlignedAVSample], object]],
         Mapping[str, str],
         Mapping[str, str],
+        Mapping[str, Mapping[str, object] | None],
     ]:
         registry = runtime.extra_metric_fns or {}
         directions = runtime.extra_metric_directions or {}
         modalities = runtime.extra_metric_modalities or {}
+        protocols = runtime.extra_metric_protocols or {
+            name: None for name in registry
+        }
         if set(registry) != set(directions) or set(registry) != set(modalities):
             raise BenchmarkEvaluationError(
                 "extra metric registry and direction allowlist must match exactly"
             )
+        if set(protocols) != set(registry) or any(
+            value is not None and not isinstance(value, Mapping)
+            for value in protocols.values()
+        ):
+            raise BenchmarkEvaluationError("extra metric protocol registry mismatch")
         for name, function in registry.items():
             if (
                 not isinstance(name, str)
@@ -1142,7 +1197,7 @@ class BenchmarkEvaluator:
                 )
             except ValueError as error:
                 raise BenchmarkEvaluationError(str(error)) from error
-        return registry, directions, modalities
+        return registry, directions, modalities, protocols
 
     def _evaluate_one(
         self,
@@ -1180,6 +1235,21 @@ class BenchmarkEvaluator:
                     prediction.predicted_audio, sample.target_audio, "diff"
                 ),
                 lre_error_db=lre_error_db(
+                    prediction.predicted_audio, sample.target_audio
+                ),
+                paper_mag=paper_magnitude_distance(
+                    prediction.predicted_audio, sample.target_audio
+                ),
+                paper_env=paper_envelope_distance(
+                    prediction.predicted_audio, sample.target_audio
+                ),
+                paper_lre_db=paper_lre_error_db(
+                    prediction.predicted_audio, sample.target_audio
+                ),
+                ild_error_db=ild_error_db(
+                    prediction.predicted_audio, sample.target_audio
+                ),
+                ipd_error_rad=ipd_error_rad(
                     prediction.predicted_audio, sample.target_audio
                 ),
             )

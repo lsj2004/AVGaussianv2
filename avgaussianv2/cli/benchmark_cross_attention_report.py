@@ -24,12 +24,15 @@ def main() -> None:
     parser.add_argument("--protocol-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--expected-samples", type=int, required=True)
+    parser.add_argument(
+        "--steps", type=int, nargs="+", choices=REPORTING_STEPS, default=REPORTING_STEPS
+    )
     args = parser.parse_args()
 
     preparation = verify_cross_attention_preparation(args.protocol_dir)
     systems = tuple(preparation["causal_evaluation_systems"])
     evaluations = []
-    for step in REPORTING_STEPS:
+    for step in tuple(sorted(set(args.steps))):
         evaluations.append(
             verify_evaluation(
                 args.film_eval_root / f"step_{step:06d}",
