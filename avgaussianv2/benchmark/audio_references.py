@@ -6,7 +6,7 @@ import io
 import json
 import math
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -251,6 +251,7 @@ def evaluate_reference_baselines(
     config_paths: Sequence[Path],
     *,
     dpam_metric: DPAMMetric | None,
+    repository: Mapping[str, object] | None = None,
 ) -> ReferenceEvaluation:
     if not config_paths:
         raise ValueError("at least one reference config is required")
@@ -346,6 +347,7 @@ def evaluate_reference_baselines(
     report = {
         "schema": SCHEMA,
         "version": 1,
+        "repository": dict(repository) if repository is not None else None,
         "baselines": {
             "source_binaural": "unprocessed source-view stereo waveform",
             "mono": "mean of source left/right channels, duplicated to both ears",

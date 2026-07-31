@@ -143,6 +143,7 @@ def test_reference_evaluation_writes_paired_rows_aggregates_and_hashes(
     evaluation = evaluate_reference_baselines(
         [first, second],
         dpam_metric=dpam,
+        repository={"root": str(tmp_path), "commit": "1" * 40, "clean": True},
     )
 
     assert len(evaluation.rows) == 12
@@ -152,6 +153,7 @@ def test_reference_evaluation_writes_paired_rows_aggregates_and_hashes(
         "mono",
     }
     assert evaluation.report["metric_protocol"]["paper_dpam"]["status"] == "computed"
+    assert evaluation.report["repository"]["clean"] is True
     for row in evaluation.rows:
         assert set(row) >= {
             "sample_id",

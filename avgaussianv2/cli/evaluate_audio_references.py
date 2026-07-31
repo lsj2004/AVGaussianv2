@@ -14,6 +14,7 @@ from avgaussianv2.benchmark.audio_references import (
     verify_reference_evaluation,
     write_reference_evaluation,
 )
+from avgaussianv2.benchmark.artifacts import repository_identity
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,6 +54,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         evaluation = evaluate_reference_baselines(
             args.config,
             dpam_metric=dpam_metric,
+            repository=repository_identity(),
         )
     write_reference_evaluation(
         evaluation,
