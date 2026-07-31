@@ -9,6 +9,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/generate_lre_ablation_configs.py"
+FAKE_REPOSITORY = {"root": str(ROOT), "commit": "1" * 40, "clean": True}
 
 
 def _load_generator():
@@ -29,6 +30,7 @@ def _generate(module, output: Path, **kwargs):
         _manifest(),
         output,
         systems=systems,
+        _repository_identity=lambda: FAKE_REPOSITORY,
         **kwargs,
     )
 
@@ -170,6 +172,7 @@ def test_architecture_generation_rejects_non_axis_config_delta(
             tmp_path / "generated",
             stage="architecture",
             systems=("plain_unet",),
+            _repository_identity=lambda: FAKE_REPOSITORY,
         )
 
 
@@ -359,6 +362,7 @@ def test_generation_binds_each_survivor_to_its_architecture_config(
         _manifest(),
         tmp_path,
         systems=("plain_unet", "query_dependent_p1"),
+        _repository_identity=lambda: FAKE_REPOSITORY,
     )
 
     plain = next(
@@ -388,4 +392,8 @@ def test_generation_requires_explicit_architecture_survivors(
     tmp_path: Path,
 ) -> None:
     with pytest.raises(ValueError, match="explicitly supplied"):
-        _load_generator().generate(_manifest(), tmp_path)
+        _load_generator().generate(
+            _manifest(),
+            tmp_path,
+            _repository_identity=lambda: FAKE_REPOSITORY,
+        )

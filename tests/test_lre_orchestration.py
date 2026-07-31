@@ -12,6 +12,7 @@ from avgaussianv2.benchmark.lre_orchestration import (
     execute_lre_pipelines,
     load_lre_run_manifest,
     query_idle_gpus,
+    run_lre_manifest,
 )
 from avgaussianv2.benchmark.orchestration import OrchestrationError
 
@@ -61,6 +62,11 @@ def _manifest(tmp_path: Path) -> tuple[Path, dict[str, object]]:
         "stage": "screening",
         "source_manifest": str(tmp_path / "source.yaml"),
         "source_manifest_sha256": "0" * 64,
+        "repository": {
+            "root": str(tmp_path.resolve()),
+            "commit": "1" * 40,
+            "clean": True,
+        },
         "winners": None,
         "configs": configs,
         "runs": runs,
@@ -99,6 +105,11 @@ class _Runner:
     def start(self, command, *, env, log_path):
         self.assignments.append((tuple(command), dict(env), log_path))
         return _Handle()
+
+
+class _PendingHandle(_Handle):
+    def poll(self):
+        return None
 
 
 def test_lre_runner_consumes_stop_step_and_keeps_one_pipeline_per_gpu(tmp_path):
@@ -141,6 +152,7 @@ def test_lre_runner_consumes_stop_step_and_keeps_one_pipeline_per_gpu(tmp_path):
         "1",
         "2",
     ]
+    assert all(record["status"] == "succeeded" for record in result["runs"])
 
 
 def test_lre_runner_resume_verifies_existing_evaluation_without_retraining(tmp_path):
@@ -243,6 +255,9 @@ def test_architecture_pipeline_schedules_main_and_causal_evaluations(tmp_path):
     assert stages[3].command[stages[3].command.index("--output-dir") + 1].endswith(
         "evaluations/query_dependent_p1_no_rgbd/step_005000"
     )
+    assert "--compute-dpam" in stages[2].command
+    assert "--compute-dpam" not in stages[3].command
+    assert "--compute-dpam" not in stages[4].command
     assert (
         pipelines[0].run_dir / "evaluations/query_dependent_p1_no_rgbd"
     ).is_dir()
@@ -263,3 +278,62 @@ def test_lre_manifest_and_gpu_preflight_fail_closed(tmp_path):
 
     with pytest.raises(OrchestrationError, match="busy"):
         query_idle_gpus((1, 2), command_runner=busy)
+
+
+def test_lre_runner_rejects_manifest_from_another_repository_revision(tmp_path):
+    path, value = _manifest(tmp_path)
+    current = {**value["repository"], "commit": "2" * 40}
+
+    with pytest.raises(OrchestrationError, match="repository identity differs"):
+        run_lre_manifest(
+            path,
+            output_root=tmp_path / "runs",
+            native_root=_native_root(tmp_path),
+            gpus=(1,),
+            python_executable="python",
+            repository_identity_getter=lambda: current,
+            gpu_query=lambda devices: {devices[0]: {}},
+        )
+
+
+def test_failed_pipeline_publishes_failure_and_peer_abort_evidence(tmp_path):
+    _, manifest = _manifest(tmp_path)
+    pipelines = build_lre_pipelines(
+        manifest,
+        output_root=tmp_path / "runs",
+        native_root=_native_root(tmp_path),
+        python_executable="python",
+        compute_dpam=False,
+        trust_upstream_artifacts=True,
+        resume=False,
+    )
+
+    class _FailureHandle(_Handle):
+        def poll(self):
+            return 9
+
+    class _MixedRunner:
+        def __init__(self):
+            self.calls = 0
+
+        def start(self, command, *, env, log_path):
+            del command, env, log_path
+            self.calls += 1
+            return _FailureHandle() if self.calls == 1 else _PendingHandle()
+
+    with pytest.raises(OrchestrationError, match="stage failed"):
+        execute_lre_pipelines(
+            pipelines, gpus=(1, 2), runner=_MixedRunner(), poll_seconds=0
+        )
+
+    failed = json.loads(
+        (pipelines[0].run_dir / "run_result.screening.json").read_text()
+    )
+    aborted = json.loads(
+        (pipelines[1].run_dir / "run_result.screening.json").read_text()
+    )
+    assert failed["status"] == "failed"
+    assert failed["failed_stage"] == "prepare"
+    assert failed["exit_code"] == 9
+    assert aborted["status"] == "aborted_due_to_peer_failure"
+    assert aborted["peer_failed_run_id"] == pipelines[0].run_id

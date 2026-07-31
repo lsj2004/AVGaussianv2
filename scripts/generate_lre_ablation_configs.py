@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
 from avgaussianv2.benchmark.architecture_ablation import (
     validate_strategy_only_delta,
 )
+from avgaussianv2.benchmark.artifacts import repository_identity
 from avgaussianv2.benchmark.cross_attention_ablation import (
     cross_attention_variant,
     validate_backend_only_delta,
@@ -207,7 +208,9 @@ def generate(
     winners_path: Path | None = None,
     systems: tuple[str, ...] | None = None,
     strict_run_root: Path | None = None,
+    _repository_identity=repository_identity,
 ) -> dict[str, object]:
+    repository = _repository_identity()
     manifest_path = manifest_path.resolve()
     manifest = _load_mapping(manifest_path)
     if (
@@ -391,6 +394,7 @@ def generate(
         "stage": stage,
         "source_manifest": str(manifest_path),
         "source_manifest_sha256": _sha256(manifest_path),
+        "repository": repository,
         "winners": str(winners_path.resolve()) if winners_path is not None else None,
         "configs": configs,
         "runs": runs,

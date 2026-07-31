@@ -12,6 +12,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from avgaussianv2.benchmark.artifacts import repository_identity
+from avgaussianv2.benchmark.evaluation import EVALUATION_CONTINUATION_SYSTEMS
 from avgaussianv2.benchmark.orchestration import (
     MAX_IDLE_GPU_UTILIZATION_PERCENT,
     MIN_GPU_FREE_MIB,
@@ -23,7 +25,6 @@ from avgaussianv2.benchmark.orchestration import (
     _terminate_handles,
     parse_gpus,
 )
-from avgaussianv2.benchmark.evaluation import EVALUATION_CONTINUATION_SYSTEMS
 
 
 SCHEMA = "avgaussianv2.lre-loss-runner-result"
@@ -68,6 +69,7 @@ def load_lre_run_manifest(path: Path) -> dict[str, object]:
         value = json.loads(path.read_text())
     except (OSError, ValueError) as error:
         raise ValueError(f"cannot read LRE run manifest: {error}") from error
+    repository = value.get("repository") if isinstance(value, dict) else None
     if (
         not isinstance(value, dict)
         or value.get("schema") != "avgaussianv2.lre-loss-run-manifest"
@@ -76,6 +78,17 @@ def load_lre_run_manifest(path: Path) -> dict[str, object]:
         not in {"smoke", "architecture", "screening", "confirmation", "robustness"}
         or not isinstance(value.get("configs"), list)
         or not isinstance(value.get("runs"), list)
+        or not isinstance(repository, dict)
+        or set(repository) != {"root", "commit", "clean"}
+        or not isinstance(repository.get("root"), str)
+        or not Path(repository["root"]).is_absolute()
+        or not isinstance(repository.get("commit"), str)
+        or len(repository["commit"]) != 40
+        or any(
+            character not in "0123456789abcdef"
+            for character in repository["commit"]
+        )
+        or repository.get("clean") is not True
     ):
         raise ValueError("unsupported LRE run manifest")
     configs: dict[str, Mapping[str, object]] = {}
@@ -345,7 +358,7 @@ def build_lre_pipelines(
                     "cuda:0",
                     *common_trust,
                 ]
-                if compute_dpam:
+                if compute_dpam and evaluation_system == system:
                     command.append("--compute-dpam")
                 if (evaluation / "current.json").is_file():
                     command.append("--verify-only")
@@ -492,9 +505,58 @@ def execute_lre_pipelines(
                 if code is None:
                     continue
                 if code:
-                    _terminate_handles(
-                        (handle, *(item[2] for key, item in active.items() if key != gpu))
+                    failed_stage = pipeline.stages[index]
+                    failure = {
+                        "run_id": pipeline.run_id,
+                        "gpu": gpu,
+                        "status": "failed",
+                        "elapsed_seconds": (time.time_ns() - started) / 1e9,
+                        "planned_stages": [stage.name for stage in pipeline.stages],
+                        "completed_stages": [
+                            stage.name for stage in pipeline.stages[:index]
+                        ],
+                        "stages": [stage.name for stage in pipeline.stages[:index]],
+                        "failed_stage": failed_stage.name,
+                        "exit_code": code,
+                        "log": str(failed_stage.log),
+                        **usage[pipeline.run_id],
+                    }
+                    _publish_result(
+                        pipeline.run_dir / f"run_result.{pipeline.stage}.json",
+                        failure,
                     )
+                    peers = tuple(
+                        (peer_gpu, item)
+                        for peer_gpu, item in active.items()
+                        if peer_gpu != gpu
+                    )
+                    _terminate_handles((handle, *(item[2] for _, item in peers)))
+                    for peer_gpu, (peer, peer_index, _, peer_started) in peers:
+                        active_stage = peer.stages[peer_index]
+                        aborted = {
+                            "run_id": peer.run_id,
+                            "gpu": peer_gpu,
+                            "status": "aborted_due_to_peer_failure",
+                            "elapsed_seconds": (
+                                time.time_ns() - peer_started
+                            ) / 1e9,
+                            "planned_stages": [stage.name for stage in peer.stages],
+                            "completed_stages": [
+                                stage.name for stage in peer.stages[:peer_index]
+                            ],
+                            "stages": [
+                                stage.name for stage in peer.stages[:peer_index]
+                            ],
+                            "active_stage": active_stage.name,
+                            "peer_failed_run_id": pipeline.run_id,
+                            "log": str(active_stage.log),
+                            **usage[peer.run_id],
+                        }
+                        _publish_result(
+                            peer.run_dir / f"run_result.{peer.stage}.json",
+                            aborted,
+                        )
+                    active.clear()
                     raise OrchestrationError(
                         f"LRE stage failed: run={pipeline.run_id} "
                         f"stage={pipeline.stages[index].name} code={code} "
@@ -512,7 +574,10 @@ def execute_lre_pipelines(
                     record = {
                         "run_id": pipeline.run_id,
                         "gpu": gpu,
+                        "status": "succeeded",
                         "elapsed_seconds": (time.time_ns() - started) / 1e9,
+                        "planned_stages": [stage.name for stage in pipeline.stages],
+                        "completed_stages": [stage.name for stage in pipeline.stages],
                         "stages": [stage.name for stage in pipeline.stages],
                         **usage[pipeline.run_id],
                     }
@@ -541,9 +606,17 @@ def run_lre_manifest(
     resume: bool = False,
     runner: ProcessRunner | None = None,
     gpu_query: Callable[[Sequence[int]], Mapping[int, object]] = query_idle_gpus,
+    repository_identity_getter: Callable[[], Mapping[str, object]] = (
+        repository_identity
+    ),
 ) -> dict[str, object]:
     manifest_path = Path(manifest_path).resolve()
     manifest = load_lre_run_manifest(manifest_path)
+    current_repository = dict(repository_identity_getter())
+    if manifest["repository"] != current_repository:
+        raise OrchestrationError(
+            "LRE manifest repository identity differs from the current clean revision"
+        )
     devices = parse_gpus(gpus)
     gpu_status = dict(gpu_query(devices))
     pipelines = build_lre_pipelines(
@@ -555,18 +628,39 @@ def run_lre_manifest(
         trust_upstream_artifacts=trust_upstream_artifacts,
         resume=resume,
     )
-    result = execute_lre_pipelines(
-        pipelines,
-        gpus=devices,
-        runner=runner,
-        usage_sampler=sample_gpu_usage if runner is None else None,
-    )
+    try:
+        result = execute_lre_pipelines(
+            pipelines,
+            gpus=devices,
+            runner=runner,
+            usage_sampler=sample_gpu_usage if runner is None else None,
+        )
+    except BaseException as error:
+        failure = {
+            "schema": SCHEMA,
+            "version": 1,
+            "status": "failed",
+            "error": {"type": type(error).__name__, "message": str(error)},
+            "source_manifest": str(manifest_path),
+            "source_manifest_sha256": _sha256(manifest_path),
+            "repository": current_repository,
+            "stage": manifest["stage"],
+            "gpus": list(devices),
+            "gpu_preflight": gpu_status,
+        }
+        _publish_result(
+            Path(output_root).resolve() / f"runner_result.{manifest['stage']}.json",
+            failure,
+        )
+        raise
     result.update(
+        status="succeeded",
         source_manifest=str(manifest_path),
         source_manifest_sha256=_sha256(manifest_path),
         stage=manifest["stage"],
         gpus=list(devices),
         gpu_preflight=gpu_status,
+        repository=current_repository,
     )
     _publish_result(
         Path(output_root).resolve() / f"runner_result.{manifest['stage']}.json",

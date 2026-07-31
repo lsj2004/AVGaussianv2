@@ -9,6 +9,7 @@ from avgaussianv2.benchmark.lre_selection import select_screening_winners
 
 
 ROOT = Path(__file__).resolve().parents[1]
+FAKE_REPOSITORY = {"root": str(ROOT), "commit": "1" * 40, "clean": True}
 
 
 def _generator():
@@ -26,6 +27,7 @@ def _generate(tmp_path: Path) -> tuple[Path, dict[str, object]]:
         ROOT / "configs/experiments/lre_loss_ablation.yaml",
         tmp_path / "generated",
         systems=("audio_only", "joint_conditioned"),
+        _repository_identity=lambda: FAKE_REPOSITORY,
     )
     return tmp_path / "generated/screening/manifest.json", value
 
@@ -79,6 +81,7 @@ def test_screening_selector_applies_all_unit_gates_and_ranks_survivors(tmp_path)
         stage="confirmation",
         winners_path=output,
         systems=("audio_only", "joint_conditioned"),
+        _repository_identity=lambda: FAKE_REPOSITORY,
     )
     assert {record["lambda_lre"] for record in confirmation["runs"]} == {
         0.0,
