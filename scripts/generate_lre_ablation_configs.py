@@ -109,6 +109,7 @@ def generate(
     *,
     stage: str = "screening",
     winners_path: Path | None = None,
+    systems: tuple[str, ...] | None = None,
 ) -> dict[str, object]:
     manifest_path = manifest_path.resolve()
     manifest = _load_mapping(manifest_path)
@@ -130,9 +131,11 @@ def generate(
         winners_path=winners_path,
         screening_manifest_path=output_dir.resolve() / "screening/manifest.json",
     )
-    systems = tuple(manifest["loss_search_default_systems"])
+    systems = tuple(systems or ())
     if not systems or len(set(systems)) != len(systems):
-        raise ValueError("systems must be nonempty and unique")
+        raise ValueError(
+            "loss-search systems must be explicitly supplied from architecture survivors"
+        )
     report_steps = tuple(int(step) for step in stage_config["report_steps"])
     if (
         not report_steps
@@ -143,59 +146,77 @@ def generate(
     max_steps = report_steps[-1]
     stage_dir = output_dir.resolve() / stage
     stage_dir.mkdir(parents=True, exist_ok=True)
+    catalog = manifest.get("architecture_configs")
+    if not isinstance(catalog, dict):
+        raise ValueError("architecture_configs must be a mapping")
     configs = []
     runs = []
-    for scene, relative in manifest["base_configs"].items():
-        base_path = (manifest_path.parent / relative).resolve()
-        base = _load_mapping(base_path)
-        for seed in seeds:
-            for weight in weights:
-                derived = yaml.safe_load(yaml.safe_dump(base, sort_keys=False))
-                if not isinstance(derived.get("train"), dict) or not isinstance(
-                    derived.get("benchmark"), dict
-                ):
-                    raise ValueError("base config requires train and benchmark mappings")
-                derived["train"]["seed"] = int(seed)
-                derived["train"]["lambda_lre"] = float(weight)
-                derived["train"]["lre_scale_db"] = float(fixed["lre_scale_db"])
-                derived["train"]["lre_epsilon"] = float(fixed["lre_epsilon"])
-                derived["train"]["lre_smooth_l1_beta"] = float(
-                    fixed["lre_smooth_l1_beta"]
-                )
-                derived["train"]["joint_steps"] = max_steps
-                derived["benchmark"]["seed"] = int(seed)
-                derived["benchmark"]["continuation_updates"] = max_steps
-                derived["benchmark"]["report_steps"] = list(report_steps)
-                config_id = (
-                    f"{stage}__{scene}__seed{seed}__lre{_weight_slug(weight)}"
-                )
-                destination = stage_dir / f"{config_id}.yaml"
-                _rebase_paths(
-                    derived,
-                    source_directory=base_path.parent,
-                    destination_directory=destination.parent,
-                )
-                data = yaml.safe_dump(derived, sort_keys=False).encode()
-                destination.write_bytes(data)
-                configs.append(
-                    {
-                        "config_id": config_id,
-                        "scene": scene,
-                        "seed": seed,
-                        "lambda_lre": weight,
-                        "base_config": str(base_path),
-                        "config": str(destination.resolve()),
-                        "config_sha256": hashlib.sha256(data).hexdigest(),
-                    }
-                )
-                for system in systems:
-                    run_id = f"{config_id}__{system}"
+    for system in systems:
+        specification = catalog.get(system)
+        if not isinstance(specification, dict):
+            raise ValueError(f"unknown architecture survivor system: {system}")
+        training_mode = specification.get("training_mode")
+        if training_mode not in {"audio_only", "joint_conditioned"}:
+            raise ValueError(f"invalid training mode for architecture {system}")
+        scenes = manifest.get("scenes")
+        if not isinstance(scenes, list) or not scenes:
+            raise ValueError("scenes must be a nonempty list")
+        for scene in scenes:
+            relative = specification.get(scene)
+            if not isinstance(relative, str):
+                raise ValueError(f"architecture {system} has no config for {scene}")
+            base_path = (manifest_path.parent / relative).resolve()
+            base = _load_mapping(base_path)
+            for seed in seeds:
+                for weight in weights:
+                    derived = yaml.safe_load(yaml.safe_dump(base, sort_keys=False))
+                    if not isinstance(derived.get("train"), dict) or not isinstance(
+                        derived.get("benchmark"), dict
+                    ):
+                        raise ValueError("base config requires train and benchmark mappings")
+                    derived["train"]["seed"] = int(seed)
+                    derived["train"]["lambda_lre"] = float(weight)
+                    derived["train"]["lre_scale_db"] = float(fixed["lre_scale_db"])
+                    derived["train"]["lre_epsilon"] = float(fixed["lre_epsilon"])
+                    derived["train"]["lre_smooth_l1_beta"] = float(
+                        fixed["lre_smooth_l1_beta"]
+                    )
+                    derived["train"]["joint_steps"] = max_steps
+                    derived["benchmark"]["seed"] = int(seed)
+                    derived["benchmark"]["continuation_updates"] = max_steps
+                    derived["benchmark"]["report_steps"] = list(report_steps)
+                    config_id = (
+                        f"{stage}__{system}__{scene}__seed{seed}"
+                        f"__lre{_weight_slug(weight)}"
+                    )
+                    destination = stage_dir / f"{config_id}.yaml"
+                    _rebase_paths(
+                        derived,
+                        source_directory=base_path.parent,
+                        destination_directory=destination.parent,
+                    )
+                    data = yaml.safe_dump(derived, sort_keys=False).encode()
+                    destination.write_bytes(data)
+                    configs.append(
+                        {
+                            "config_id": config_id,
+                            "system": system,
+                            "training_mode": training_mode,
+                            "scene": scene,
+                            "seed": seed,
+                            "lambda_lre": weight,
+                            "base_config": str(base_path),
+                            "config": str(destination.resolve()),
+                            "config_sha256": hashlib.sha256(data).hexdigest(),
+                        }
+                    )
+                    run_id = config_id
                     control_run_id = (
                         None
                         if weight == 0.0
                         else (
-                            f"{stage}__{scene}__seed{seed}__lre"
-                            f"{_weight_slug(0.0)}__{system}"
+                            f"{stage}__{system}__{scene}__seed{seed}"
+                            f"__lre{_weight_slug(0.0)}"
                         )
                     )
                     runs.append(
@@ -205,6 +226,7 @@ def generate(
                             "config_id": config_id,
                             "scene": scene,
                             "system": system,
+                            "training_mode": training_mode,
                             "seed": seed,
                             "lambda_lre": weight,
                             "control_run_id": control_run_id,
@@ -251,12 +273,19 @@ def main() -> None:
         type=Path,
         help="screening selection JSON; required for confirmation",
     )
+    parser.add_argument(
+        "--system",
+        action="append",
+        dest="systems",
+        help="architecture survivor system; repeat for multiple systems",
+    )
     args = parser.parse_args()
     result = generate(
         args.manifest,
         args.output_dir,
         stage=args.stage,
         winners_path=args.winners,
+        systems=tuple(args.systems or ()),
     )
     print(
         json.dumps(

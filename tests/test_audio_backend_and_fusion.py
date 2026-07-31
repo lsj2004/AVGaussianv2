@@ -328,6 +328,27 @@ def test_direct_conditioned_unet_replaces_gs_only_output() -> None:
     )
 
 
+def test_plain_unet_strategy_uses_inherited_unet_and_ignores_condition() -> None:
+    backend = _gs_only_backend(AudioRenderStrategy.PLAIN_UNET)
+    source = torch.randn(1, 2, 32, generator=torch.Generator().manual_seed(11))
+    pose = torch.zeros(1, 12)
+    condition = torch.ones(1, 8)
+
+    expected = TinyGSOnlyAudioModel.inherited_unet_forward(
+        backend.model, pose, source
+    )
+    native = backend.model(pose, source)
+
+    torch.testing.assert_close(backend.render(pose, source), expected)
+    torch.testing.assert_close(
+        backend.render(pose, source, condition=condition),
+        expected,
+    )
+    assert not torch.allclose(expected, native)
+    assert backend.audio_unet_parameters()
+    assert backend.film_parameters()
+
+
 def test_gated_native_residual_initializes_as_unit_bounded_gate() -> None:
     backend = _gs_only_backend(AudioRenderStrategy.GATED_NATIVE_RESIDUAL)
     source = torch.randn(1, 2, 32)
@@ -364,6 +385,7 @@ def test_gated_native_residual_initializes_as_unit_bounded_gate() -> None:
 def test_non_gated_strategies_do_not_add_gate_state() -> None:
     for strategy in (
         AudioRenderStrategy.NATIVE_RESIDUAL,
+        AudioRenderStrategy.PLAIN_UNET,
         AudioRenderStrategy.DIRECT_CONDITIONED_UNET,
     ):
         backend = _gs_only_backend(strategy)

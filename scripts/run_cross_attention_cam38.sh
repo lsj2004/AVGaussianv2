@@ -2,15 +2,31 @@
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
-  echo "usage: $0 <scene1_opera|Scene7playing> <prepare|diagnose|train|eval|report> [gpu] [system] [step]" >&2
+  echo "usage: $0 <scene> <prepare|diagnose|train|report> [gpu] [variant]" >&2
+  echo "       $0 <scene> eval [gpu] [system] [step]" >&2
   exit 2
 fi
 
 SCENE="$1"
 ACTION="$2"
 GPU="${3:-0}"
-SYSTEM="${4:-cross_attention}"
-STEP="${5:-30000}"
+if [[ "${ACTION}" == "eval" ]]; then
+  SYSTEM="${4:-cross_attention}"
+  STEP="${5:-30000}"
+  case "${SYSTEM}" in
+    cross_attention_masks*) VARIANT=cross_attention_masks ;;
+    query_dependent_p1*) VARIANT=query_dependent_p1 ;;
+    cross_attention*) VARIANT=cross_attention ;;
+    *)
+      echo "unsupported causal system: ${SYSTEM}" >&2
+      exit 2
+      ;;
+  esac
+else
+  VARIANT="${4:-cross_attention}"
+  SYSTEM="${VARIANT}"
+  STEP=30000
+fi
 
 case "${SCENE}" in
   scene1_opera)
@@ -27,11 +43,26 @@ esac
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BASE_CONFIG="${ROOT}/configs/benchmark_cam38/${SCENE}.yaml"
-CROSS_CONFIG="${ROOT}/configs/benchmark_cam38/${SCENE}_cross_attention.yaml"
+case "${VARIANT}" in
+  cross_attention)
+    CONFIG_SUFFIX=cross_attention
+    ;;
+  cross_attention_masks)
+    CONFIG_SUFFIX=cross_attention_masks
+    ;;
+  query_dependent_p1)
+    CONFIG_SUFFIX=query_dependent_p1
+    ;;
+  *)
+    echo "unsupported cross-attention variant: ${VARIANT}" >&2
+    exit 2
+    ;;
+esac
+CROSS_CONFIG="${ROOT}/configs/benchmark_cam38/${SCENE}_${CONFIG_SUFFIX}.yaml"
 BASE_PROTOCOL="${ROOT}/runs/cam38_benchmark/${SCENE}/protocol"
 FTGSPP_CONTRACT="${ROOT}/runs/cam38_strict/${SCENE}/ftgspp/native_contract"
 AUDIOGS_CONTRACT="${ROOT}/runs/cam38_strict/${SCENE}/audiogs/native_contract"
-OUTPUT="${ROOT}/runs/cross_attention_ablation/${SCENE}"
+OUTPUT="${ROOT}/runs/${VARIANT}_ablation/${SCENE}"
 PROTOCOL="${OUTPUT}/protocol"
 WORKER="${OUTPUT}/worker"
 EVALUATIONS="${OUTPUT}/evaluations"
@@ -77,7 +108,7 @@ case "${ACTION}" in
     ;;
   eval)
     case "${SYSTEM}" in
-      cross_attention|cross_attention_no_rgbd|cross_attention_shuffled_rgbd|cross_attention_no_gaussians|cross_attention_no_pose) ;;
+      cross_attention|cross_attention_no_rgbd|cross_attention_shuffled_rgbd|cross_attention_no_gaussians|cross_attention_no_pose|cross_attention_masks|cross_attention_masks_no_rgbd|cross_attention_masks_shuffled_rgbd|query_dependent_p1|query_dependent_p1_no_rgbd|query_dependent_p1_wrong_camera) ;;
       *)
         echo "unsupported causal system: ${SYSTEM}" >&2
         exit 2

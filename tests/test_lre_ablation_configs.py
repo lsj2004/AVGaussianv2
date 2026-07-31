@@ -23,11 +23,20 @@ def _manifest() -> Path:
     return ROOT / "configs/experiments/lre_loss_ablation.yaml"
 
 
+def _generate(module, output: Path, **kwargs):
+    return module.generate(
+        _manifest(),
+        output,
+        systems=("audio_only", "joint_conditioned"),
+        **kwargs,
+    )
+
+
 def test_screening_generation_only_expands_screening_seed(tmp_path: Path) -> None:
-    generated = _load_generator().generate(_manifest(), tmp_path)
+    generated = _generate(_load_generator(), tmp_path)
 
     assert generated["stage"] == "screening"
-    assert len(generated["configs"]) == 8
+    assert len(generated["configs"]) == 16
     assert len(generated["runs"]) == 16
     assert {record["seed"] for record in generated["runs"]} == {42}
     assert {record["lambda_lre"] for record in generated["runs"]} == {
@@ -69,9 +78,9 @@ def test_confirmation_requires_winners_bound_to_screening_manifest(
     module = _load_generator()
 
     with pytest.raises(ValueError, match="requires --winners"):
-        module.generate(_manifest(), tmp_path, stage="confirmation")
+        _generate(module, tmp_path, stage="confirmation")
 
-    module.generate(_manifest(), tmp_path, stage="screening")
+    _generate(module, tmp_path, stage="screening")
     screening_manifest = tmp_path / "screening/manifest.json"
     winners = tmp_path / "winners.json"
     winners.write_text(
@@ -87,14 +96,14 @@ def test_confirmation_requires_winners_bound_to_screening_manifest(
         )
     )
 
-    generated = module.generate(
-        _manifest(),
+    generated = _generate(
+        module,
         tmp_path,
         stage="confirmation",
         winners_path=winners,
     )
 
-    assert len(generated["configs"]) == 6
+    assert len(generated["configs"]) == 12
     assert len(generated["runs"]) == 12
     assert {record["seed"] for record in generated["runs"]} == {42}
     assert {record["lambda_lre"] for record in generated["runs"]} == {
@@ -121,8 +130,8 @@ def test_confirmation_requires_winners_bound_to_screening_manifest(
 @pytest.mark.parametrize(
     ("selected", "expected_configs", "expected_runs", "expected_weights"),
     [
-        ([], 2, 4, {0.0}),
-        ([0.02], 4, 8, {0.0, 0.02}),
+        ([], 4, 4, {0.0}),
+        ([0.02], 8, 8, {0.0, 0.02}),
     ],
 )
 def test_confirmation_supports_dynamic_survivor_count(
@@ -133,7 +142,7 @@ def test_confirmation_supports_dynamic_survivor_count(
     expected_weights: set[float],
 ) -> None:
     module = _load_generator()
-    module.generate(_manifest(), tmp_path, stage="screening")
+    _generate(module, tmp_path, stage="screening")
     screening_manifest = tmp_path / "screening/manifest.json"
     winners = tmp_path / "winners.json"
     winners.write_text(
@@ -149,8 +158,8 @@ def test_confirmation_supports_dynamic_survivor_count(
         )
     )
 
-    generated = module.generate(
-        _manifest(),
+    generated = _generate(
+        module,
         tmp_path,
         stage="confirmation",
         winners_path=winners,
@@ -163,7 +172,7 @@ def test_confirmation_supports_dynamic_survivor_count(
 
 def test_confirmation_rejects_unbound_or_too_many_winners(tmp_path: Path) -> None:
     module = _load_generator()
-    module.generate(_manifest(), tmp_path, stage="screening")
+    _generate(module, tmp_path, stage="screening")
     winners = tmp_path / "winners.json"
     winners.write_text(
         json.dumps(
@@ -177,8 +186,8 @@ def test_confirmation_rejects_unbound_or_too_many_winners(tmp_path: Path) -> Non
     )
 
     with pytest.raises(ValueError, match="does not bind"):
-        module.generate(
-            _manifest(),
+        _generate(
+            module,
             tmp_path,
             stage="confirmation",
             winners_path=winners,
@@ -198,9 +207,50 @@ def test_confirmation_rejects_unbound_or_too_many_winners(tmp_path: Path) -> Non
         )
     )
     with pytest.raises(ValueError, match="at most 2"):
-        module.generate(
-            _manifest(),
+        _generate(
+            module,
             tmp_path,
             stage="confirmation",
             winners_path=winners,
         )
+
+
+def test_generation_binds_each_survivor_to_its_architecture_config(
+    tmp_path: Path,
+) -> None:
+    module = _load_generator()
+
+    generated = module.generate(
+        _manifest(),
+        tmp_path,
+        systems=("plain_unet", "query_dependent_p1"),
+    )
+
+    plain = next(
+        record
+        for record in generated["configs"]
+        if record["system"] == "plain_unet"
+        and record["scene"] == "scene1_opera"
+        and record["lambda_lre"] == 0.0
+    )
+    p1 = next(
+        record
+        for record in generated["configs"]
+        if record["system"] == "query_dependent_p1"
+        and record["scene"] == "scene1_opera"
+        and record["lambda_lre"] == 0.0
+    )
+    plain_config = yaml.safe_load(Path(plain["config"]).read_text())
+    p1_config = yaml.safe_load(Path(p1["config"]).read_text())
+
+    assert plain["training_mode"] == "audio_only"
+    assert plain_config["model"]["audio_render_strategy"] == "plain_unet"
+    assert p1["training_mode"] == "joint_conditioned"
+    assert p1_config["model"]["audio_backend"] == "query_dependent_p1"
+
+
+def test_generation_requires_explicit_architecture_survivors(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="explicitly supplied"):
+        _load_generator().generate(_manifest(), tmp_path)

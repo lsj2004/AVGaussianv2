@@ -12,6 +12,11 @@ import torch
 from torch import Tensor, nn
 
 from avgaussianv2.models.film_unet import FiLMConditionedAudioUNet
+from avgaussianv2.models.mask_cross_attention import (
+    AudioFeatureMaskCrossAttention,
+)
+from avgaussianv2.models.p1_audio import AlignedComplexCrossAttention
+from avgaussianv2.models.p1_visual import VisualMemory
 
 
 class AudioCheckpointError(RuntimeError):
@@ -26,6 +31,7 @@ class AudioRenderStrategy(str, Enum):
     """How RGBD-conditioned U-Net output is combined with AudioGS."""
 
     NATIVE_RESIDUAL = "native_residual"
+    PLAIN_UNET = "plain_unet"
     DIRECT_CONDITIONED_UNET = "direct_conditioned_unet"
     GATED_NATIVE_RESIDUAL = "gated_native_residual"
 
@@ -227,11 +233,27 @@ class AudioGSBackend(nn.Module):
         upstream_root: Path | None = None,
         forward_override: ForwardOverride | None = None,
         render_strategy: AudioRenderStrategy | str = AudioRenderStrategy.NATIVE_RESIDUAL,
+        complex_renderer: AlignedComplexCrossAttention | None = None,
     ) -> None:
         super().__init__()
-        if not isinstance(getattr(model, "renderer", None), FiLMConditionedAudioUNet):
-            raise TypeError("AudioGS model renderer must be wrapped by FiLMConditionedAudioUNet")
+        renderer = getattr(model, "renderer", None)
+        required_renderer_methods = (
+            "use_condition",
+            "conditioning_parameters",
+            "base_parameters",
+        )
+        if complex_renderer is None and (
+            not isinstance(renderer, nn.Module)
+            or any(
+                not callable(getattr(renderer, name, None))
+                for name in required_renderer_methods
+            )
+        ):
+            raise TypeError(
+                "AudioGS model renderer must implement the conditioned renderer protocol"
+            )
         self.model = model
+        self.complex_renderer = complex_renderer
         self.source_path = Path(source_path)
         self.checkpoint_config = checkpoint_config
         self.upstream_root = None if upstream_root is None else Path(upstream_root)
@@ -244,10 +266,14 @@ class AudioGSBackend(nn.Module):
         )
 
     @property
-    def conditioned_renderer(self) -> FiLMConditionedAudioUNet:
+    def conditioned_renderer(self) -> nn.Module:
         renderer = self.model.renderer
-        if not isinstance(renderer, FiLMConditionedAudioUNet):
-            raise RuntimeError("AudioGS renderer wrapper was replaced after backend construction")
+        if not isinstance(renderer, nn.Module) or not callable(
+            getattr(renderer, "use_condition", None)
+        ):
+            raise RuntimeError(
+                "AudioGS conditioned renderer was replaced after backend construction"
+            )
         return renderer
 
     @classmethod
@@ -259,6 +285,21 @@ class AudioGSBackend(nn.Module):
         upstream_root: str | Path | None = None,
         model_class: str = "Audio3DGS",
         render_strategy: AudioRenderStrategy | str = AudioRenderStrategy.NATIVE_RESIDUAL,
+        renderer_kind: str = "film_unet",
+        transformer_layers: int = 4,
+        transformer_heads: int = 4,
+        freq_patch: int = 16,
+        time_patch: int = 4,
+        dropout: float = 0.0,
+        cross_gate_init: float = 0.01,
+        n_fft: int = 512,
+        hop_length: int = 160,
+        win_length: int = 400,
+        max_log_magnitude: float = 0.15,
+        max_phase: float = 0.25,
+        additive_scale: float = 0.01,
+        geometry_rank: int = 16,
+        geometry_bias_scale: float = 1.0,
     ) -> "AudioGSBackend":
         model, checkpoint_config, checkpoint_path = _load_audiogs_model(
             checkpoint,
@@ -266,7 +307,49 @@ class AudioGSBackend(nn.Module):
             upstream_root=upstream_root,
             model_class=model_class,
         )
-        model.renderer = FiLMConditionedAudioUNet(model.renderer, embedding_dim=embedding_dim)
+        complex_renderer = None
+        if renderer_kind == "film_unet":
+            model.renderer = FiLMConditionedAudioUNet(
+                model.renderer,
+                embedding_dim=embedding_dim,
+            )
+        elif renderer_kind == "mask_cross_attention":
+            model.renderer = AudioFeatureMaskCrossAttention(
+                d_model=embedding_dim,
+                num_layers=transformer_layers,
+                num_heads=transformer_heads,
+                freq_patch=freq_patch,
+                time_patch=time_patch,
+                dropout=dropout,
+                cross_gate_init=cross_gate_init,
+            )
+        elif renderer_kind == "p1_query_geometry":
+            if model_class != "Audio3DGSMonoDiffGSOnly":
+                raise AudioCheckpointError(
+                    "query-dependent P1 requires Audio3DGSMonoDiffGSOnly"
+                )
+            complex_renderer = AlignedComplexCrossAttention(
+                d_model=embedding_dim,
+                num_layers=transformer_layers,
+                num_heads=transformer_heads,
+                freq_patch=freq_patch,
+                time_patch=time_patch,
+                dropout=dropout,
+                cross_gate_init=cross_gate_init,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                win_length=win_length,
+                max_log_magnitude=max_log_magnitude,
+                max_phase=max_phase,
+                additive_scale=additive_scale,
+                geometry_rank=geometry_rank,
+                geometry_bias_scale=geometry_bias_scale,
+            )
+        else:
+            raise ValueError(
+                "renderer_kind must be film_unet, mask_cross_attention, "
+                "or p1_query_geometry"
+            )
         forward_override = None
         if upstream_root is not None:
             forward_override = _upstream_forward_override(Path(upstream_root), model_class)
@@ -277,6 +360,7 @@ class AudioGSBackend(nn.Module):
             upstream_root=None if upstream_root is None else Path(upstream_root),
             forward_override=forward_override,
             render_strategy=render_strategy,
+            complex_renderer=complex_renderer,
         )
 
     def build_criterion(self) -> nn.Module:
@@ -286,12 +370,35 @@ class AudioGSBackend(nn.Module):
         self,
         cam_pose: Tensor,
         source_audio: Tensor,
-        condition: Tensor | None = None,
+        condition: Tensor | VisualMemory | None = None,
     ) -> Tensor:
         if source_audio.ndim != 3 or source_audio.shape[1] != 2:
             raise ValueError("source_audio must have shape (B,2,samples)")
         if cam_pose.ndim != 2 or cam_pose.shape[0] != source_audio.shape[0]:
             raise ValueError("cam_pose must have shape (B,features) and match source audio")
+        if self.complex_renderer is not None:
+            if condition is None:
+                return self.model(cam_pose, source_audio)
+            native_outputs = self.model(
+                cam_pose,
+                source_audio,
+                return_masks=True,
+            )
+            if not isinstance(native_outputs, tuple) or len(native_outputs) != 5:
+                raise RuntimeError(
+                    "query-dependent P1 requires AudioGS return_masks output "
+                    "(audio, mono, diff, source_magnitude, distance)"
+                )
+            native, mono, diff, source_magnitude, distance = native_outputs
+            return self.complex_renderer(
+                native,
+                mono,
+                diff,
+                source_magnitude,
+                distance,
+                cam_pose,
+                condition,
+            )
         if self.forward_override is None:
             plain = self.model(cam_pose, source_audio)
             if condition is None:
@@ -301,6 +408,9 @@ class AudioGSBackend(nn.Module):
             if self.render_strategy is AudioRenderStrategy.GATED_NATIVE_RESIDUAL:
                 return plain + self.residual_gate_scale() * (conditioned - plain)
             return conditioned
+
+        if self.render_strategy is AudioRenderStrategy.PLAIN_UNET:
+            return self.forward_override(self.model, cam_pose, source_audio)
 
         if self.render_strategy is AudioRenderStrategy.DIRECT_CONDITIONED_UNET:
             if condition is None:
@@ -336,10 +446,14 @@ class AudioGSBackend(nn.Module):
         ]
 
     def film_parameters(self) -> list[nn.Parameter]:
-        parameters = list(self.conditioned_renderer.film.parameters())
+        if self.complex_renderer is not None:
+            return list(self.complex_renderer.parameters())
+        parameters = list(self.conditioned_renderer.conditioning_parameters())
         if self.residual_gate_logit is not None:
             parameters.append(self.residual_gate_logit)
         return parameters
 
     def audio_unet_parameters(self) -> list[nn.Parameter]:
-        return list(self.conditioned_renderer.base.parameters())
+        if self.complex_renderer is not None:
+            return []
+        return list(self.conditioned_renderer.base_parameters())

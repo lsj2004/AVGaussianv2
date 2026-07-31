@@ -20,6 +20,7 @@ from avgaussianv2.train import (
     joint_train_step,
     run_condition_warmup,
     run_joint_finetune,
+    same_frame_camera_negative_indices,
 )
 
 
@@ -57,10 +58,14 @@ class TinyTrainFusion(nn.Module):
         self.emit_nan = emit_nan
 
     def forward(self, sample):
+        return self.forward_with_condition_sample(sample, sample)
+
+    def forward_with_condition_sample(self, sample, condition_sample):
         visual_value = self.visual.value
         rgb = visual_value.sigmoid().expand(1, 8, 8, 3)
         depth = (visual_value + 2.0).expand(1, 8, 8, 1)
-        condition = visual_value * self.condition_encoder.value
+        frame_scale = 1.0 + 0.01 * float(condition_sample.frame_index)
+        condition = visual_value * self.condition_encoder.value * frame_scale
         audio_gain = (
             self.acoustic.value
             + self.audio_unet.value
@@ -183,6 +188,61 @@ def test_audio_objective_rejects_invalid_base_criterion(
             weights=JointLossWeights(),
             audio_loss_fn=criterion,
         )
+
+
+def test_same_frame_camera_negatives_are_reproducible_and_cross_camera() -> None:
+    samples = []
+    for frame in (1, 2):
+        for camera in ("cam00", "cam01", "cam02"):
+            value = make_sample()
+            samples.append(
+                type(value)(
+                    **{
+                        **vars(value),
+                        "frame_index": frame,
+                        "camera": camera,
+                    }
+                )
+            )
+    anchors = [0, 1, 3, 4]
+
+    first = same_frame_camera_negative_indices(samples, anchors, seed=42)
+    second = same_frame_camera_negative_indices(samples, anchors, seed=42)
+
+    assert first == second
+    for anchor, negative in zip(anchors, first):
+        assert samples[anchor].frame_index == samples[negative].frame_index
+        assert samples[anchor].camera != samples[negative].camera
+
+
+def test_joint_step_applies_p1_camera_contrast() -> None:
+    model = TinyTrainFusion()
+    model.camera_contrast_weight = 0.5
+    model.camera_contrast_margin = 0.1
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    correct = make_sample()
+    wrong = type(correct)(
+        **{
+            **vars(correct),
+            "camera": "cam01",
+            "frame_index": correct.frame_index,
+        }
+    )
+
+    stats = joint_train_step(
+        model,
+        correct,
+        optimizer,
+        TrainConfig(),
+        audio_loss,
+        capture_visual_anchor(model.visual),
+        contrast_sample=wrong,
+    )
+
+    assert stats.losses["camera_contrast"] >= 0
+    assert stats.losses["camera_contrast_weighted"] == pytest.approx(
+        0.5 * stats.losses["camera_contrast"]
+    )
 
 
 def test_joint_loss_matches_weighted_components() -> None:

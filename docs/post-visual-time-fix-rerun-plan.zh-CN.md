@@ -123,25 +123,21 @@ strict verification。
 
 ## 5. 重跑前置工作
 
-### 5.1 建立真正的统一实验分支
+### 5.1 使用统一 clean runner
 
 当前 `clean/codebase-structure` 包含：
 
 - FiLM；
 - Direct/Gated；
 - Gaussian-token Cross-Attention；
+- Plain U-Net；
+- Mask Cross-Attention；
+- Query-dependent P1；
 - 基础 cam38 benchmark。
 
-以下实现仍在其他分支：
-
-- Mask Cross-Attention、P1、Spatial P1：
-  `origin/agent/p1-spatial-camera-contrast`
-- Plain U-Net：
-  `origin/agent/plain-unet-baseline`
-
-重跑这些系统前，必须把本次修复和 clean 文档提交移植到对应分支，或者先建立
-统一模型 registry 分支。禁止直接在旧实验分支上运行，因为旧分支仍包含错误的
-cam38 time fallback。
+这些系统必须从 clean 的统一 config/runtime/benchmark 入口重跑，不能直接在旧
+实验分支上运行。Spatial P1 没有合入本轮候选池；如后续恢复，应单独审查其额外
+训练目标，而不是与原 P1 混用 checkpoint。
 
 ### 5.2 使用新输出目录
 

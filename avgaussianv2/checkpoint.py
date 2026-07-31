@@ -91,6 +91,36 @@ def _compatibility(config: ProjectConfig) -> dict[str, Any]:
                 "audio_pose_tokens": config.model.audio_pose_tokens,
             }
         )
+    if config.model.audio_backend == "cross_attention_masks":
+        compatibility.update(
+            {
+                "audio_freq_patch": config.model.audio_freq_patch,
+                "audio_time_patch": config.model.audio_time_patch,
+                "audio_transformer_layers": config.model.audio_transformer_layers,
+                "audio_transformer_heads": config.model.audio_transformer_heads,
+                "audio_dropout": config.model.audio_dropout,
+                "audio_cross_gate_init": config.model.audio_cross_gate_init,
+            }
+        )
+    if config.model.audio_backend == "query_dependent_p1":
+        compatibility.update(
+            {
+                "p1_transformer_layers": config.model.p1_transformer_layers,
+                "p1_transformer_heads": config.model.p1_transformer_heads,
+                "p1_freq_patch": config.model.p1_freq_patch,
+                "p1_time_patch": config.model.p1_time_patch,
+                "p1_dropout": config.model.p1_dropout,
+                "p1_cross_gate_init": config.model.p1_cross_gate_init,
+                "p1_max_log_magnitude": config.model.p1_max_log_magnitude,
+                "p1_max_phase": config.model.p1_max_phase,
+                "p1_additive_scale": config.model.p1_additive_scale,
+                "p1_geometry_rank": config.model.p1_geometry_rank,
+                "p1_geometry_bias_scale": config.model.p1_geometry_bias_scale,
+                "p1_visual_scene_scale": config.model.p1_visual_scene_scale,
+                "p1_camera_contrast_weight": config.model.p1_camera_contrast_weight,
+                "p1_camera_contrast_margin": config.model.p1_camera_contrast_margin,
+            }
+        )
     return compatibility
 
 

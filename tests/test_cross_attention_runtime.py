@@ -16,6 +16,7 @@ from avgaussianv2.models.cross_attention_audio import (
     AudioVisualTokenAudioBackend,
 )
 from avgaussianv2.models.fusion import AVGaussianFusionV2
+from avgaussianv2.models.p1_visual import GeometricVisualTokenEncoder
 from avgaussianv2.models.visual_tokens import RGBDTokenEncoder
 
 
@@ -55,6 +56,24 @@ class TinyRuntimeAudioGS(nn.Module):
     def eval_mono_diff_fields(self, relative):
         zeros = relative[..., 0] * 0
         return zeros, zeros
+
+
+class TinyConditionedBackend(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.value = nn.Parameter(torch.tensor(1.0))
+
+    def build_criterion(self):
+        return nn.MSELoss()
+
+    def acoustic_parameters(self):
+        return []
+
+    def film_parameters(self):
+        return [self.value]
+
+    def audio_unet_parameters(self):
+        return []
 
 
 def test_cross_attention_runtime_loads_native_audiogs_without_unet(monkeypatch) -> None:
@@ -132,3 +151,103 @@ def test_cross_attention_runtime_loads_native_audiogs_without_unet(monkeypatch) 
     assert isinstance(bundle.model.condition_encoder, RGBDTokenEncoder)
     assert bundle.train_samples == ("train-sample",)
     assert bundle.eval_samples == ("eval-sample",)
+
+
+def _runtime_config(backend: str) -> ProjectConfig:
+    return ProjectConfig(
+        scene=SceneConfig(
+            "scene",
+            30.0,
+            ("cam00",),
+            ("cam38",),
+            {"cam00": 0, "cam38": 38},
+        ),
+        paths=PathConfig(
+            Path("/visual"),
+            Path("/audio"),
+            Path("/visual.pt"),
+            Path("/audio.pt"),
+            Path("/manifest.json"),
+        ),
+        model=ModelConfig(
+            audio_backend=backend,
+            embedding_dim=32,
+            audio_freq_patch=4,
+            audio_time_patch=2,
+            audio_transformer_layers=1,
+            audio_transformer_heads=4,
+            p1_transformer_layers=1,
+            p1_transformer_heads=4,
+            p1_freq_patch=4,
+            p1_time_patch=2,
+            audio_model_class="Audio3DGSMonoDiffGSOnly",
+        ),
+        train=TrainConfig(),
+    )
+
+
+def _install_runtime_fakes(monkeypatch, load_audio):
+    monkeypatch.setattr(
+        runtime_module,
+        "FTGSVisualBackend",
+        SimpleNamespace(load=lambda *_: nn.Linear(1, 1)),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "AudioGSBackend",
+        SimpleNamespace(load=load_audio),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "AlignedAVDataset",
+        lambda _config, split: (f"{split}-sample",),
+    )
+    monkeypatch.setattr(runtime_module, "AVGaussianFusionV2", AVGaussianFusionV2)
+    monkeypatch.setattr(runtime_module, "RGBDConditionEncoder", nn.Identity)
+
+
+def test_mask_runtime_selects_mask_renderer_protocol(monkeypatch) -> None:
+    backend = TinyConditionedBackend()
+    captured = {}
+
+    def load_audio(*_args, **kwargs):
+        captured.update(kwargs)
+        return backend
+
+    _install_runtime_fakes(monkeypatch, load_audio)
+    bundle = runtime_module.build_runtime(
+        _runtime_config("cross_attention_masks"),
+        torch.device("cpu"),
+        trusted_upstream_artifacts=True,
+    )
+
+    assert bundle.model.audio is backend
+    assert isinstance(bundle.model.condition_encoder, RGBDTokenEncoder)
+    assert captured["renderer_kind"] == "mask_cross_attention"
+    assert captured["transformer_layers"] == 1
+    assert captured["freq_patch"] == 4
+
+
+def test_p1_runtime_selects_geometry_protocol(monkeypatch) -> None:
+    backend = TinyConditionedBackend()
+    captured = {}
+
+    def load_audio(*_args, **kwargs):
+        captured.update(kwargs)
+        return backend
+
+    _install_runtime_fakes(monkeypatch, load_audio)
+    bundle = runtime_module.build_runtime(
+        _runtime_config("query_dependent_p1"),
+        torch.device("cpu"),
+        trusted_upstream_artifacts=True,
+    )
+
+    assert bundle.model.audio is backend
+    assert isinstance(
+        bundle.model.condition_encoder,
+        GeometricVisualTokenEncoder,
+    )
+    assert captured["renderer_kind"] == "p1_query_geometry"
+    assert captured["transformer_layers"] == 1
+    assert captured["freq_patch"] == 4

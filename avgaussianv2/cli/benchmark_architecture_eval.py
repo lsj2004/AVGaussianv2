@@ -12,7 +12,7 @@ def main() -> None:
     run_ablation_evaluation(
         verify_architecture_preparation,
         result_label="strategy",
-        fixed_system="joint_conditioned",
+        system_from_preparation="evaluation_system",
     )
 
 

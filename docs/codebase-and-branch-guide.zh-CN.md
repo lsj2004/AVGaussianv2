@@ -7,6 +7,8 @@
 `origin/agent/gaussian-token-cross-attention`。当前主线保留核心模型、正式
 cam38 benchmark、cross-attention 和显式 AudioGS Gaussian token。早期 Scene1
 pilot 已从主线退役，完整实现仍保留在 `origin/agent/scene1-pilot` 的 Git 历史中。
+当前 clean 分支也已吸收 Plain U-Net、Mask Cross-Attention 和 Query-dependent
+P1 的最小模型/runtime/benchmark 接入；Spatial P1 额外目标仍只作历史实验参考。
 
 ## 1. 先看结论
 
@@ -18,8 +20,8 @@ pilot 已从主线退役，完整实现仍保留在 `origin/agent/scene1-pilot` 
 4. `cross-attention`、Gaussian token、P1、plain U-Net：在同一评测协议上的模型消融。
 
 真正需要并排比较的是最后一层的模型假设，不是把所有分支机械 merge 成一个模型。
-P1、spatial loss 和 plain U-Net 会修改相同的配置、runtime、训练和评估分派代码，
-直接合并会把互斥实验的语义混在一起。
+这些架构现在通过同一 registry 和 runner 选择，仍保持互斥的配置与 checkpoint
+身份；没有把 Spatial P1 等历史附加目标并入默认训练。
 
 ## 2. Git 真实拓扑
 

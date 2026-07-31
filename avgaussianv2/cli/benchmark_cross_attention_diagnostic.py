@@ -25,6 +25,7 @@ from avgaussianv2.train import (
     build_warmup_optimizer,
     condition_warmup_step,
     joint_train_step,
+    same_frame_camera_negative_indices,
 )
 
 
@@ -99,6 +100,27 @@ def run_diagnostic(
         samples = DeviceSampleSequence(runtime.train_samples, device)
         warmup_indices = make_shared_indices(len(samples), steps, seed)
         main_indices = tuple(worker_manifest["shared_indices"][:steps])
+        use_contrast = (
+            float(getattr(runtime.model, "camera_contrast_weight", 0.0)) > 0
+        )
+        warmup_contrast_indices = (
+            same_frame_camera_negative_indices(
+                runtime.train_samples,
+                warmup_indices,
+                seed + 10_000,
+            )
+            if use_contrast
+            else None
+        )
+        main_contrast_indices = (
+            same_frame_camera_negative_indices(
+                runtime.train_samples,
+                main_indices,
+                seed + 20_000,
+            )
+            if use_contrast
+            else None
+        )
         probe = samples[main_indices[0]]
         runtime.model.eval()
         with torch.no_grad():
@@ -114,32 +136,44 @@ def run_diagnostic(
             runtime.model,
             runtime.train_config.condition_lr,
         )
-        warmup = [
-            condition_warmup_step(
-                runtime.model,
-                samples[index],
-                warmup_optimizer,
-                runtime.train_config,
-                runtime.audio_loss_fn,
+        warmup = []
+        for step, index in enumerate(warmup_indices):
+            warmup.append(
+                condition_warmup_step(
+                    runtime.model,
+                    samples[index],
+                    warmup_optimizer,
+                    runtime.train_config,
+                    runtime.audio_loss_fn,
+                    contrast_sample=(
+                        samples[warmup_contrast_indices[step]]
+                        if warmup_contrast_indices is not None
+                        else None
+                    ),
+                )
             )
-            for index in warmup_indices
-        ]
 
         runtime.model.unfreeze_all()
         joint_optimizer = build_joint_optimizer(runtime.model, runtime.train_config)
         visual_anchor = capture_visual_anchor(runtime.model.visual)
-        joint = [
-            joint_train_step(
-                runtime.model,
-                samples[index],
-                joint_optimizer,
-                runtime.train_config,
-                runtime.audio_loss_fn,
-                visual_anchor,
-                probe_audio_visual_gradient=True,
+        joint = []
+        for step, index in enumerate(main_indices):
+            joint.append(
+                joint_train_step(
+                    runtime.model,
+                    samples[index],
+                    joint_optimizer,
+                    runtime.train_config,
+                    runtime.audio_loss_fn,
+                    visual_anchor,
+                    probe_audio_visual_gradient=True,
+                    contrast_sample=(
+                        samples[main_contrast_indices[step]]
+                        if main_contrast_indices is not None
+                        else None
+                    ),
+                )
             )
-            for index in main_indices
-        ]
 
         runtime.model.eval()
         with torch.no_grad():

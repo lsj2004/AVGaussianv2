@@ -79,9 +79,18 @@ CROSS_ATTENTION_CONTINUATION_SYSTEMS = {
     "cross_attention_shuffled_rgbd",
     "cross_attention_no_gaussians",
     "cross_attention_no_pose",
+    "cross_attention_masks",
+    "cross_attention_masks_no_rgbd",
+    "cross_attention_masks_shuffled_rgbd",
+    "query_dependent_p1",
+    "query_dependent_p1_no_rgbd",
+    "query_dependent_p1_wrong_camera",
 }
+ARCHITECTURE_CONTINUATION_SYSTEMS = {"plain_unet"}
 EVALUATION_CONTINUATION_SYSTEMS = (
-    CONTINUATION_SYSTEMS | CROSS_ATTENTION_CONTINUATION_SYSTEMS
+    CONTINUATION_SYSTEMS
+    | CROSS_ATTENTION_CONTINUATION_SYSTEMS
+    | ARCHITECTURE_CONTINUATION_SYSTEMS
 )
 NATIVE_SYSTEMS = {"native_audiogs", "native_ftgspp"}
 NATIVE_AUDIO_UPDATES = {"scene1_opera": 2_318, "Scene7playing": 6_954}
@@ -111,6 +120,8 @@ def _training_mode_for_evaluation_system(system_name: str) -> str:
     """Map inference-only causal labels to their shared training contract."""
     if system_name in CROSS_ATTENTION_CONTINUATION_SYSTEMS:
         return "joint_conditioned"
+    if system_name == "plain_unet":
+        return "audio_only"
     return system_name
 
 
@@ -820,6 +831,12 @@ def _audit_continuation_snapshot(
                 "cross_attention_shuffled_rgbd",
                 "cross_attention_no_gaussians",
                 "cross_attention_no_pose",
+                "cross_attention_masks",
+                "cross_attention_masks_no_rgbd",
+                "cross_attention_masks_shuffled_rgbd",
+                "query_dependent_p1",
+                "query_dependent_p1_no_rgbd",
+                "query_dependent_p1_wrong_camera",
             }
             else 0
         )

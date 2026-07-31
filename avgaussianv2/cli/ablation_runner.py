@@ -95,7 +95,9 @@ def run_ablation_evaluation(
     *,
     result_label: str,
     fixed_system: str | None = None,
+    system_from_preparation: str | None = None,
     system_choices: Sequence[str] = (),
+    allowed_systems_from_preparation: str | None = None,
     verify_kwargs: Mapping[str, Any] | None = None,
 ) -> None:
     """Evaluate one prepared ablation milestone through the common evaluator."""
@@ -106,8 +108,15 @@ def run_ablation_evaluation(
         expected_identity,
     )
 
-    if (fixed_system is None) == (not system_choices):
-        raise ValueError("configure exactly one of fixed_system or system_choices")
+    configured_sources = sum(
+        (
+            fixed_system is not None,
+            system_from_preparation is not None,
+            bool(system_choices),
+        )
+    )
+    if configured_sources != 1:
+        raise ValueError("configure exactly one evaluation system source")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--protocol-dir", type=Path, required=True)
@@ -135,7 +144,18 @@ def run_ablation_evaluation(
         **dict(verify_kwargs or {}),
     )
     scene_id = str(preparation["scene_id"])
-    system = fixed_system if fixed_system is not None else args.system
+    if fixed_system is not None:
+        system = fixed_system
+    elif system_from_preparation is not None:
+        system = str(preparation[system_from_preparation])
+    else:
+        system = args.system
+    if allowed_systems_from_preparation is not None:
+        allowed = tuple(preparation[allowed_systems_from_preparation])
+        if system not in allowed:
+            raise ValueError(
+                f"evaluation system {system!r} is not allowed by preparation"
+            )
     identity = expected_identity(scene_id, system, args.step)
     evidence = continuation_training_evidence(
         args.worker_dir,

@@ -40,8 +40,19 @@ class AVGaussianFusionV2(nn.Module):
             condition=None,
         )
 
-    def forward(self, sample: AlignedAVSample) -> FusionOutput:
-        rgbd = self.render_rgbd(sample)
+    def _encode_condition(
+        self,
+        rgbd: RGBDRender,
+        condition_sample: AlignedAVSample,
+    ):
+        if bool(
+            getattr(self.condition_encoder, "requires_camera_geometry", False)
+        ):
+            return self.condition_encoder(
+                rgbd,
+                condition_sample.w2c,
+                condition_sample.intrinsic,
+            )
         if self.condition_content_permutation is None:
             condition = self.condition_encoder(rgbd)
         else:
@@ -58,6 +69,15 @@ class AVGaussianFusionV2(nn.Module):
                 rgbd,
                 self.condition_content_permutation,
             )
+        return condition
+
+    def forward_with_condition_sample(
+        self,
+        sample: AlignedAVSample,
+        condition_sample: AlignedAVSample,
+    ) -> FusionOutput:
+        rgbd = self.render_rgbd(condition_sample)
+        condition = self._encode_condition(rgbd, condition_sample)
         predicted_audio = self.audio.render(
             sample.audio_cam_pose,
             sample.source_audio,
@@ -68,6 +88,9 @@ class AVGaussianFusionV2(nn.Module):
             condition=condition,
             predicted_audio=predicted_audio,
         )
+
+    def forward(self, sample: AlignedAVSample) -> FusionOutput:
+        return self.forward_with_condition_sample(sample, sample)
 
     def freeze_pretrained(self) -> None:
         _set_requires_grad(self.visual.parameters(), False)
@@ -86,3 +109,10 @@ class AVGaussianFusionV2(nn.Module):
             "film": list(self.audio.film_parameters()),
             "audio_unet": list(self.audio.audio_unet_parameters()),
         }
+
+    def audio_only_parameter_groups(self) -> tuple[str, ...]:
+        strategy = getattr(self.audio, "render_strategy", "")
+        strategy = getattr(strategy, "value", strategy)
+        if strategy == "plain_unet":
+            return ("audio_unet",)
+        return ("acoustic", "audio_unet")

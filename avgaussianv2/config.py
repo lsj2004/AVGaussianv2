@@ -99,6 +99,20 @@ class ModelConfig:
     audio_gaussian_token_columns: int = 16
     audio_gaussian_token_hidden_dim: int = 32
     audio_pose_tokens: int = 2
+    p1_transformer_layers: int = 2
+    p1_transformer_heads: int = 4
+    p1_freq_patch: int = 8
+    p1_time_patch: int = 2
+    p1_dropout: float = 0.0
+    p1_cross_gate_init: float = 0.01
+    p1_max_log_magnitude: float = 0.15
+    p1_max_phase: float = 0.25
+    p1_additive_scale: float = 0.01
+    p1_geometry_rank: int = 16
+    p1_geometry_bias_scale: float = 1.0
+    p1_visual_scene_scale: float = 1.0
+    p1_camera_contrast_weight: float = 0.5
+    p1_camera_contrast_margin: float = 0.05
     sample_rate: int = 16_000
     condition_height: int = 64
     condition_width: int = 96
@@ -153,6 +167,49 @@ class ModelConfig:
             audio_pose_tokens=int(
                 raw.get("audio_pose_tokens", defaults.audio_pose_tokens)
             ),
+            p1_transformer_layers=int(
+                raw.get("p1_transformer_layers", defaults.p1_transformer_layers)
+            ),
+            p1_transformer_heads=int(
+                raw.get("p1_transformer_heads", defaults.p1_transformer_heads)
+            ),
+            p1_freq_patch=int(raw.get("p1_freq_patch", defaults.p1_freq_patch)),
+            p1_time_patch=int(raw.get("p1_time_patch", defaults.p1_time_patch)),
+            p1_dropout=float(raw.get("p1_dropout", defaults.p1_dropout)),
+            p1_cross_gate_init=float(
+                raw.get("p1_cross_gate_init", defaults.p1_cross_gate_init)
+            ),
+            p1_max_log_magnitude=float(
+                raw.get("p1_max_log_magnitude", defaults.p1_max_log_magnitude)
+            ),
+            p1_max_phase=float(raw.get("p1_max_phase", defaults.p1_max_phase)),
+            p1_additive_scale=float(
+                raw.get("p1_additive_scale", defaults.p1_additive_scale)
+            ),
+            p1_geometry_rank=int(
+                raw.get("p1_geometry_rank", defaults.p1_geometry_rank)
+            ),
+            p1_geometry_bias_scale=float(
+                raw.get(
+                    "p1_geometry_bias_scale",
+                    defaults.p1_geometry_bias_scale,
+                )
+            ),
+            p1_visual_scene_scale=float(
+                raw.get("p1_visual_scene_scale", defaults.p1_visual_scene_scale)
+            ),
+            p1_camera_contrast_weight=float(
+                raw.get(
+                    "p1_camera_contrast_weight",
+                    defaults.p1_camera_contrast_weight,
+                )
+            ),
+            p1_camera_contrast_margin=float(
+                raw.get(
+                    "p1_camera_contrast_margin",
+                    defaults.p1_camera_contrast_margin,
+                )
+            ),
             sample_rate=int(raw.get("sample_rate", defaults.sample_rate)),
             condition_height=int(raw.get("condition_height", defaults.condition_height)),
             condition_width=int(raw.get("condition_width", defaults.condition_width)),
@@ -173,42 +230,59 @@ class ModelConfig:
                 raise ValueError(f"model.{name} must be positive")
         if not 0 <= self.alpha_threshold <= 1:
             raise ValueError("model.alpha_threshold must be in [0, 1]")
-        if self.audio_backend not in {"audiogs", "cross_attention_tokens"}:
-            raise ValueError("model.audio_backend must be 'audiogs' or 'cross_attention_tokens'")
+        cross_backends = {
+            "cross_attention_tokens",
+            "cross_attention_masks",
+            "query_dependent_p1",
+        }
+        if self.audio_backend not in {"audiogs", *cross_backends}:
+            raise ValueError(
+                "model.audio_backend must be audiogs, cross_attention_tokens, "
+                "cross_attention_masks, or query_dependent_p1"
+            )
         if self.audio_render_strategy not in {
             "native_residual",
+            "plain_unet",
             "direct_conditioned_unet",
             "gated_native_residual",
         }:
             raise ValueError(
-                "model.audio_render_strategy must be native_residual, "
+                "model.audio_render_strategy must be native_residual, plain_unet, "
                 "direct_conditioned_unet, or gated_native_residual"
             )
         if (
-            self.audio_backend == "cross_attention_tokens"
+            self.audio_backend in cross_backends
             and self.audio_render_strategy != "native_residual"
         ):
             raise ValueError(
-                "cross_attention_tokens does not use AudioGS render strategies; "
+                "cross-attention backends do not use AudioGS render strategies; "
                 "model.audio_render_strategy must remain native_residual"
             )
-        if self.audio_backend == "cross_attention_tokens":
+        if (
+            self.audio_render_strategy == "plain_unet"
+            and self.audio_model_class != "Audio3DGSMonoDiffGSOnly"
+        ):
+            raise ValueError(
+                "plain_unet requires "
+                "model.audio_model_class=Audio3DGSMonoDiffGSOnly"
+            )
+        if self.audio_backend in cross_backends:
             if self.audio_model_class != "Audio3DGSMonoDiffGSOnly":
                 raise ValueError(
-                    "cross_attention_tokens requires "
+                    "cross-attention backends require "
                     "model.audio_model_class=Audio3DGSMonoDiffGSOnly"
                 )
-            cross_positive = {
+        if self.audio_backend in {
+            "cross_attention_tokens",
+            "cross_attention_masks",
+        }:
+            transformer_positive = {
                 "audio_freq_patch": self.audio_freq_patch,
                 "audio_time_patch": self.audio_time_patch,
                 "audio_transformer_layers": self.audio_transformer_layers,
                 "audio_transformer_heads": self.audio_transformer_heads,
-                "audio_gaussian_token_rows": self.audio_gaussian_token_rows,
-                "audio_gaussian_token_columns": self.audio_gaussian_token_columns,
-                "audio_gaussian_token_hidden_dim": self.audio_gaussian_token_hidden_dim,
-                "audio_pose_tokens": self.audio_pose_tokens,
             }
-            for name, value in cross_positive.items():
+            for name, value in transformer_positive.items():
                 if value <= 0:
                     raise ValueError(f"model.{name} must be positive")
             if self.embedding_dim % self.audio_transformer_heads != 0:
@@ -219,8 +293,49 @@ class ModelConfig:
                 raise ValueError("model.audio_dropout must be non-negative")
             if not 0 <= self.audio_cross_gate_init <= 1:
                 raise ValueError("model.audio_cross_gate_init must be in [0,1]")
-            if self.audio_residual_scale <= 0:
-                raise ValueError("model.audio_residual_scale must be positive")
+        if self.audio_backend == "cross_attention_tokens":
+            gaussian_positive = {
+                "audio_gaussian_token_rows": self.audio_gaussian_token_rows,
+                "audio_gaussian_token_columns": self.audio_gaussian_token_columns,
+                "audio_gaussian_token_hidden_dim": self.audio_gaussian_token_hidden_dim,
+                "audio_pose_tokens": self.audio_pose_tokens,
+                "audio_residual_scale": self.audio_residual_scale,
+            }
+            for name, value in gaussian_positive.items():
+                if value <= 0:
+                    raise ValueError(f"model.{name} must be positive")
+        if self.audio_backend == "query_dependent_p1":
+            p1_positive = {
+                "p1_transformer_layers": self.p1_transformer_layers,
+                "p1_transformer_heads": self.p1_transformer_heads,
+                "p1_freq_patch": self.p1_freq_patch,
+                "p1_time_patch": self.p1_time_patch,
+                "p1_max_log_magnitude": self.p1_max_log_magnitude,
+                "p1_max_phase": self.p1_max_phase,
+                "p1_additive_scale": self.p1_additive_scale,
+                "p1_geometry_rank": self.p1_geometry_rank,
+                "p1_geometry_bias_scale": self.p1_geometry_bias_scale,
+                "p1_visual_scene_scale": self.p1_visual_scene_scale,
+            }
+            for name, value in p1_positive.items():
+                if value <= 0:
+                    raise ValueError(f"model.{name} must be positive")
+            if self.embedding_dim % self.p1_transformer_heads != 0:
+                raise ValueError(
+                    "model.embedding_dim must be divisible by p1_transformer_heads"
+                )
+            if self.p1_dropout < 0:
+                raise ValueError("model.p1_dropout must be non-negative")
+            if not 0 <= self.p1_cross_gate_init <= 0.1:
+                raise ValueError("model.p1_cross_gate_init must be in [0,0.1]")
+            if self.p1_camera_contrast_weight < 0:
+                raise ValueError(
+                    "model.p1_camera_contrast_weight must be non-negative"
+                )
+            if self.p1_camera_contrast_margin < 0:
+                raise ValueError(
+                    "model.p1_camera_contrast_margin must be non-negative"
+                )
 
 
 @dataclass(frozen=True)

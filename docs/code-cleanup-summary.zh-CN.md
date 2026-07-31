@@ -148,7 +148,8 @@ tests Python:         9,739 行
 2. 将 `benchmark/training.py` 的 checkpoint store 与 step execution 分开；
 3. 将 `benchmark/assets.py` 的 AudioGS、FTGS++ 审计分开；
 4. 为 Linux-only retained-FD production runner 建立明确的平台边界；
-5. 在 P1/Mask/Plain 合入统一模型 registry 后，再删除各分支兼容 runner。
+5. P1/Mask/Plain 已合入统一 model/runtime registry，并复用现有 architecture /
+   cross-attention runner；没有把旧分支的兼容 runner 带回 clean。
 
 每次拆分都应保持 schema、hash、resume 和 failure-injection 测试不变，不应把
 “文件变短”作为唯一成功标准。

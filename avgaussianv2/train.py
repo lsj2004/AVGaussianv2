@@ -46,6 +46,15 @@ def _require_finite_tensor(name: str, value: Tensor, sample: AlignedAVSample) ->
         raise NonFiniteTrainingError(f"non-finite {name} at {_sample_identity(sample)}")
 
 
+def _condition_tensor(condition: object) -> Tensor:
+    if isinstance(condition, Tensor):
+        return condition
+    tokens = getattr(condition, "tokens", None)
+    if isinstance(tokens, Tensor):
+        return tokens
+    raise TypeError("condition must be a tensor or expose tensor tokens")
+
+
 def _gradient_norm(parameters: Iterable[nn.Parameter]) -> float:
     total = 0.0
     for parameter in parameters:
@@ -78,6 +87,80 @@ def _weights(config: TrainConfig) -> JointLossWeights:
 
 def _trainable(parameters: Iterable[nn.Parameter]) -> list[nn.Parameter]:
     return [parameter for parameter in parameters if parameter.requires_grad]
+
+
+def same_frame_camera_negative_indices(
+    samples: Sequence[AlignedAVSample],
+    anchor_indices: Sequence[int],
+    seed: int,
+) -> list[int]:
+    """Choose deterministic same-frame samples from another training camera."""
+    records = getattr(samples, "records", None)
+    identities = (
+        [(int(record.frame_index), str(record.camera)) for record in records]
+        if records is not None
+        else [
+            (int(samples[index].frame_index), str(samples[index].camera))
+            for index in range(len(samples))
+        ]
+    )
+    by_frame: dict[int, list[int]] = {}
+    for index, (frame_index, _) in enumerate(identities):
+        by_frame.setdefault(frame_index, []).append(index)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    negatives = []
+    for anchor_index in anchor_indices:
+        frame_index, camera = identities[anchor_index]
+        candidates = [
+            index
+            for index in by_frame.get(frame_index, ())
+            if identities[index][1] != camera
+        ]
+        if not candidates:
+            raise ValueError(
+                "camera contrast requires another camera at the same frame"
+            )
+        choice = int(torch.randint(len(candidates), (1,), generator=generator))
+        negatives.append(candidates[choice])
+    return negatives
+
+
+def _camera_contrast(
+    model: nn.Module,
+    sample: AlignedAVSample,
+    contrast_sample: AlignedAVSample | None,
+    correct_audio_objective: Tensor,
+    config: TrainConfig,
+    audio_loss_fn: AudioLoss,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    weight = float(getattr(model, "camera_contrast_weight", 0.0))
+    if weight == 0:
+        return correct_audio_objective.new_zeros(()), {}
+    if contrast_sample is None:
+        raise ValueError(
+            "camera-contrast model requires a same-frame negative sample"
+        )
+    wrong = model.forward_with_condition_sample(sample, contrast_sample)
+    _require_finite_tensor(
+        "wrong-camera predicted audio",
+        wrong.predicted_audio,
+        sample,
+    )
+    wrong_objective, _ = compute_audio_objective(
+        wrong.predicted_audio,
+        sample.target_audio,
+        weights=_weights(config),
+        audio_loss_fn=audio_loss_fn,
+    )
+    observed = wrong_objective - correct_audio_objective
+    margin = float(getattr(model, "camera_contrast_margin", 0.0))
+    contrast = torch.relu(correct_audio_objective.new_tensor(margin) - observed)
+    return correct_audio_objective.new_tensor(weight) * contrast, {
+        "camera_contrast": contrast,
+        "camera_contrast_weighted": contrast * weight,
+        "camera_contrast_margin_observed": observed,
+    }
 
 
 def build_warmup_optimizer(
@@ -123,6 +206,7 @@ def condition_warmup_step(
     optimizer: torch.optim.Optimizer,
     config: TrainConfig,
     audio_loss_fn: AudioLoss,
+    contrast_sample: AlignedAVSample | None = None,
 ) -> TrainStepStats:
     optimizer.zero_grad(set_to_none=True)
     output = model(sample)
@@ -133,8 +217,18 @@ def condition_warmup_step(
         weights=_weights(config),
         audio_loss_fn=audio_loss_fn,
     )
-    _require_finite_tensor("warmup audio objective", audio, sample)
-    audio.backward()
+    contrast, contrast_parts = _camera_contrast(
+        model,
+        sample,
+        contrast_sample,
+        audio,
+        config,
+        audio_loss_fn,
+    )
+    total = audio + contrast
+    parts = {**parts, **contrast_parts}
+    _require_finite_tensor("warmup audio objective", total, sample)
+    total.backward()
     groups = model.named_parameter_groups()
     gradient_norms = {
         name: _gradient_norm(parameters) for name, parameters in groups.items()
@@ -142,7 +236,7 @@ def condition_warmup_step(
     if not all(math.isfinite(value) for value in gradient_norms.values()):
         raise NonFiniteTrainingError(f"non-finite gradients at {_sample_identity(sample)}")
     optimizer.step()
-    value = float(audio.detach().cpu())
+    value = float(total.detach().cpu())
     return TrainStepStats(
         total=value,
         losses={name: float(item.detach().cpu()) for name, item in parts.items()},
@@ -159,13 +253,14 @@ def joint_train_step(
     audio_loss_fn: AudioLoss,
     visual_anchor: Mapping[str, Tensor],
     probe_audio_visual_gradient: bool = True,
+    contrast_sample: AlignedAVSample | None = None,
 ) -> TrainStepStats:
     optimizer.zero_grad(set_to_none=True)
     output = model(sample)
     _require_finite_tensor("predicted audio", output.predicted_audio, sample)
     _require_finite_tensor("rendered RGB", output.rgbd.rgb, sample)
     _require_finite_tensor("rendered depth", output.rgbd.depth, sample)
-    _require_finite_tensor("condition", output.condition, sample)
+    _require_finite_tensor("condition", _condition_tensor(output.condition), sample)
     total, parts = compute_joint_loss(
         output,
         sample,
@@ -174,6 +269,16 @@ def joint_train_step(
         weights=_weights(config),
         audio_loss_fn=audio_loss_fn,
     )
+    contrast, contrast_parts = _camera_contrast(
+        model,
+        sample,
+        contrast_sample,
+        parts["audio_total_with_lre"],
+        config,
+        audio_loss_fn,
+    )
+    total = total + contrast
+    parts = {**parts, **contrast_parts}
     _require_finite_tensor("total loss", total, sample)
     groups = model.named_parameter_groups()
     audio_to_visual = 0.0

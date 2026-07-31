@@ -1,0 +1,46 @@
+scene:
+  id: Scene7playing
+  fps: 30.0
+  train_cameras: [cam00, cam01, cam02, cam03, cam04, cam05, cam06, cam07, cam08, cam09, cam10, cam11, cam12, cam13, cam14, cam15, cam16, cam17, cam18, cam19, cam20, cam21, cam22, cam23, cam24, cam25, cam26, cam27, cam28, cam29, cam30, cam31, cam32, cam33, cam34, cam35, cam36, cam37]
+  eval_cameras: [cam38]
+  camera_mapping: {cam00: 0, cam01: 1, cam02: 2, cam03: 3, cam04: 4, cam05: 5, cam06: 6, cam07: 7, cam08: 8, cam09: 9, cam10: 10, cam11: 11, cam12: 12, cam13: 13, cam14: 14, cam15: 15, cam16: 16, cam17: 17, cam18: 18, cam19: 19, cam20: 20, cam21: 21, cam22: 22, cam23: 23, cam24: 24, cam25: 25, cam26: 26, cam27: 27, cam28: 28, cam29: 29, cam30: 30, cam31: 31, cam32: 32, cam33: 33, cam34: 34, cam35: 35, cam36: 36, cam37: 37, cam38: 38}
+paths:
+  visual_upstream_root: /mnt/sda/lisujing/Dataset/FreeTimeGSPlusPlus
+  audio_upstream_root: /mnt/sda/lisujing/Dataset/audioGS-replay
+  visual_checkpoint: ../../runs/cam38_strict/Scene7playing/ftgspp/native/Scene7playing/00/gaussians.pt
+  audio_checkpoint: ../../runs/cam38_strict/Scene7playing/audiogs/native/replayNVAS/SC-scene7-playing-cam38-shared/viewpoint_39/checkpoint_latest.pth
+  manifest: ../../runs/cam38_strict/Scene7playing/protocol/scene_manifest.json
+  visual_memmap: /mnt/sda/lisujing/Dataset/FreeTimeGSPlusPlus/_memmap/cam38_strict/Scene7playing
+model:
+  embedding_dim: 128
+  alpha_threshold: 0.001
+  audio_model_class: Audio3DGSMonoDiffGSOnly
+  audio_backend: query_dependent_p1
+  condition_height: 94
+  condition_width: 166
+train:
+  crop_seconds: 0.5
+  warmup_steps: 2000
+  joint_steps: 30000
+  seed: 42
+  audio_lr: 0.0001
+  visual_lr: 0.00001
+  condition_lr: 0.0001
+  lambda_audio: 1.0
+  lambda_rgb: 1.0
+  lambda_dssim: 0.2
+  lambda_visual_anchor: 0.0001
+benchmark:
+  protocol: dual_dataset_cam38_v1
+  test_camera: cam38
+  expected_test_samples: 293
+  seed: 42
+  native_budgets:
+    audiogs_epochs: 61
+    audiogs_batch_size: 1
+    audiogs_resolved_updates: 6954
+    ftgspp_updates: 30000
+    ftgspp_batch_size: 1
+  continuation_updates: 30000
+  conditioner_warmup_steps: 2000
+  report_steps: [5000, 10000, 30000]

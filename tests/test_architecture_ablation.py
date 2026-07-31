@@ -15,9 +15,12 @@ from avgaussianv2.benchmark.architecture_ablation import (
 from avgaussianv2.benchmark.training import (
     BenchmarkCompatibility,
     BenchmarkConfig,
+    BenchmarkMode,
+    build_worker_manifest,
     hash_shared_indices,
     make_shared_indices,
 )
+from avgaussianv2.benchmark.evaluation import _training_mode_for_evaluation_system
 
 
 def _config(strategy: str | None = None) -> dict:
@@ -67,6 +70,28 @@ def test_strategy_delta_rejects_every_other_protocol_change(tmp_path: Path) -> N
         validate_strategy_only_delta(
             base, derived, expected_strategy="direct_conditioned_unet"
         )
+
+
+@pytest.mark.parametrize(
+    ("base_name", "derived_name"),
+    [
+        ("scene1_opera.yaml", "scene1_opera_plain_unet.yaml"),
+        ("Scene7playing.yaml", "Scene7playing_plain_unet.yaml"),
+    ],
+)
+def test_plain_unet_configs_are_strategy_only_deltas(
+    base_name: str,
+    derived_name: str,
+) -> None:
+    config_dir = Path(__file__).resolve().parents[1] / "configs/benchmark_cam38"
+
+    result = validate_strategy_only_delta(
+        config_dir / base_name,
+        config_dir / derived_name,
+        expected_strategy="plain_unet",
+    )
+
+    assert result["strategy"] == "plain_unet"
 
 
 class TinyState(nn.Module):
@@ -149,6 +174,40 @@ def test_aligned_manifest_reuses_exact_a_sample_sequence() -> None:
     assert json.dumps(manifest, sort_keys=True)
 
 
+def test_aligned_manifest_supports_plain_unet_audio_only_mode() -> None:
+    config = BenchmarkConfig()
+    indices = make_shared_indices(17, config.main_updates, config.seed)
+    compatibility = BenchmarkCompatibility(
+        scene_id="scene1_opera",
+        mode=BenchmarkMode.AUDIO_ONLY.value,
+        train_cameras=tuple(f"cam{index:02d}" for index in range(38)),
+        test_camera="cam38",
+        seed=42,
+        index_sha256=hash_shared_indices(indices),
+        visual_initialization_sha256="a" * 64,
+        audio_initialization_sha256="b" * 64,
+        model_initialization_sha256="c" * 64,
+        source_sha256="d" * 64,
+        config_sha256="e" * 64,
+    )
+    base = build_worker_manifest(
+        config=config,
+        compatibility=compatibility,
+        shared_indices=indices,
+    )
+
+    manifest = build_aligned_worker_manifest(
+        base_manifest=base,
+        compatibility=compatibility,
+        config=config,
+        mode=BenchmarkMode.AUDIO_ONLY,
+    )
+
+    assert manifest["mode"] == BenchmarkMode.AUDIO_ONLY.value
+    assert manifest["shared_indices"] == list(indices)
+    assert _training_mode_for_evaluation_system("plain_unet") == "audio_only"
+
+
 def test_architecture_worker_prints_generic_worker_result_keys() -> None:
     runner = (
         Path(__file__).resolve().parents[1]
@@ -171,4 +230,4 @@ def test_architecture_cli_delegates_to_shared_ablation_runner() -> None:
     assert "run_ablation_worker(" in worker
     assert 'result_label="strategy"' in worker
     assert "run_ablation_evaluation(" in evaluator
-    assert 'fixed_system="joint_conditioned"' in evaluator
+    assert 'system_from_preparation="evaluation_system"' in evaluator

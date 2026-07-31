@@ -12,9 +12,7 @@ execution_policy:
   max_processes_per_gpu: 4
   multi_seed_priority: last
 
-base_configs:
-  scene1_opera: ../benchmark_cam38/scene1_opera.yaml
-  Scene7playing: ../benchmark_cam38/Scene7playing.yaml
+scenes: [scene1_opera, Scene7playing]
 
 fixed_loss:
   lre_scale_db: 6.0
@@ -26,31 +24,52 @@ architecture_screening:
   seed: 42
   lambda_lre: 0.0
   required:
-    - gs_only
+    - audio_only
     - plain_unet
-    - film_residual
-    - mask_cross_attention
+    - joint_conditioned
+    - cross_attention_masks
     - query_dependent_p1
   conditional:
-    - gaussian_token_cross_attention
+    - cross_attention
   default_pruned:
     - direct_conditioned_unet
     - gated_native_residual
-    - spatial_p1
   branch_sources:
-    gs_only: clean/codebase-structure
-    film_residual: clean/codebase-structure
-    gaussian_token_cross_attention: clean/codebase-structure
-    plain_unet: origin/agent/plain-unet-baseline
-    mask_cross_attention: origin/agent/p1-spatial-camera-contrast
-    query_dependent_p1: origin/agent/p1-spatial-camera-contrast
-    spatial_p1: origin/agent/p1-spatial-camera-contrast
+    audio_only: clean/codebase-structure
+    joint_conditioned: clean/codebase-structure
+    cross_attention: clean/codebase-structure
+    plain_unet: clean/codebase-structure
+    cross_attention_masks: clean/codebase-structure
+    query_dependent_p1: clean/codebase-structure
   keep_architectures_max: 2
   require_visual_causal_check_for_conditioned: true
 
-loss_search_default_systems:
-  - audio_only
-  - joint_conditioned
+architecture_configs:
+  audio_only:
+    training_mode: audio_only
+    scene1_opera: ../benchmark_cam38/scene1_opera.yaml
+    Scene7playing: ../benchmark_cam38/Scene7playing.yaml
+  joint_conditioned:
+    training_mode: joint_conditioned
+    scene1_opera: ../benchmark_cam38/scene1_opera.yaml
+    Scene7playing: ../benchmark_cam38/Scene7playing.yaml
+  plain_unet:
+    training_mode: audio_only
+    scene1_opera: ../benchmark_cam38/scene1_opera_plain_unet.yaml
+    Scene7playing: ../benchmark_cam38/Scene7playing_plain_unet.yaml
+  cross_attention:
+    training_mode: joint_conditioned
+    scene1_opera: ../benchmark_cam38/scene1_opera_cross_attention.yaml
+    Scene7playing: ../benchmark_cam38/Scene7playing_cross_attention.yaml
+  cross_attention_masks:
+    training_mode: joint_conditioned
+    scene1_opera: ../benchmark_cam38/scene1_opera_cross_attention_masks.yaml
+    Scene7playing: ../benchmark_cam38/Scene7playing_cross_attention_masks.yaml
+  query_dependent_p1:
+    training_mode: joint_conditioned
+    scene1_opera: ../benchmark_cam38/scene1_opera_query_dependent_p1.yaml
+    Scene7playing: ../benchmark_cam38/Scene7playing_query_dependent_p1.yaml
+
 loss_search_systems:
   source: architecture_screening_survivors
 
@@ -148,10 +167,10 @@ reporting:
     reference_baseline_rows: 846
     screening_training_runs_max: 16
     confirmation_training_runs_max: 12
-    robustness_training_runs_max: 16
+    robustness_training_runs_max: 8
     screening_per_sample_rows_max: 3384
     confirmation_per_sample_rows_max: 7614
-    robustness_per_sample_rows_max: 3384
+    robustness_per_sample_rows_max: 1692
 
 output:
   generated_configs: ../../configs/generated/lre_loss_ablation

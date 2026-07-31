@@ -640,10 +640,11 @@ flowchart LR
 | AudioGS-native RGBD Cross-Attention | `origin/agent/cross-attention-benchmark:avgaussianv2/models/cross_attention_audio.py` |
 | Gaussian-token Cross-Attention | `avgaussianv2/models/cross_attention_audio.py` |
 | AudioGS Gaussian token schema | `avgaussianv2/models/acoustic_gaussian_tokens.py` |
-| Mask Cross-Attention | `origin/agent/p1-spatial-camera-contrast:avgaussianv2/models/mask_cross_attention.py` |
-| P1 audio queries / geometry bias | `origin/agent/p1-spatial-camera-contrast:avgaussianv2/models/p1_audio.py` |
-| P1 geometric VisualMemory | `origin/agent/p1-spatial-camera-contrast:avgaussianv2/models/p1_visual.py` |
-| P1 / Spatial P1 training objective | `origin/agent/p1-spatial-camera-contrast:avgaussianv2/train.py` |
+| Mask Cross-Attention | `avgaussianv2/models/mask_cross_attention.py` |
+| P1 audio queries / geometry bias | `avgaussianv2/models/p1_audio.py` |
+| P1 geometric VisualMemory | `avgaussianv2/models/p1_visual.py` |
+| P1 camera-contrast training objective | `avgaussianv2/train.py` |
+| Spatial P1 historical objective | `origin/agent/p1-spatial-camera-contrast:avgaussianv2/train.py` |
 
 本文只画已经在当前实验矩阵中实现或评估的版本。LRE-anchor 等后续诊断配置是
 输出后处理消融，不作为一个新的基础架构重复绘制。

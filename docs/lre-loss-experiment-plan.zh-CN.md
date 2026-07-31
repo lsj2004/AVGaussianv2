@@ -15,11 +15,12 @@
 
 ## 2. 服务器与并发
 
-服务器预计有两张空闲的 48 GB GPU。允许一张卡同时运行多个实验：
+服务器预计有两张空闲的 48 GB GPU。先为每个架构各跑一个短 smoke，记录单进程
+峰值显存和吞吐，再决定并发：
 
 - 初始每张卡启动 2 个训练进程；
-- 运行稳定后，如果显存峰值低于 80%、没有 OOM，且吞吐没有明显下降，可提高到
-  每卡 3-4 个；
+- 只有估算总峰值低于显存的 80%、没有 OOM，且单任务吞吐下降不超过 20% 时，
+  才可提高到每卡 3-4 个；
 - 两张卡尽量同时保持有任务，不要串行等待；
 - 同一组 control / treatment 尽量分配到相同型号 GPU；
 - OOM 时先降低单卡并发，不修改 batch size 或实验语义。
@@ -36,7 +37,7 @@ Agent 必须记录每个进程的 GPU、峰值显存、运行时间和失败原�
 - 计算 `Source Binaural` 和 `Mono` 的 paper MAG / ENV / LRE / DPAM；
 - 验证 `lambda_lre=0` 与旧 objective 一致；
 - 建立统一架构 runner，保证所有方法使用同一 split、初始化、seed、预算和 evaluator；
-- 将 Plain U-Net、Mask Cross-Attention、P1 从实验分支接入统一 runner；
+- 验证 clean 分支中的 Plain U-Net、Mask Cross-Attention、P1 统一 runner；
 - 对所有可运行架构做短程 smoke，确认 loss、梯度和指标有限；
 - 检查两张 GPU 的可用显存，并确定每卡并发数。
 
@@ -48,16 +49,28 @@ P0 失败时不启动大规模训练。
 |---|---|---|
 | GS-only | clean 分支 `audio_only` | 必跑基线 |
 | FiLM residual | clean 分支 `joint_conditioned` | 必跑 |
-| Plain U-Net | `origin/agent/plain-unet-baseline` | 必跑 |
-| Mask Cross-Attention | `origin/agent/p1-spatial-camera-contrast` | 必跑 |
-| Query-dependent P1 | `origin/agent/p1-spatial-camera-contrast` | 必跑主候选 |
-| Gaussian-token Cross-Attention | clean / gaussian-token 分支 | 条件复核 |
+| Plain U-Net | clean 分支 `plain_unet` strategy | 必跑 |
+| Mask Cross-Attention | clean 分支 `cross_attention_masks` | 必跑 |
+| Query-dependent P1 | clean 分支 `query_dependent_p1` | 必跑主候选 |
+| Gaussian-token Cross-Attention | clean 分支 `cross_attention_tokens` | 条件复核 |
 | Direct / Gated / Spatial P1 | 已有历史负结果 | 默认淘汰，仅 smoke 异常优秀时恢复 |
 
 Visual-only 不产生音频，不进入这轮音频架构排名。
 
 历史结果只用于安排优先级。它们来自 `visual_time` 修复前或不同分支，不能直接
 替代本轮统一 runner 的重评估。
+
+Plain 复用现有 architecture runner，训练 mode 为 `audio_only`，评估名为
+`plain_unet`；Mask、P1 与 Gaussian-token 复用同一个 cross-attention runner，
+由派生 config 的 `audio_backend` 决定具体实现。Spatial P1 不合入 clean，本轮
+先验证原始 P1，避免同时增加架构和额外 spatial objective。
+
+运行入口保持最少：
+
+- Plain：`benchmark_architecture_*`，strategy 为 `plain_unet`；
+- Gaussian-token / Mask / P1：`run_cross_attention_cam38.sh`，variant 分别为
+  `cross_attention`、`cross_attention_masks`、`query_dependent_p1`；
+- LRE 搜索配置必须显式传入 P1 survivor system，生成器不再默认回退到某个架构。
 
 ### P1：先做架构赛马
 
@@ -69,8 +82,7 @@ lambda_lre: 0.0
 scenes: scene1_opera, Scene7playing
 ```
 
-先看最早可评估 checkpoint（建议 1k）的指标，再把有希望的配置推进到 5k。
-如果当前 runner 只能在 5k 评估，则直接使用 5k，不为此改变训练语义。重点排序：
+首次正式比较统一使用 5k checkpoint，不为更早观察点修改 strict runner。重点排序：
 
 1. MAG / ENV / DPAM、`audio_total` 和 waveform L1；
 2. LRE 是否接近或优于 GS-only；

@@ -125,6 +125,72 @@ train: {}
         load_project_config(path)
 
 
+@pytest.mark.parametrize(
+    "backend",
+    ["cross_attention_masks", "query_dependent_p1"],
+)
+def test_load_project_config_accepts_unified_architecture_backends(
+    tmp_path: Path,
+    backend: str,
+) -> None:
+    path = tmp_path / "scene.yaml"
+    path.write_text(
+        f"""
+scene:
+  id: scene1_opera
+  fps: 30
+  train_cameras: [cam00]
+  eval_cameras: [cam38]
+  camera_mapping: {{cam00: 0, cam38: 38}}
+paths:
+  visual_upstream_root: /repos/FreeTimeGSPlusPlus
+  audio_upstream_root: /repos/audioGS-replay
+  visual_checkpoint: /runs/visual.pt
+  audio_checkpoint: /runs/audio.pth
+  manifest: /runs/manifest.json
+model:
+  audio_backend: {backend}
+  audio_model_class: Audio3DGSMonoDiffGSOnly
+  embedding_dim: 32
+  audio_transformer_heads: 4
+  p1_transformer_heads: 4
+train: {{}}
+""".strip()
+        + "\n"
+    )
+
+    config = load_project_config(path)
+
+    assert config.model.audio_backend == backend
+
+
+def test_load_project_config_accepts_plain_unet_strategy(tmp_path: Path) -> None:
+    path = tmp_path / "scene.yaml"
+    path.write_text(
+        """
+scene:
+  id: scene1_opera
+  fps: 30
+  train_cameras: [cam00]
+  eval_cameras: [cam38]
+  camera_mapping: {cam00: 0, cam38: 38}
+paths:
+  visual_upstream_root: /repos/FreeTimeGSPlusPlus
+  audio_upstream_root: /repos/audioGS-replay
+  visual_checkpoint: /runs/visual.pt
+  audio_checkpoint: /runs/audio.pth
+  manifest: /runs/manifest.json
+model:
+  audio_model_class: Audio3DGSMonoDiffGSOnly
+  audio_render_strategy: plain_unet
+train: {}
+""".strip()
+        + "\n"
+    )
+
+    assert load_project_config(path).model.audio_render_strategy == "plain_unet"
+
+
 def test_load_project_config_resolves_relative_paths_from_config_directory(
     tmp_path: Path,
 ) -> None:

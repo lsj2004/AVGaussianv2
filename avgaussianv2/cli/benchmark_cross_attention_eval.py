@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from avgaussianv2.benchmark.cross_attention_ablation import (
-    CAUSAL_EVALUATION_SYSTEMS,
+    ALL_CAUSAL_EVALUATION_SYSTEMS,
     verify_cross_attention_preparation,
 )
 from avgaussianv2.cli.ablation_runner import run_ablation_evaluation
@@ -17,7 +17,8 @@ def main() -> None:
     run_ablation_evaluation(
         verify_cross_attention_preparation,
         result_label="system",
-        system_choices=CAUSAL_EVALUATION_SYSTEMS,
+        system_choices=ALL_CAUSAL_EVALUATION_SYSTEMS,
+        allowed_systems_from_preparation="causal_evaluation_systems",
         verify_kwargs={"require_repository_match": False},
     )
 

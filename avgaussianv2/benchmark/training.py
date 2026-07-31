@@ -42,6 +42,7 @@ from avgaussianv2.train import (
     build_warmup_optimizer,
     condition_warmup_step,
     joint_train_step,
+    same_frame_camera_negative_indices,
 )
 
 SCHEMA = "avgaussianv2.cam38-fixed-budget"
@@ -400,7 +401,9 @@ def configure_benchmark_mode(
             _set_enabled(parameters, True)
         model.condition_enabled = True
     elif resolved is BenchmarkMode.AUDIO_ONLY:
-        for name in ("acoustic", "audio_unet"):
+        selected = getattr(model, "audio_only_parameter_groups", None)
+        names = selected() if callable(selected) else ("acoustic", "audio_unet")
+        for name in names:
             _set_enabled(groups[name], True)
         model.condition_enabled = False
     else:
@@ -1649,14 +1652,31 @@ class FixedBudgetTrainer:
                 self.config.conditioner_warmup_steps,
                 self.config.seed,
             )
+            warmup_contrast_indices = (
+                same_frame_camera_negative_indices(
+                    train_samples,
+                    warmup_indices,
+                    self.config.seed + 10_000,
+                )
+                if float(getattr(model, "camera_contrast_weight", 0.0)) > 0
+                else None
+            )
             while warmup_step < self.config.conditioner_warmup_steps:
                 sample_index = warmup_indices[warmup_step]
+                contrast_sample = (
+                    _require_training_sample(
+                        train_samples[warmup_contrast_indices[warmup_step]]
+                    )
+                    if warmup_contrast_indices is not None
+                    else None
+                )
                 condition_warmup_step(
                     model,
                     _require_training_sample(train_samples[sample_index]),
                     optimizer,
                     train_config,
                     audio_loss_fn,
+                    contrast_sample=contrast_sample,
                 )
                 warmup_step += 1
                 if (
@@ -1706,6 +1726,15 @@ class FixedBudgetTrainer:
         if optimizer is None:
             optimizer = build_joint_optimizer(model, train_config)
         observed_at_resume = 0
+        main_contrast_indices = (
+            same_frame_camera_negative_indices(
+                train_samples,
+                shared_indices,
+                self.config.seed + 20_000,
+            )
+            if float(getattr(model, "camera_contrast_weight", 0.0)) > 0
+            else None
+        )
         journal_path = output / "progress.json"
         if resume and journal_path.exists():
             try:
@@ -1723,6 +1752,13 @@ class FixedBudgetTrainer:
             sample = _require_training_sample(train_samples[shared_indices[main_step]])
             next_step = main_step + 1
             if resolved_mode is BenchmarkMode.JOINT_CONDITIONED:
+                contrast_sample = (
+                    _require_training_sample(
+                        train_samples[main_contrast_indices[main_step]]
+                    )
+                    if main_contrast_indices is not None
+                    else None
+                )
                 stats = joint_train_step(
                     model,
                     sample,
@@ -1733,6 +1769,7 @@ class FixedBudgetTrainer:
                     probe_audio_visual_gradient=(
                         next_step % train_config.gradient_probe_interval == 0
                     ),
+                    contrast_sample=contrast_sample,
                 )
                 if next_step % train_config.gradient_probe_interval == 0:
                     audio_visual_probe_count += 1

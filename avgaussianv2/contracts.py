@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
 from torch import Tensor
+
+
+class TokenCondition(Protocol):
+    tokens: Tensor
 
 
 @dataclass(frozen=True)
@@ -46,5 +51,5 @@ class AlignedAVSample:
 @dataclass(frozen=True)
 class FusionOutput:
     rgbd: RGBDRender
-    condition: Tensor
+    condition: Tensor | TokenCondition
     predicted_audio: Tensor
