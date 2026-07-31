@@ -16,11 +16,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from avgaussianv2.benchmark.architecture_ablation import (
+from avgaussianv2.benchmark.architecture_ablation import (  # noqa: E402
     validate_strategy_only_delta,
 )
-from avgaussianv2.benchmark.artifacts import repository_identity
-from avgaussianv2.benchmark.cross_attention_ablation import (
+from avgaussianv2.benchmark.artifacts import repository_identity  # noqa: E402
+from avgaussianv2.benchmark.cross_attention_ablation import (  # noqa: E402
     cross_attention_variant,
     validate_backend_only_delta,
 )
@@ -207,6 +207,7 @@ def generate(
     stage: str = "screening",
     winners_path: Path | None = None,
     systems: tuple[str, ...] | None = None,
+    architecture_selection_path: Path | None = None,
     strict_run_root: Path | None = None,
     _repository_identity=repository_identity,
 ) -> dict[str, object]:
@@ -250,6 +251,33 @@ def generate(
         raise ValueError(
             "loss-search systems must be explicitly supplied from architecture survivors"
         )
+    architecture_selection = None
+    if architecture_selection_path is not None:
+        architecture_selection_path = architecture_selection_path.resolve()
+        architecture_selection = json.loads(architecture_selection_path.read_text())
+        selected_source = (
+            Path(str(architecture_selection.get("source_manifest"))).resolve()
+            if isinstance(architecture_selection, dict)
+            else None
+        )
+        if (
+            stage in {"smoke", "architecture"}
+            or not isinstance(architecture_selection, dict)
+            or architecture_selection.get("schema")
+            != "avgaussianv2.architecture-screening-selection"
+            or architecture_selection.get("version") != 1
+            or architecture_selection.get("repository") != repository
+            or architecture_selection.get("selected_systems") != list(systems)
+            or not 1 <= len(systems) <= 2
+            or selected_source
+            != (output_dir.resolve() / "architecture/manifest.json")
+            or not selected_source.is_file()
+            or _sha256(selected_source)
+            != architecture_selection.get("source_manifest_sha256")
+        ):
+            raise ValueError(
+                "architecture selection does not bind the loss-search systems"
+            )
     report_steps = tuple(int(step) for step in stage_config["report_steps"])
     if (
         not report_steps
@@ -396,6 +424,16 @@ def generate(
         "source_manifest_sha256": _sha256(manifest_path),
         "repository": repository,
         "winners": str(winners_path.resolve()) if winners_path is not None else None,
+        "architecture_selection": (
+            str(architecture_selection_path)
+            if architecture_selection_path is not None
+            else None
+        ),
+        "architecture_selection_sha256": (
+            _sha256(architecture_selection_path)
+            if architecture_selection_path is not None
+            else None
+        ),
         "configs": configs,
         "runs": runs,
     }
@@ -440,6 +478,11 @@ def main() -> None:
         help="architecture survivor system; repeat for multiple systems",
     )
     parser.add_argument(
+        "--architecture-selection",
+        type=Path,
+        help="verified P1 selector output binding loss-search systems",
+    )
+    parser.add_argument(
         "--strict-run-root",
         type=Path,
         help=(
@@ -454,6 +497,7 @@ def main() -> None:
         stage=args.stage,
         winners_path=args.winners,
         systems=tuple(args.systems or ()),
+        architecture_selection_path=args.architecture_selection,
         strict_run_root=args.strict_run_root,
     )
     print(

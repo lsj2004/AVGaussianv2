@@ -5,12 +5,13 @@ import hashlib
 import io
 import json
 import math
+import os
+import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-import torch
 from torch import Tensor
 
 import avgaussianv2.benchmark.metrics as metrics_module
@@ -27,6 +28,7 @@ from avgaussianv2.benchmark.metrics import (
     waveform_l1,
 )
 from avgaussianv2.config import load_project_config
+from avgaussianv2.cdpam import CDPAMMetric, serve_cdpam_worker
 from avgaussianv2.data.aligned import AlignedAVDataset
 
 
@@ -95,61 +97,83 @@ def paper_audio_metrics(
     return result
 
 
-class CDPAMMetric:
-    """Paper-compatible CDPAM adapter with one shared model and isolated WAV I/O."""
+class ExternalCDPAMMetric:
+    """Persistent CDPAM worker isolated from the model-evaluation interpreter."""
 
-    def __init__(self) -> None:
+    def __init__(self, python_executable: str) -> None:
+        executable = Path(python_executable).resolve()
+        if not executable.is_file():
+            raise FileNotFoundError(f"DPAM Python does not exist: {executable}")
         try:
-            import cdpam
             import soundfile
         except ImportError as error:
-            raise RuntimeError(
-                "DPAM requires the cdpam and soundfile packages; "
-                "use --skip-dpam only for an explicitly incomplete report"
-            ) from error
-        self._cdpam = cdpam
+            raise RuntimeError("external DPAM bridge requires soundfile") from error
         self._soundfile = soundfile
-        self._model = cdpam.CDPAM()
         self._temporary = tempfile.TemporaryDirectory(
-            prefix="avgaussianv2-paper-dpam-"
+            prefix="avgaussianv2-external-dpam-"
+        )
+        self._stderr_path = Path(self._temporary.name) / "worker.stderr.log"
+        self._stderr = self._stderr_path.open("w+")
+        environment = os.environ.copy()
+        environment.setdefault(
+            "NUMBA_CACHE_DIR", str(Path(tempfile.gettempdir()) / "avgaussianv2-numba")
+        )
+        self._process = subprocess.Popen(
+            [str(executable), "-m", "avgaussianv2.cli.cdpam_worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self._stderr,
+            text=True,
+            bufsize=1,
+            env=environment,
         )
         self._index = 0
+        try:
+            ready = self._read_response("initialization")
+            if ready.get("status") != "ready" or not isinstance(
+                ready.get("protocol"), dict
+            ):
+                raise RuntimeError("external DPAM worker returned an invalid handshake")
+            self._protocol = {
+                **ready["protocol"],
+                "execution_mode": "persistent_external_worker",
+                "python_executable": str(executable),
+                "python_executable_sha256": _sha256(executable),
+                "python_version": ready.get("python_version"),
+                "bridge_source_sha256": _sha256(Path(__file__).resolve()),
+            }
+        except BaseException:
+            self.close()
+            raise
+
+    def _worker_error(self, context: str) -> RuntimeError:
+        self._stderr.flush()
+        self._stderr.seek(0)
+        details = self._stderr.read().strip()
+        suffix = f": {details[-2000:]}" if details else ""
+        return RuntimeError(f"external DPAM worker failed during {context}{suffix}")
+
+    def _read_response(self, context: str) -> dict[str, object]:
+        if self._process.stdout is None:
+            raise self._worker_error(context)
+        line = self._process.stdout.readline()
+        if not line:
+            raise self._worker_error(context)
+        try:
+            response = json.loads(line)
+        except ValueError as error:
+            raise self._worker_error(context) from error
+        if not isinstance(response, dict):
+            raise self._worker_error(context)
+        return response
 
     @property
     def protocol(self) -> dict[str, object]:
-        import inspect
-
-        state_owner = getattr(self._model, "model", self._model)
-        state_dict = getattr(state_owner, "state_dict", None)
-        if not callable(state_dict):
-            raise RuntimeError("cannot locate CDPAM model state for hashing")
-        state_digest = hashlib.sha256()
-        for name, value in sorted(state_dict().items()):
-            tensor = value.detach().cpu().contiguous()
-            state_digest.update(name.encode())
-            state_digest.update(str(tensor.dtype).encode())
-            state_digest.update(canonical_json(list(tensor.shape)))
-            state_digest.update(
-                tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
-            )
-        module_path = Path(self._cdpam.__file__).resolve()
-        class_path_value = inspect.getsourcefile(type(self._model))
-        if class_path_value is None:
-            raise RuntimeError("cannot locate CDPAM implementation source")
-        class_path = Path(class_path_value).resolve()
-        return {
-            "implementation": f"{type(self._model).__module__}.{type(self._model).__qualname__}",
-            "weight_module": (
-                f"{type(state_owner).__module__}.{type(state_owner).__qualname__}"
-            ),
-            "module_path": str(module_path),
-            "module_sha256": _sha256(module_path),
-            "class_source_path": str(class_path),
-            "class_source_sha256": _sha256(class_path),
-            "model_state_sha256": state_digest.hexdigest(),
-        }
+        return dict(self._protocol)
 
     def __call__(self, predicted: Tensor, target: Tensor, sample_rate: int) -> float:
+        if self._process.stdin is None:
+            raise self._worker_error("request")
         self._index += 1
         root = Path(self._temporary.name)
         predicted_path = root / f"predicted-{self._index:08d}.wav"
@@ -164,18 +188,52 @@ class CDPAMMetric:
             target.detach().cpu().squeeze(0).transpose(0, 1).numpy(),
             sample_rate,
         )
-        reference = self._cdpam.load_audio(str(target_path))
-        output = self._cdpam.load_audio(str(predicted_path))
-        with torch.no_grad():
-            value = self._model.forward(reference, output)
-        predicted_path.unlink(missing_ok=True)
-        target_path.unlink(missing_ok=True)
-        return float(value.detach().cpu().reshape(-1)[0])
+        request = {
+            "request_id": self._index,
+            "predicted_path": str(predicted_path),
+            "target_path": str(target_path),
+        }
+        try:
+            self._process.stdin.write(json.dumps(request, sort_keys=True) + "\n")
+            self._process.stdin.flush()
+            response = self._read_response(f"request {self._index}")
+            if response.get("request_id") != self._index:
+                raise RuntimeError("external DPAM response identity mismatch")
+            if response.get("status") != "ok":
+                raise RuntimeError(
+                    f"external DPAM request failed: {response.get('error')}"
+                )
+            value = float(response["value"])
+            if not math.isfinite(value):
+                raise RuntimeError("external DPAM returned a nonfinite value")
+            return value
+        finally:
+            predicted_path.unlink(missing_ok=True)
+            target_path.unlink(missing_ok=True)
 
     def close(self) -> None:
-        self._temporary.cleanup()
+        process = getattr(self, "_process", None)
+        if process is not None and process.poll() is None:
+            if process.stdin is not None:
+                try:
+                    process.stdin.write('{"command":"close"}\n')
+                    process.stdin.flush()
+                    process.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        stderr = getattr(self, "_stderr", None)
+        if stderr is not None and not stderr.closed:
+            stderr.close()
+        temporary = getattr(self, "_temporary", None)
+        if temporary is not None:
+            temporary.cleanup()
 
-    def __enter__(self) -> CDPAMMetric:
+    def __enter__(self) -> ExternalCDPAMMetric:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
@@ -498,10 +556,12 @@ def verify_reference_evaluation(output_dir: Path) -> dict[str, object]:
 __all__ = [
     "BASELINES",
     "CDPAMMetric",
+    "ExternalCDPAMMetric",
     "ReferenceEvaluation",
     "evaluate_reference_baselines",
     "paper_audio_metrics",
     "reference_prediction",
+    "serve_cdpam_worker",
     "verify_reference_evaluation",
     "write_reference_evaluation",
 ]

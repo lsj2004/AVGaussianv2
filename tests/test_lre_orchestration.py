@@ -123,6 +123,7 @@ def test_lre_runner_consumes_stop_step_and_keeps_one_pipeline_per_gpu(tmp_path):
         compute_dpam=True,
         trust_upstream_artifacts=True,
         resume=False,
+        dpam_python="/opt/dpam/bin/python",
     )
     assert len(pipelines) == 2
     for pipeline in pipelines:
@@ -135,6 +136,9 @@ def test_lre_runner_consumes_stop_step_and_keeps_one_pipeline_per_gpu(tmp_path):
         train = pipeline.stages[1].command
         assert train[train.index("--stop-after-step") + 1] == "5000"
         assert "--compute-dpam" in pipeline.stages[2].command
+        assert pipeline.stages[2].command[
+            pipeline.stages[2].command.index("--dpam-python") + 1
+        ] == "/opt/dpam/bin/python"
 
     runner = _Runner()
     result = execute_lre_pipelines(
@@ -172,6 +176,7 @@ def test_lre_runner_resume_verifies_existing_evaluation_without_retraining(tmp_p
         compute_dpam=True,
         trust_upstream_artifacts=True,
         resume=False,
+        dpam_python="/opt/dpam/bin/python",
     )
     run = tmp_path / "runs/continuation-0"
     (run / "protocol").mkdir(parents=True)
@@ -267,6 +272,7 @@ def test_architecture_pipeline_schedules_main_and_causal_evaluations(tmp_path):
         compute_dpam=True,
         trust_upstream_artifacts=True,
         resume=False,
+        dpam_python="/opt/dpam/bin/python",
     )
 
     stages = pipelines[0].stages
@@ -284,7 +290,9 @@ def test_architecture_pipeline_schedules_main_and_causal_evaluations(tmp_path):
         "evaluations/query_dependent_p1_no_rgbd/step_005000"
     )
     assert "--compute-dpam" in stages[2].command
+    assert "--dpam-python" in stages[2].command
     assert "--compute-dpam" not in stages[3].command
+    assert "--dpam-python" not in stages[3].command
     assert "--compute-dpam" not in stages[4].command
     assert (
         pipelines[0].run_dir / "evaluations/query_dependent_p1_no_rgbd"

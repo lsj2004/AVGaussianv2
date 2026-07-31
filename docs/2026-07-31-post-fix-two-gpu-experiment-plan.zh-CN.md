@@ -67,8 +67,9 @@ validation/test 分离协议，并确认 native AudioGS/FTGS++ 也没有使用 v
 
 ## 4. GPU 与调度策略
 
-用户授权 GPU 1、GPU 2，均为 48GB。不能假设两张卡始终空闲：2026-08-01 两次真实
-smoke 时 GPU 1 被其他任务占用约 46GB，因此只安全使用 GPU 2。
+用户授权 GPU 1、GPU 2，均为 48GB。不能假设两张卡始终空闲：2026-08-01 前两次真实
+smoke 时 GPU 1 被其他任务占用约 46GB，DPAM smoke 前两张卡均已空闲。正式启动仍以
+即时 preflight 为准，不把任一时刻状态写死到调度配置。
 
 启动规则：
 
@@ -110,7 +111,18 @@ P1 smoke 真实验证了 5k 暂停、三路因果评测、失败后恢复和 ver
 - 已完成主评测恢复时必须 verify-only，不能覆盖。
 
 2026-08-01 再次对三路现有产物执行独立 verifier，样本数和上述三个 content SHA-256
-完全一致。smoke 至此完成，但它明确没有覆盖 DPAM，也不能用于比较架构性能。
+完全一致。前两项 smoke 明确没有覆盖 DPAM，也不能用于比较架构性能。
+
+3. DPAM 双运行时：复用 P1 5k checkpoint，在 FreeTimeGS++ Python 加载模型、由持久化
+   `avcloud` worker 计算 CDPAM；130/130 行均含 `paper_dpam` 并通过独立 verifier。
+   evaluation content SHA-256：
+   `98e7508bfa98f0871aba46c6e3d219b1a3fdfe72099851f6bff01a0436002e5b`；
+   CDPAM 权重 SHA-256：
+   `2841b384b2423a34e282a66ea69dd608c9e585584f60d13337220d4cb69f08cb`。
+
+DPAM smoke 首次诊断命令遗漏 `CUBLAS_WORKSPACE_CONFIG`，第二次在全部计算结束后因输出
+父目录不存在而无法发布；两项均已修正。正式 runner 原本已强制注入确定性环境，独立
+evaluator 现在也会在昂贵计算前创建输出父目录。
 
 ### 5.2 门禁状态与剩余阻塞项
 
@@ -122,14 +134,14 @@ P1 smoke 真实验证了 5k 暂停、三路因果评测、失败后恢复和 ver
 | Source/Mono 846 行 MAG/ENV/LRE/DPAM | 已通过 verifier | 最终 commit 覆盖重跑并固化 SHA |
 | `lambda_lre=0` 等价于 legacy 更新 | loss、gradient、连续 10 次更新精确一致 | 全量测试复核 |
 | P1 三路真实 GPU smoke | 已完成 | 不再重复训练 |
-| 正式主评测 DPAM | **未打通** | 拆分模型评测 Python 与 CDPAM Python，并做 130 样本集成 smoke |
-| P1 自动化筛选 | **未冻结** | 实现 fail-closed selector，避免训练后人工改口径 |
+| 正式主评测 DPAM | 双运行时 130 样本 smoke 通过 | 全量测试复核 |
+| P1 自动化筛选 | fail-closed selector 与生成器绑定已实现 | 全量测试复核 |
 | 最终代码质量 | 未完成 | 全量 pytest、静态检查、clean worktree 后冻结 commit |
 
-正式训练 Python 没有 `cdpam`；已有 CDPAM 环境又没有 `gsplat/tinycudann`。因此主评测
-必须以持久化子进程或等价的双运行时方式调用 CDPAM，并把其解释器、实现、权重哈希写入
-metric protocol。禁止临时给训练环境安装未经锁定的依赖，也禁止因环境问题在正式主表
-跳过 DPAM。上述两个粗体阻塞项和最终代码质量任一未通过，不启动正式架构队列。
+正式训练 Python 没有 `cdpam`；已有 CDPAM 环境又没有 `gsplat/tinycudann`。主评测因此
+使用已验证的持久化双运行时，并把解释器、实现、权重哈希写入 metric protocol。禁止
+临时给训练环境安装未经锁定的依赖，也禁止因环境问题在正式主表跳过 DPAM。最终代码
+质量及最终 commit 重新绑定未通过前，不启动正式架构队列。
 
 ## 6. 分阶段实验矩阵
 
@@ -156,16 +168,21 @@ metric protocol。禁止临时给训练环境安装未经锁定的依赖，也�
   全面支配；
 - 条件模型 correct 必须总体优于相应 no-RGBD，并且不能在两个场景都被 shuffled 或
   wrong-camera 稳定击败；
-- LRE、ILD、IPD 不出现不可接受退化；
+- paper LRE、native LRE、ILD、IPD 的两场景 macro 相对 `audio_only` 退化均不超过 20%；
 - Pareto 近似等价时优先参数更少、GPU-hours 更低的模型。
 
 自动 selector 按以下固定顺序决策，不构造加权总分：先检查覆盖、身份、样本集合和有限性；
-再执行条件因果门禁；随后剔除被 `audio_only` 全面支配的候选并形成 Pareto front；若前沿
-超过 2 个，依次用两场景等权 macro `audio_total`、MAG、ENV、DPAM、waveform L1、LRE
-和资源成本作词典序 tie-break。selector 必须同时输出全部候选、淘汰原因和至多 2 个
+再执行条件因果门禁，其中 correct 相对 no-RGBD 的两场景 macro `audio_total` 改善至少
+0.1%，且 alternate 不能在两个场景都优于 correct；随后剔除被 `audio_only` 全面支配的
+候选并形成 Pareto front；若前沿
+超过 2 个，依次用两场景等权 macro `audio_total`、MAG、ENV、DPAM、waveform L1、
+paper LRE、native LRE、ILD、IPD 作词典序 tie-break，完全相同时按稳定 system ID 排序。
+资源成本单独报告，不用于自动
+打破指标差异，避免因不同数量的因果评测污染训练成本。selector 必须输出全部候选和至多 2 个
 `selected_systems`；任何输入缺失都 fail closed，不允许人工补齐默认值。
 
-最多保留 2 个架构。5k 边界不清楚时只把边界候选延长到 10k，不凭微小均值差淘汰。
+最多保留 2 个架构；P3 再检验其 5k 排序能否延续到 10k/30k。P1 不在看到结果后
+临时增加第三个候选，以免破坏预注册预算和引入选择自由度。
 
 ### P2：LRE 权重筛选
 
@@ -247,12 +264,20 @@ $PRODUCTION_PYTHON -m avgaussianv2.cli.benchmark_lre_run \
   --native-root "$STRICT_RUN_ROOT" \
   --gpus 1,2 \
   --python "$PRODUCTION_PYTHON" \
+  --dpam-python /home/lisujing/miniconda3/envs/avcloud/bin/python \
   --trust-upstream-artifacts
 
-# P1 选出 survivor 后生成 LRE screening；示例中的 system 必须替换为真实 survivor。
+# P1 selector fail closed；输出最多两个 survivor。
+$PRODUCTION_PYTHON -m avgaussianv2.cli.benchmark_architecture_select \
+  --manifest "$GENERATED_ROOT/architecture/manifest.json" \
+  --run-root "$RUN_ROOT" \
+  --output "$GENERATED_ROOT/architecture/selection.json"
+
+# 按 selection.json 的 selected_systems 原顺序逐项传入 --system。
 $PRODUCTION_PYTHON scripts/generate_lre_ablation_configs.py \
   --stage screening \
   --system query_dependent_p1 \
+  --architecture-selection "$GENERATED_ROOT/architecture/selection.json" \
   --output-dir "$GENERATED_ROOT" \
   --strict-run-root "$STRICT_RUN_ROOT"
 
@@ -262,6 +287,7 @@ $PRODUCTION_PYTHON -m avgaussianv2.cli.benchmark_lre_run \
   --native-root "$STRICT_RUN_ROOT" \
   --gpus 1,2 \
   --python "$PRODUCTION_PYTHON" \
+  --dpam-python /home/lisujing/miniconda3/envs/avcloud/bin/python \
   --trust-upstream-artifacts \
   --resume
 ```

@@ -247,6 +247,7 @@ def build_lre_pipelines(
     compute_dpam: bool,
     trust_upstream_artifacts: bool,
     resume: bool,
+    dpam_python: str | None = None,
 ) -> tuple[LREPipeline, ...]:
     configs = {
         str(record["config_id"]): record
@@ -367,6 +368,8 @@ def build_lre_pipelines(
                 ]
                 if compute_dpam and evaluation_system == system:
                     command.append("--compute-dpam")
+                    if dpam_python is not None:
+                        command.extend(("--dpam-python", dpam_python))
                 if (evaluation / "current.json").is_file():
                     command.append("--verify-only")
                 stage_name = (
@@ -611,6 +614,7 @@ def run_lre_manifest(
     compute_dpam: bool = True,
     trust_upstream_artifacts: bool = False,
     resume: bool = False,
+    dpam_python: str | None = None,
     runner: ProcessRunner | None = None,
     gpu_query: Callable[[Sequence[int]], Mapping[int, object]] = query_idle_gpus,
     repository_identity_getter: Callable[[], Mapping[str, object]] = (
@@ -634,6 +638,7 @@ def run_lre_manifest(
         compute_dpam=compute_dpam,
         trust_upstream_artifacts=trust_upstream_artifacts,
         resume=resume,
+        dpam_python=dpam_python,
     )
     try:
         result = execute_lre_pipelines(

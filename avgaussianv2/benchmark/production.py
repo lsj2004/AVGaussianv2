@@ -1018,6 +1018,7 @@ def build_evaluation_adapters(
     evidence: TrainingEvidence,
     trusted_upstream_artifacts: bool,
     compute_dpam: bool = False,
+    dpam_python: str | None = None,
 ):
     """Return lazy common-runtime and modality-exact predictor factories."""
     holder: dict[str, object] = {}
@@ -1241,9 +1242,16 @@ def build_evaluation_adapters(
         extra_metric_modalities = None
         extra_metric_protocols = None
         if compute_dpam:
-            from avgaussianv2.benchmark.audio_references import CDPAMMetric
+            from avgaussianv2.benchmark.audio_references import (
+                CDPAMMetric,
+                ExternalCDPAMMetric,
+            )
 
-            dpam = CDPAMMetric()
+            dpam = (
+                ExternalCDPAMMetric(dpam_python)
+                if dpam_python is not None
+                else CDPAMMetric()
+            )
             stack.callback(dpam.close)
             sample_rate = config.model.sample_rate
             extra_metric_fns = {

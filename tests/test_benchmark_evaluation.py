@@ -13,7 +13,6 @@ import avgaussianv2.benchmark.evaluation as evaluation_module
 from avgaussianv2.benchmark.evaluation import (
     ALL_METRICS,
     AUDIO_METRICS,
-    VIDEO_METRICS,
     BenchmarkEvaluationError,
     BenchmarkEvaluationRuntime,
     BenchmarkEvaluator,

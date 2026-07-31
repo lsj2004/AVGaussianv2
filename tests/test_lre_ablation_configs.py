@@ -397,3 +397,46 @@ def test_generation_requires_explicit_architecture_survivors(
             tmp_path,
             _repository_identity=lambda: FAKE_REPOSITORY,
         )
+
+
+def test_loss_search_can_bind_verified_architecture_selection(tmp_path: Path) -> None:
+    module = _load_generator()
+    systems = ("plain_unet", "query_dependent_p1")
+    _generate(module, tmp_path, stage="architecture", systems=systems)
+    source = tmp_path / "architecture/manifest.json"
+    selection = tmp_path / "architecture-selection.json"
+    selection.write_text(
+        json.dumps(
+            {
+                "schema": "avgaussianv2.architecture-screening-selection",
+                "version": 1,
+                "repository": FAKE_REPOSITORY,
+                "source_manifest": str(source.resolve()),
+                "source_manifest_sha256": hashlib.sha256(
+                    source.read_bytes()
+                ).hexdigest(),
+                "selected_systems": list(systems),
+            }
+        )
+    )
+
+    generated = _generate(
+        module,
+        tmp_path,
+        stage="screening",
+        systems=systems,
+        architecture_selection_path=selection,
+    )
+
+    assert generated["architecture_selection"] == str(selection.resolve())
+    assert generated["architecture_selection_sha256"] == hashlib.sha256(
+        selection.read_bytes()
+    ).hexdigest()
+    with pytest.raises(ValueError, match="does not bind"):
+        _generate(
+            module,
+            tmp_path / "mismatch",
+            stage="screening",
+            systems=("plain_unet",),
+            architecture_selection_path=selection,
+        )

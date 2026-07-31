@@ -27,8 +27,14 @@ def main() -> None:
     )
     parser.add_argument("--trust-upstream-artifacts", action="store_true")
     parser.add_argument("--skip-dpam", action="store_true")
+    parser.add_argument(
+        "--dpam-python",
+        help="isolated Python containing cdpam for formal main evaluations",
+    )
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
+    if args.dpam_python and args.skip_dpam:
+        parser.error("--dpam-python cannot be combined with --skip-dpam")
     result = run_lre_manifest(
         args.manifest,
         output_root=args.output_root,
@@ -38,6 +44,7 @@ def main() -> None:
         compute_dpam=not args.skip_dpam,
         trust_upstream_artifacts=args.trust_upstream_artifacts,
         resume=args.resume,
+        dpam_python=args.dpam_python,
     )
     print(
         json.dumps(

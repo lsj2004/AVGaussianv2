@@ -29,13 +29,20 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--trust-upstream-artifacts", action="store_true")
     parser.add_argument("--compute-dpam", action="store_true")
+    parser.add_argument(
+        "--dpam-python",
+        help="optional isolated Python containing cdpam; requires --compute-dpam",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--verify-only", action="store_true")
     args = parser.parse_args()
+    if args.dpam_python and not args.compute_dpam:
+        parser.error("--dpam-python requires --compute-dpam")
     identity = expected_identity(args.scene, args.system, args.step)
     if args.verify_only:
         result = verify_evaluation(args.output_dir, identity=identity)
     else:
+        args.output_dir.parent.mkdir(parents=True, exist_ok=True)
         if args.system.startswith("native_"):
             if args.step is not None:
                 parser.error("native systems do not accept --step")
@@ -57,6 +64,7 @@ def main() -> None:
             evidence=evidence,
             trusted_upstream_artifacts=args.trust_upstream_artifacts,
             compute_dpam=args.compute_dpam,
+            dpam_python=args.dpam_python,
         )
         result = BenchmarkEvaluator(args.device).evaluate(
             identity=identity,
