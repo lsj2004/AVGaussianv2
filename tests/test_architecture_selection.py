@@ -97,7 +97,10 @@ def _result(scene: str, system: str, value: float, *, checkpoint: str):
         "completed_updates": 5_000,
         "checkpoint_step": 5_000,
         "batch_size": 1,
-        "audio_initialization_sha256": "b" * 64,
+        # Full audio state legitimately differs when the architecture adds parameters.
+        "audio_initialization_sha256": (
+            "b" * 64 if system == "audio_only" else "9" * 64
+        ),
         "visual_initialization_sha256": "c" * 64,
         "model_initialization_sha256": checkpoint,
         "checkpoint_sha256": checkpoint,
@@ -149,6 +152,47 @@ def _evaluations(tmp_path: Path):
     return values
 
 
+def _preparation(run_dir: Path):
+    scene = next(scene for scene in SCENES if run_dir.name.startswith(scene))
+    return {
+        "scene_id": scene,
+        "_continuation_identity": {
+            "repository": {
+                "root": str(run_dir.parent.resolve()),
+                "commit": "1" * 40,
+                "clean": True,
+            },
+            "scene": scene,
+            "system": run_dir.name.removeprefix(f"{scene}-"),
+            "seed": 42,
+            "lambda_lre": 0.0,
+        },
+        "native_contracts": {
+            "audiogs": {
+                "path": f"/{scene}/audiogs",
+                "checkpoint_sha256": hashlib.sha256(scene.encode()).hexdigest(),
+                "manifest_sha256": hashlib.sha256(
+                    f"{scene}-audio-manifest".encode()
+                ).hexdigest(),
+            },
+            "ftgspp": {
+                "path": f"/{scene}/ftgspp",
+                "checkpoint_sha256": hashlib.sha256(
+                    f"{scene}-visual".encode()
+                ).hexdigest(),
+                "manifest_sha256": hashlib.sha256(
+                    f"{scene}-visual-manifest".encode()
+                ).hexdigest(),
+            },
+        },
+        "runtime": {
+            "dataset_identity_sha256": hashlib.sha256(
+                f"{scene}-dataset".encode()
+            ).hexdigest()
+        },
+    }
+
+
 def test_architecture_selector_applies_fairness_causal_and_pareto_gates(
     tmp_path: Path,
 ) -> None:
@@ -160,6 +204,7 @@ def test_architecture_selector_applies_fairness_causal_and_pareto_gates(
         tmp_path,
         tmp_path / "selection.json",
         evaluation_loader=lambda path: evaluations[path.resolve()],
+        preparation_loader=_preparation,
         repository_identity_getter=lambda: {
             "root": str(tmp_path.resolve()),
             "commit": "1" * 40,
@@ -168,6 +213,8 @@ def test_architecture_selector_applies_fairness_causal_and_pareto_gates(
     )
 
     assert result["selected_systems"] == ["query_dependent_p1"]
+    assert result["exploratory_systems"] == []
+    assert result["screening_systems"] == ["query_dependent_p1"]
     assert result["pareto_systems"] == ["query_dependent_p1"]
     assert json.loads((tmp_path / "selection.json").read_text()) == result
     candidate = next(
@@ -175,6 +222,10 @@ def test_architecture_selector_applies_fairness_causal_and_pareto_gates(
     )
     assert candidate["causal_gate_passed"] is True
     assert len(candidate["causal_evidence"]) == 2
+    assert result["postprocessing_revision_only"] is False
+    assert "audio_initialization_sha256" not in result["fairness_policy"][
+        "shared_fields"
+    ]
 
 
 def test_architecture_selector_rejects_incomplete_dpam_protocol(tmp_path: Path) -> None:
@@ -189,6 +240,7 @@ def test_architecture_selector_rejects_incomplete_dpam_protocol(tmp_path: Path) 
             tmp_path,
             tmp_path / "selection.json",
             evaluation_loader=lambda path: evaluations[path.resolve()],
+            preparation_loader=_preparation,
             repository_identity_getter=lambda: {
                 "root": str(tmp_path.resolve()),
                 "commit": "1" * 40,
@@ -209,6 +261,7 @@ def test_architecture_selector_enforces_spatial_guardrail(tmp_path: Path) -> Non
         tmp_path,
         tmp_path / "selection.json",
         evaluation_loader=lambda path: evaluations[path.resolve()],
+        preparation_loader=_preparation,
         repository_identity_getter=lambda: {
             "root": str(tmp_path.resolve()),
             "commit": "1" * 40,
@@ -217,9 +270,72 @@ def test_architecture_selector_enforces_spatial_guardrail(tmp_path: Path) -> Non
     )
 
     assert selected["selected_systems"] == ["audio_only"]
+    assert selected["exploratory_systems"] == ["query_dependent_p1"]
+    assert selected["screening_systems"] == [
+        "audio_only",
+        "query_dependent_p1",
+    ]
     candidate = next(
         item
         for item in selected["candidates"]
         if item["system"] == "query_dependent_p1"
     )
     assert candidate["spatial_guardrail_passed"] is False
+
+
+def test_architecture_selector_rejects_native_initialization_mismatch(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path)
+    evaluations = _evaluations(tmp_path)
+
+    def mismatched(run_dir: Path):
+        value = dict(_preparation(run_dir))
+        if run_dir.name.endswith("query_dependent_p1"):
+            value["native_contracts"] = {
+                "audiogs": {"checkpoint_sha256": "0" * 64}
+            }
+        return value
+
+    with pytest.raises(ValueError, match="native fairness mismatch"):
+        select_architecture_winners(
+            manifest,
+            tmp_path,
+            tmp_path / "selection.json",
+            evaluation_loader=lambda path: evaluations[path.resolve()],
+            preparation_loader=mismatched,
+            repository_identity_getter=lambda: {
+                "root": str(tmp_path.resolve()),
+                "commit": "1" * 40,
+                "clean": True,
+            },
+        )
+
+
+def test_architecture_selector_allows_validated_postprocessing_revision(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path)
+    evaluations = _evaluations(tmp_path)
+    current = {
+        "root": str(tmp_path.resolve()),
+        "commit": "2" * 40,
+        "clean": True,
+    }
+    validated = []
+
+    result = select_architecture_winners(
+        manifest,
+        tmp_path,
+        tmp_path / "selection.json",
+        evaluation_loader=lambda path: evaluations[path.resolve()],
+        preparation_loader=_preparation,
+        repository_identity_getter=lambda: current,
+        revision_validator=lambda old, new: validated.append((old, new)),
+        allow_postprocessing_revision=True,
+    )
+
+    assert validated == [(json.loads(manifest.read_text())["repository"], current)]
+    assert result["repository"] == current
+    assert result["experiment_repository"]["commit"] == "1" * 40
+    assert result["postprocessing_revision_only"] is True

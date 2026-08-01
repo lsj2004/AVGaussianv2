@@ -409,13 +409,15 @@ def test_loss_search_can_bind_verified_architecture_selection(tmp_path: Path) ->
         json.dumps(
             {
                 "schema": "avgaussianv2.architecture-screening-selection",
-                "version": 1,
+                "version": 2,
                 "repository": FAKE_REPOSITORY,
                 "source_manifest": str(source.resolve()),
                 "source_manifest_sha256": hashlib.sha256(
                     source.read_bytes()
                 ).hexdigest(),
                 "selected_systems": list(systems),
+                "exploratory_systems": [],
+                "screening_systems": list(systems),
             }
         )
     )

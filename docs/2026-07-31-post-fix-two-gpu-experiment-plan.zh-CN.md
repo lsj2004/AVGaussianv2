@@ -1,6 +1,6 @@
 # post-fix 双 48GB GPU 实验计划（执行版）
 
-更新日期：2026-08-01（smoke 后修订版）
+更新日期：2026-08-01（P1 后修订版）
 
 ## 1. 本轮要回答的问题
 
@@ -89,6 +89,13 @@ attempt 用时 836.22 秒，采样到的设备占用峰值 1,033MiB、利用率�
 verify-only 仅用 27.00 秒、14MiB，因此不能用最新指针估算训练或完整评测成本。这些
 数据只证明显存充足，不证明多开能提速；CPU、数据读取和渲染可能是主要瓶颈。
 
+正式 P1 的 10 个 run 均成功。scene1/Scene7 单 pipeline 总用时分别为：`audio_only`
+882.67/1491.09 秒、`plain_unet` 777.67/1196.84 秒、`joint_conditioned`
+2612.20/4209.60 秒、`cross_attention_masks` 2466.50/4404.60 秒、
+`query_dependent_p1` 3034.10/4632.00 秒；峰值显存范围 1,418--2,997MiB。22 份
+主/因果 evaluation 已逐份独立 verify-only。由此确认瓶颈是训练后多路 DPAM 评测，P2
+仍保持每卡一个 pipeline，不做未经 A/B 验证的单卡多开。
+
 ## 5. 已完成 smoke 与剩余开跑门禁
 
 ### 5.1 已通过的两个真实 smoke
@@ -136,7 +143,7 @@ evaluator 现在也会在昂贵计算前创建输出父目录。
 | P1 三路真实 GPU smoke | 已完成 | 不再重复训练 |
 | 正式主评测 DPAM | 双运行时 130 样本 smoke 通过 | 全量测试复核 |
 | P1 自动化筛选 | fail-closed selector 与生成器绑定已实现 | 全量测试复核 |
-| 最终代码质量 | 未完成 | 全量 pytest、静态检查、clean worktree 后冻结 commit |
+| 最终代码质量 | 400 项 pytest、全仓 Ruff、diff-check 通过 | P2 提交再次冻结后复核 |
 
 正式训练 Python 没有 `cdpam`；已有 CDPAM 环境又没有 `gsplat/tinycudann`。主评测因此
 使用已验证的持久化双运行时，并把解释器、实现、权重哈希写入 metric protocol。禁止
@@ -182,7 +189,16 @@ paper LRE、native LRE、ILD、IPD 作词典序 tie-break，完全相同时按�
 `selected_systems`；任何输入缺失都 fail closed，不允许人工补齐默认值。
 
 最多保留 2 个架构；P3 再检验其 5k 排序能否延续到 10k/30k。P1 不在看到结果后
-临时增加第三个候选，以免破坏预注册预算和引入选择自由度。
+临时增加第三个 confirmatory 候选，以免破坏预注册预算和引入选择自由度。
+
+P1 实测后，严格门禁唯一胜者是 `audio_only`。`query_dependent_p1` 的五个主音频质量
+指标整体优于 `audio_only` 且因果门禁通过，但 paper LRE scene-macro 从 0.338dB 增至
+0.912dB，未通过 20% 相对空间 guardrail。若只继续严格胜者，P2 将无法回答 LRE loss
+能否修复最佳条件架构。因此额外保留一个明确标注为 **post-hoc exploratory** 的 rescue
+槽：只有没有条件架构通过严格门禁时，才在“因果门禁通过、未被 `audio_only` 在质量
+指标全面支配、paper LRE 绝对退化不超过 1dB”的条件架构中，按 paper LRE 绝对退化、
+五个质量指标、稳定 system ID 排序取一个。本轮该槽为 `query_dependent_p1`。它进入 P2
+但不能被报告为预注册胜者；最终 confirmatory 与 exploratory 结论必须分表。
 
 ### P2：LRE 权重筛选
 
@@ -195,8 +211,9 @@ scenes = scene1_opera, Scene7playing
 step = 5k
 ```
 
-训练上限 16 个 5k run；架构阶段已有的 `lambda=0` 目录和 checkpoint 直接复用。非零
-权重晋级要求：
+训练上限 16 个 5k run。由于 selector 修复产生了新的 clean commit，P2 使用新的
+`RUN_ROOT_V3`，并在新提交下重新训练 `lambda=0` control；禁止跨提交 continuation。
+非零权重晋级要求：
 
 - 两场景 scene-macro LRE 相对本架构 control 改善至少 15%；
 - `audio_total` 与 waveform L1 相对退化各不超过 3%；
@@ -245,6 +262,7 @@ PRODUCTION_PYTHON=/mnt/sda/lisujing/Dataset/FreeTimeGSPlusPlus/.venv/bin/python
 STRICT_RUN_ROOT=/mnt/sda/lisujing/Dataset/AVGaussianFusionv2/.worktrees/scene1-pilot/runs/cam38_strict
 GENERATED_ROOT=configs/generated/lre_loss_ablation
 RUN_ROOT=runs/lre_loss_ablation_visual_time_v2
+RUN_ROOT_V3=runs/lre_loss_ablation_visual_time_v3
 
 # 架构阶段：5 systems × 2 scenes，lambda=0，5k
 $PRODUCTION_PYTHON scripts/generate_lre_ablation_configs.py \
@@ -271,11 +289,13 @@ $PRODUCTION_PYTHON -m avgaussianv2.cli.benchmark_lre_run \
 $PRODUCTION_PYTHON -m avgaussianv2.cli.benchmark_architecture_select \
   --manifest "$GENERATED_ROOT/architecture/manifest.json" \
   --run-root "$RUN_ROOT" \
-  --output "$GENERATED_ROOT/architecture/selection.json"
+  --output "$GENERATED_ROOT/architecture/selection.json" \
+  --allow-postprocessing-revision
 
 # 按 selection.json 的 selected_systems 原顺序逐项传入 --system。
 $PRODUCTION_PYTHON scripts/generate_lre_ablation_configs.py \
   --stage screening \
+  --system audio_only \
   --system query_dependent_p1 \
   --architecture-selection "$GENERATED_ROOT/architecture/selection.json" \
   --output-dir "$GENERATED_ROOT" \
@@ -283,13 +303,12 @@ $PRODUCTION_PYTHON scripts/generate_lre_ablation_configs.py \
 
 $PRODUCTION_PYTHON -m avgaussianv2.cli.benchmark_lre_run \
   --manifest "$GENERATED_ROOT/screening/manifest.json" \
-  --output-root "$RUN_ROOT" \
+  --output-root "$RUN_ROOT_V3" \
   --native-root "$STRICT_RUN_ROOT" \
   --gpus 1,2 \
   --python "$PRODUCTION_PYTHON" \
   --dpam-python /home/lisujing/miniconda3/envs/avcloud/bin/python \
-  --trust-upstream-artifacts \
-  --resume
+  --trust-upstream-artifacts
 ```
 
 若 GPU 1 未通过预检，将 `--gpus 1,2` 改为 `--gpus 2`；禁止关闭预检。selection、

@@ -265,9 +265,9 @@ def generate(
             or not isinstance(architecture_selection, dict)
             or architecture_selection.get("schema")
             != "avgaussianv2.architecture-screening-selection"
-            or architecture_selection.get("version") != 1
+            or architecture_selection.get("version") != 2
             or architecture_selection.get("repository") != repository
-            or architecture_selection.get("selected_systems") != list(systems)
+            or architecture_selection.get("screening_systems") != list(systems)
             or not 1 <= len(systems) <= 2
             or selected_source
             != (output_dir.resolve() / "architecture/manifest.json")
