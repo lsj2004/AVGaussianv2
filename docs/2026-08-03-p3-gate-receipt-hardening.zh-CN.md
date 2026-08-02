@@ -58,17 +58,17 @@ pending 路径，成功后才提升到正式路径，避免失败尝试覆盖权
 30k supervisor。只替换尚在等待的 P3 后处理、Audio-only 和最终报告 relay，因此不会
 中断当前 GPU 训练，也不会改变任何已注册实验配置。
 
-实际部署冻结于提交 `3c3527a4dbb674af0fb670587167936b18b3abfc`。旧的三个等待 relay
+最终部署冻结于提交 `2fc0353258450831b62fcd0538b2e1ed22786675`。旧的三个等待 relay
 已停止，新会话依次为：
 
-- `avgf-p3-after-30k-versioned-v4`；
-- `avgf-audio-only-after-p3-versioned-v4`；
-- `avgf-final-report-after-baseline-v6`。
+- `avgf-p3-after-30k-versioned-v5`；
+- `avgf-audio-only-after-p3-versioned-v5`；
+- `avgf-final-report-after-baseline-v7`。
 
-训练 supervisor 仍为原 PID `1661222`；替换前后第二条 30k continuation 从精确 17.5k
-继续前进，证明训练未被 relay 迁移中断。P3 与 Audio-only token 分别为
-`c3337efb-9e63-4840-9cf0-5155eeb8ba3a` 和
-`1b26ccaf-61c9-47fb-8e86-e5dd1e9c7704`，后续 receipt 必须逐字匹配。
+训练 supervisor 仍为原 PID `1661222`；两次等待 relay 迁移期间，第二条 30k
+continuation 从精确 17.5k 连续推进到 20k，证明训练未被迁移中断。最终 P3 与
+Audio-only token 分别为 `7223410d-291b-4d91-bf50-a4a6efe93b0b` 和
+`30bf5963-94ac-4258-af01-9af486cebeb8`，后续 receipt 必须逐字匹配。
 
 ## 4. 验证
 
