@@ -5,6 +5,10 @@
 状态：P3 10k 已完成并通过独立复核；30k、causal、多 seed 与 update-matched
 Audio-only 对照尚未完成。本文是中期报告，不是最终冠军结论。
 
+执行更新：首条 30k continuation 遇到新的外部 GPU PID 后，所有权 watchdog 已在
+精确 18k checkpoint 安全停止。恢复 supervisor、后续 causal/multi-seed relay 及
+Audio-only 公平基线 relay 均已重新排队，不会复用受污染的非精确进度。
+
 ## 1. 结论摘要
 
 1. `cross_attention_masks/lambda_lre=0.01` 与
@@ -129,3 +133,10 @@ Mono 的 LRE/ILD/IPD 不能单独作为空间正确性的目标：把左右通�
 
 在这些证据齐全前，当前最强表述只能是：Query P1/0.02 是 10k 阶段综合趋势最好的
 条件候选；尚未证明它在全部指标或统计意义上超过 Audio-only。
+
+Audio-only 两份正式 manifest 已生成并通过冻结 loader：seed42 confirmation 为
+2 runs，SHA-256
+`5ff107105afdb699fe844d36f76a1a02b44bfb640686cd063069a2c624b1ca2b`；seed17/73
+robustness 为 4 runs，SHA-256
+`503c711a1560411e2642cf44e25d0674c496d6769fc5b0212283a4a08c8012b0`。它们仍属于
+待执行证据，不能因 manifest 已就绪而标记为实验完成。
