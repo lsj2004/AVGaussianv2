@@ -864,6 +864,264 @@ def verify_resume_artifacts(
                 raise BenchmarkResumeError("artifact transaction hash mismatch")
 
 
+def _safe_interrupted_temporary(path: Path) -> None:
+    metadata = path.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+    ):
+        raise BenchmarkResumeError(
+            f"unsafe interrupted checkpoint temporary: {path.name}"
+        )
+
+
+def _remove_atomic_temporaries(directory: Path, target: str) -> None:
+    matches = tuple(directory.glob(f".{target}.*.tmp"))
+    if len(matches) > 1:
+        raise BenchmarkResumeError(
+            f"ambiguous interrupted checkpoint temporaries for {target}"
+        )
+    for temporary in matches:
+        _safe_interrupted_temporary(temporary)
+        temporary.unlink()
+
+
+def recover_interrupted_checkpoint_transaction(
+    output: Path,
+    *,
+    worker_manifest: Mapping[str, object],
+    stop_after_main_step: int | None = None,
+) -> bool:
+    """Recover one crash-interrupted rolling-checkpoint publication.
+
+    The caller must hold the worker output's exclusive lock.  The checkpoint I/O
+    sidecar is the durable commit record.  A single safe tail checkpoint may be
+    either promoted (normal/final training) or discarded when it coincides with
+    a requested pause boundary, which must be replayed so the normal paused
+    result is published.
+    """
+
+    output = Path(output)
+    try:
+        verify_resume_artifacts(output, worker_manifest=worker_manifest)
+        return False
+    except BenchmarkResumeError as error:
+        if str(error) != "committed rolling checkpoint inventory mismatch":
+            raise
+
+    training = BenchmarkConfig.from_mapping(worker_manifest.get("training"))
+    compatibility_value = worker_manifest.get("compatibility")
+    compatibility = BenchmarkCompatibility.from_mapping(compatibility_value)
+    contract = json.loads((output / "contract.json").read_text(encoding="utf-8"))
+    fingerprint = contract.get("fingerprint") if isinstance(contract, Mapping) else None
+    if (
+        not isinstance(fingerprint, Mapping)
+        or set(fingerprint) != {"sha256", "inputs"}
+        or contract.get("compatibility") != compatibility_value
+        or contract.get("shared_indices") != worker_manifest.get("shared_indices")
+    ):
+        raise BenchmarkResumeError("benchmark contract/fingerprint mismatch")
+    fingerprint_sha256 = fingerprint.get("sha256")
+    if not isinstance(fingerprint_sha256, str):
+        raise BenchmarkResumeError("benchmark fingerprint mismatch")
+    progress = json.loads((output / "progress.json").read_text(encoding="utf-8"))
+    if not isinstance(progress, Mapping):
+        raise BenchmarkResumeError("progress journal metadata mismatch")
+    sidecar_io, committed = _load_io_sidecar(
+        output, fingerprint_sha256=fingerprint_sha256
+    )
+    checkpoints = output / "checkpoints"
+    actual = {path.name: path for path in checkpoints.iterdir()}
+    if not set(committed).issubset(actual):
+        raise BenchmarkResumeError("committed rolling checkpoint inventory mismatch")
+    extras = set(actual) - set(committed)
+    if len(extras) != 1:
+        raise BenchmarkResumeError("ambiguous interrupted checkpoint transaction")
+    for name, digest in committed.items():
+        path = actual[name]
+        _safe_interrupted_temporary(path)
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise BenchmarkResumeError(f"committed checkpoint hash mismatch: {name}")
+
+    tail_name = extras.pop()
+    tail = actual[tail_name]
+    _safe_interrupted_temporary(tail)
+    try:
+        payload = torch.load(tail, map_location="cpu", weights_only=True)
+    except Exception as error:
+        raise BenchmarkResumeError(
+            f"cannot load interrupted checkpoint: {error}"
+        ) from error
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != _CHECKPOINT_KEYS
+        or payload.get("schema") != SCHEMA
+        or payload.get("version") != SCHEMA_VERSION
+        or payload.get("fingerprint") != fingerprint
+        or payload.get("compatibility") != compatibility_value
+        or payload.get("stage") not in {"warmup", "main"}
+    ):
+        raise BenchmarkResumeError("interrupted checkpoint schema/fingerprint mismatch")
+    stage = str(payload["stage"])
+    warmup_step = _require_int("warmup_step", payload.get("warmup_step"))
+    main_step = _require_int("main_step", payload.get("main_step"))
+    step = warmup_step if stage == "warmup" else main_step
+    expected_warmup = (
+        training.conditioner_warmup_steps
+        if compatibility.mode == BenchmarkMode.JOINT_CONDITIONED.value
+        else 0
+    )
+    if (
+        tail_name != f"{stage}_step_{step:06d}.pt"
+        or (stage == "warmup" and (main_step != 0 or warmup_step > expected_warmup))
+        or (
+            stage == "main"
+            and (warmup_step != expected_warmup or main_step > training.main_updates)
+        )
+        or not isinstance(progress.get(f"observed_{stage}_step"), int)
+        or progress[f"observed_{stage}_step"] > step
+        or step - progress[f"observed_{stage}_step"] > training.journal_every
+    ):
+        raise BenchmarkResumeError("interrupted checkpoint stage/step mismatch")
+    tail_io = CheckpointIO.from_mapping(payload.get("io"))
+    if not _checkpoint_is_committed(sidecar_io, tail_io):
+        raise BenchmarkResumeError("interrupted checkpoint I/O counter rollback")
+
+    journal_path = output / "artifact_journal.json"
+    if journal_path.is_file():
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        journal_hashes = (
+            journal.get("sha256") if isinstance(journal, Mapping) else None
+        )
+        if (
+            not isinstance(journal_hashes, Mapping)
+            or journal.get("schema") != f"{SCHEMA}.artifact-journal"
+            or journal.get("version") != SCHEMA_VERSION
+            or journal.get("fingerprint_sha256") != fingerprint_sha256
+        ):
+            raise BenchmarkResumeError("artifact transaction journal mismatch")
+    else:
+        journal_hashes = {}
+    for relative, digest in journal_hashes.items():
+        relative_path = Path(relative) if isinstance(relative, str) else Path("/")
+        artifact = output / relative_path
+        try:
+            metadata = artifact.lstat()
+        except OSError:
+            metadata = None
+        if (
+            not isinstance(relative, str)
+            or relative.startswith("/")
+            or ".." in relative_path.parts
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            or metadata is None
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or hashlib.sha256(artifact.read_bytes()).hexdigest() != digest
+        ):
+            raise BenchmarkResumeError("artifact transaction hash mismatch")
+
+    publication_targets: list[Path] = []
+    if stage == "main" and step in training.milestones:
+        publication_targets.append(output / "milestones" / f"step_{step:06d}.pt")
+    if stage == "main" and step == training.main_updates:
+        publication_targets.append(output / "final.pt")
+    for target in publication_targets:
+        relative = target.relative_to(output).as_posix()
+        if relative in journal_hashes:
+            raise BenchmarkResumeError(
+                "artifact journal committed an uncommitted checkpoint publication"
+            )
+        _remove_atomic_temporaries(target.parent, target.name)
+    _remove_atomic_temporaries(checkpoints, tail_name)
+    for target in ("checkpoint_io.json", "progress.json", "artifact_journal.json"):
+        _remove_atomic_temporaries(output, target)
+
+    rollback_for_pause = (
+        stage == "main"
+        and stop_after_main_step is not None
+        and step >= stop_after_main_step
+    )
+    if rollback_for_pause:
+        tail.unlink()
+        for target in publication_targets:
+            if target.exists():
+                _safe_interrupted_temporary(target)
+                target.unlink()
+        repaired_progress = dict(progress)
+        committed_stage_steps = [
+            int(name.removesuffix(".pt").rsplit("_", 1)[1])
+            for name in committed
+            if name.startswith(f"{stage}_step_")
+        ]
+        repaired_progress[f"exact_{stage}_step"] = max(
+            committed_stage_steps, default=0
+        )
+        if repaired_progress != progress:
+            data = _json_bytes(repaired_progress)
+            sidecar_io.journal_bytes += _atomic_bytes(output / "progress.json", data)
+            sidecar_io.journal_writes += 1
+            _persist_io_sidecar(
+                output,
+                fingerprint_sha256,
+                sidecar_io,
+                committed_checkpoints=committed,
+            )
+        verify_resume_artifacts(output, worker_manifest=worker_manifest)
+        return True
+
+    authoritative = tail.read_bytes()
+    digest = hashlib.sha256(authoritative).hexdigest()
+    for target in publication_targets:
+        if target.exists():
+            _safe_interrupted_temporary(target)
+            if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+                raise BenchmarkResumeError(
+                    f"interrupted checkpoint publication mismatch: {target.name}"
+                )
+        else:
+            _atomic_bytes(target, authoritative)
+
+    periodic = sorted(
+        actual.values(),
+        key=lambda path: (
+            path.name.startswith("main_"),
+            int(path.stem.rsplit("_", 1)[1]),
+        ),
+    )
+    for stale in periodic[:-2]:
+        stale.unlink()
+    retained = periodic[-2:]
+    committed = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in retained
+    }
+    _persist_io_sidecar(
+        output,
+        fingerprint_sha256,
+        tail_io,
+        committed_checkpoints=committed,
+    )
+    repaired_progress = dict(progress)
+    repaired_progress[f"observed_{stage}_step"] = step
+    repaired_progress[f"exact_{stage}_step"] = step
+    if repaired_progress != progress:
+        data = _json_bytes(repaired_progress)
+        tail_io.journal_bytes += _atomic_bytes(output / "progress.json", data)
+        tail_io.journal_writes += 1
+        _persist_io_sidecar(
+            output,
+            fingerprint_sha256,
+            tail_io,
+            committed_checkpoints=committed,
+        )
+    verify_resume_artifacts(output, worker_manifest=worker_manifest)
+    return True
+
+
 def _progress_allows_fresh_resume(
     output: Path,
     *,
@@ -1660,6 +1918,8 @@ class FixedBudgetTrainer:
                 io_counters=io_counters,
             )
 
+        durable_warmup_step = warmup_step
+        durable_main_step = main_step
         if stage == "warmup":
             configure_benchmark_mode(model, resolved_mode, "warmup")
             if optimizer is None:
@@ -1696,6 +1956,10 @@ class FixedBudgetTrainer:
                     contrast_sample=contrast_sample,
                 )
                 warmup_step += 1
+                checkpoint_due = (
+                    warmup_step % self.config.checkpoint_every == 0
+                    or warmup_step == self.config.conditioner_warmup_steps
+                )
                 if (
                     warmup_step % self.config.journal_every == 0
                     or warmup_step == self.config.conditioner_warmup_steps
@@ -1705,16 +1969,12 @@ class FixedBudgetTrainer:
                         stage="warmup",
                         observed_warmup_step=warmup_step,
                         observed_main_step=0,
-                        exact_warmup_step=warmup_step
-                        - warmup_step % self.config.checkpoint_every,
+                        exact_warmup_step=durable_warmup_step,
                         exact_main_step=0,
                         fingerprint_sha256=str(fingerprint["sha256"]),
                         io_counters=io_counters,
                     )
-                if (
-                    warmup_step % self.config.checkpoint_every == 0
-                    or warmup_step == self.config.conditioner_warmup_steps
-                ):
+                if checkpoint_due:
                     payload = self._checkpoint_payload(
                         model=model,
                         optimizer=optimizer,
@@ -1736,6 +1996,7 @@ class FixedBudgetTrainer:
                         main_step=0,
                         io_counters=io_counters,
                     )
+                    durable_warmup_step = warmup_step
             stage = "main"
             optimizer = None
 
@@ -1808,28 +2069,29 @@ class FixedBudgetTrainer:
             else:
                 _visual_only_step(model, sample, optimizer, train_config, visual_anchor)
             main_step = next_step
+            milestone = main_step in self.config.milestones
+            requested_stop = stop_after_main_step == main_step
+            checkpoint_due = (
+                main_step % self.config.checkpoint_every == 0
+                or milestone
+                or requested_stop
+            )
             if (
                 main_step % self.config.journal_every == 0
                 or main_step == self.config.main_updates
+                or requested_stop
             ):
                 self._write_journal(
                     output,
                     stage="main",
                     observed_warmup_step=warmup_step,
                     observed_main_step=main_step,
-                    exact_warmup_step=warmup_step,
-                    exact_main_step=main_step
-                    - main_step % self.config.checkpoint_every,
+                    exact_warmup_step=durable_warmup_step,
+                    exact_main_step=durable_main_step,
                     fingerprint_sha256=str(fingerprint["sha256"]),
                     io_counters=io_counters,
                 )
-            milestone = main_step in self.config.milestones
-            requested_stop = stop_after_main_step == main_step
-            if (
-                main_step % self.config.checkpoint_every == 0
-                or milestone
-                or requested_stop
-            ):
+            if checkpoint_due:
                 payload = self._checkpoint_payload(
                     model=model,
                     optimizer=optimizer,
@@ -1855,6 +2117,7 @@ class FixedBudgetTrainer:
                     final=main_step == self.config.main_updates,
                     io_counters=io_counters,
                 )
+                durable_main_step = main_step
                 if milestone:
                     self._write_artifact_journal(
                         output,
@@ -1867,8 +2130,8 @@ class FixedBudgetTrainer:
                     stage="main",
                     observed_warmup_step=warmup_step,
                     observed_main_step=main_step,
-                    exact_warmup_step=warmup_step,
-                    exact_main_step=main_step,
+                    exact_warmup_step=durable_warmup_step,
+                    exact_main_step=durable_main_step,
                     fingerprint_sha256=str(fingerprint["sha256"]),
                     io_counters=io_counters,
                 )

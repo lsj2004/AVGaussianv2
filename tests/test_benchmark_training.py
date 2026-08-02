@@ -5,7 +5,7 @@ import hashlib
 import json
 import random
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import numpy as np
 import pytest
@@ -23,6 +23,7 @@ from avgaussianv2.benchmark.training import (
     configure_benchmark_mode,
     hash_shared_indices,
     make_shared_indices,
+    recover_interrupted_checkpoint_transaction,
     verify_resume_artifacts,
 )
 from avgaussianv2.config import TrainConfig
@@ -584,6 +585,114 @@ def test_atomic_final_milestones_retention_and_io_counters(tmp_path) -> None:
     assert result.io.checkpoint_bytes > 0
     assert result.io.journal_writes >= 6
     assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_interrupted_final_checkpoint_transaction_is_promoted_without_retraining(
+    tmp_path, monkeypatch
+) -> None:
+    config = tiny_config()
+    original_atomic = benchmark_training._atomic_bytes
+
+    def interrupt_final(path, data):
+        if path.name == "final.pt":
+            (path.parent / ".final.pt.injected.tmp").write_bytes(data)
+            raise RuntimeError("injected final publication interruption")
+        return original_atomic(path, data)
+
+    monkeypatch.setattr(benchmark_training, "_atomic_bytes", interrupt_final)
+    with pytest.raises(RuntimeError, match="injected final"):
+        run(tmp_path, BenchmarkMode.AUDIO_ONLY, config=config)
+    progress = json.loads((tmp_path / "progress.json").read_text())
+    assert progress["observed_main_step"] == 6
+    assert progress["exact_main_step"] == 4
+    assert (tmp_path / "checkpoints/main_step_000006.pt").is_file()
+    assert (tmp_path / ".final.pt.injected.tmp").is_file()
+
+    monkeypatch.setattr(benchmark_training, "_atomic_bytes", original_atomic)
+    indices = (0, 1, 2, 0, 1, 2)
+    manifest = {
+        "training": {**asdict(config), "milestones": list(config.milestones)},
+        "compatibility": compatibility(
+            BenchmarkMode.AUDIO_ONLY, indices
+        ).to_mapping(),
+        "shared_indices": list(indices),
+    }
+    original_validate = BenchmarkConfig.validate
+    monkeypatch.setattr(
+        BenchmarkConfig,
+        "validate",
+        lambda self, strict_protocol=True: original_validate(
+            self, strict_protocol=False
+        ),
+    )
+    assert recover_interrupted_checkpoint_transaction(
+        tmp_path, worker_manifest=manifest
+    )
+    verify_resume_artifacts(tmp_path, worker_manifest=manifest)
+    assert json.loads((tmp_path / "progress.json").read_text())["exact_main_step"] == 6
+    assert not list(tmp_path.rglob("*.tmp"))
+
+    monkeypatch.setattr(BenchmarkConfig, "validate", original_validate)
+    _, _, result = run(
+        tmp_path, BenchmarkMode.AUDIO_ONLY, resume=True, config=config
+    )
+    assert result.resumed_from_main_step == 6
+    assert result.redone_main_updates == 0
+    assert result.selection == "final"
+
+
+def test_interrupted_pause_checkpoint_transaction_rolls_back_for_exact_replay(
+    tmp_path, monkeypatch
+) -> None:
+    config = tiny_config()
+    original_atomic = benchmark_training._atomic_bytes
+
+    def interrupt_milestone(path, data):
+        if path.name == "step_000004.pt":
+            (path.parent / ".step_000004.pt.injected.tmp").write_bytes(data)
+            raise RuntimeError("injected pause publication interruption")
+        return original_atomic(path, data)
+
+    monkeypatch.setattr(benchmark_training, "_atomic_bytes", interrupt_milestone)
+    with pytest.raises(RuntimeError, match="injected pause"):
+        run(tmp_path, BenchmarkMode.AUDIO_ONLY, stop=4, config=config)
+    monkeypatch.setattr(benchmark_training, "_atomic_bytes", original_atomic)
+    indices = (0, 1, 2, 0, 1, 2)
+    manifest = {
+        "training": {**asdict(config), "milestones": list(config.milestones)},
+        "compatibility": compatibility(
+            BenchmarkMode.AUDIO_ONLY, indices
+        ).to_mapping(),
+        "shared_indices": list(indices),
+    }
+    original_validate = BenchmarkConfig.validate
+    monkeypatch.setattr(
+        BenchmarkConfig,
+        "validate",
+        lambda self, strict_protocol=True: original_validate(
+            self, strict_protocol=False
+        ),
+    )
+    assert recover_interrupted_checkpoint_transaction(
+        tmp_path,
+        worker_manifest=manifest,
+        stop_after_main_step=4,
+    )
+    verify_resume_artifacts(tmp_path, worker_manifest=manifest)
+    assert not (tmp_path / "checkpoints/main_step_000004.pt").exists()
+    assert not list(tmp_path.rglob("*.tmp"))
+
+    monkeypatch.setattr(BenchmarkConfig, "validate", original_validate)
+    _, _, result = run(
+        tmp_path,
+        BenchmarkMode.AUDIO_ONLY,
+        resume=True,
+        stop=4,
+        config=config,
+    )
+    assert result.resumed_from_main_step == 2
+    assert result.completed_main_updates == 4
+    assert result.selection == "paused"
 
 
 def test_resume_fails_closed_on_fingerprint_change(tmp_path) -> None:

@@ -72,6 +72,7 @@ from avgaussianv2.benchmark.training import (
     BenchmarkConfig,
     BenchmarkMode,
     FixedBudgetTrainer,
+    recover_interrupted_checkpoint_transaction,
 )
 from avgaussianv2.data.tensor import DeviceSampleSequence
 
@@ -187,6 +188,12 @@ def run_worker(
     indices = tuple(raw["shared_indices"])
     original_output = Path(output_dir)
     with BenchmarkOutputLock(original_output) as pinned_output:
+        if resume:
+            recover_interrupted_checkpoint_transaction(
+                pinned_output,
+                worker_manifest=raw,
+                stop_after_main_step=stop_after_step,
+            )
         validate_output_children(pinned_output)
         # Seed before importing/constructing any production model or dataset state.
         _seed_everything(config.seed)
