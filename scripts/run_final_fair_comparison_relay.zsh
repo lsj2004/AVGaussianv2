@@ -13,8 +13,9 @@ audio_run_token=$3
 report_root=$4
 formal_root=$5
 
-expected_report_commit=912b08b12dfeaeda2fa9095c7e7ea0ab0e4cef36
+expected_report_commit=d39c81e052e4908850bf57455db3a0ea325f4dd5
 expected_builder_sha256=bdf2ed0e2838b9866b42194592828d3b7515da8d4919256bce507a031e65c31a
+expected_figure_renderer_sha256=be5918bb1cabba9829a6fdc6aa3160f707ef8e2b96c6ffe3d15b5268ddcbb03c
 run_root=$formal_root/runs/lre_loss_ablation_visual_time_v3
 result_root=$formal_root/results/lre_loss_ablation_visual_time_v3
 gate_30k=$result_root/p3_30k_gate.json
@@ -37,8 +38,10 @@ expected_reference_verification_sha256=38aab786429fe56e4d73f163de9e7a1059f0c4d09
 audio_receipt=$result_root/audio_only_pipeline_receipt.json
 output_json=$result_root/final_fair_comparison.json
 output_markdown=$result_root/FINAL_FAIR_COMPARISON.zh-CN.md
+figure_dir=$result_root/final_figures
 python_executable=/mnt/sda/lisujing/Dataset/FreeTimeGSPlusPlus/.venv/bin/python
 builder=$report_root/scripts/build_final_fair_comparison.py
+figure_renderer=$report_root/scripts/render_final_fair_comparison_svg.py
 log=/tmp/avgf-final-report-after-audio-baseline.log
 
 log_event() {
@@ -49,11 +52,13 @@ cd "$report_root" || exit 2
 observed_dirty=$(git status --porcelain --untracked-files=normal)
 observed_head=$(git rev-parse HEAD)
 observed_builder_sha256=$(sha256sum "$builder" | cut -d' ' -f1)
-log_event "relay_started upstream_pid=$upstream_pid audio_run_token=$audio_run_token report_commit=$observed_head dirty_length=${#observed_dirty} builder_sha256=$observed_builder_sha256"
+observed_figure_renderer_sha256=$(sha256sum "$figure_renderer" | cut -d' ' -f1)
+log_event "relay_started upstream_pid=$upstream_pid audio_run_token=$audio_run_token report_commit=$observed_head dirty_length=${#observed_dirty} builder_sha256=$observed_builder_sha256 figure_renderer_sha256=$observed_figure_renderer_sha256"
 if [[ -n "$observed_dirty" ]] \
   || [[ "$observed_head" != "$expected_report_commit" ]] \
-  || [[ "$observed_builder_sha256" != "$expected_builder_sha256" ]]; then
-  log_event "report_builder_identity_failed expected_commit=$expected_report_commit expected_builder_sha256=$expected_builder_sha256"
+  || [[ "$observed_builder_sha256" != "$expected_builder_sha256" ]] \
+  || [[ "$observed_figure_renderer_sha256" != "$expected_figure_renderer_sha256" ]]; then
+  log_event "report_builder_identity_failed expected_commit=$expected_report_commit expected_builder_sha256=$expected_builder_sha256 expected_figure_renderer_sha256=$expected_figure_renderer_sha256"
   exit 3
 fi
 
@@ -141,3 +146,19 @@ if (( status_code != 0 )); then
   exit 10
 fi
 log_event "final_report_complete json_sha256=$(sha256sum "$output_json" | cut -d' ' -f1) markdown_sha256=$(sha256sum "$output_markdown" | cut -d' ' -f1)"
+
+PYTHONDONTWRITEBYTECODE=1 \
+  "$python_executable" "$figure_renderer" \
+  --report "$output_json" --output-dir "$figure_dir" >> "$log" 2>&1
+status_code=$?
+if (( status_code != 0 )); then
+  log_event "final_figures_failed status=$status_code"
+  exit 11
+fi
+for figure in strict-model-metric-ratios.svg absolute-reference-ratios.svg p2-architecture-resource-pareto.svg; do
+  if [[ ! -s "$figure_dir/$figure" ]]; then
+    log_event "final_figure_missing path=$figure_dir/$figure"
+    exit 12
+  fi
+done
+log_event "final_figures_complete strict_sha256=$(sha256sum "$figure_dir/strict-model-metric-ratios.svg" | cut -d' ' -f1) reference_sha256=$(sha256sum "$figure_dir/absolute-reference-ratios.svg" | cut -d' ' -f1) resource_sha256=$(sha256sum "$figure_dir/p2-architecture-resource-pareto.svg" | cut -d' ' -f1)"

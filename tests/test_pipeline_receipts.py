@@ -60,6 +60,12 @@ def test_final_relay_requires_exact_audio_receipt_token_and_hashes() -> None:
     assert '--architecture-report "$architecture_report"' in text
     assert '--parameter-audit "$parameter_audit"' in text
     assert '--resource-report "$resource_report"' in text
+    assert "expected_figure_renderer_sha256" in text
+    assert "render_final_fair_comparison_svg.py" in text
+    assert 'final_figures_complete strict_sha256=' in text
+    assert "strict-model-metric-ratios.svg" in text
+    assert "absolute-reference-ratios.svg" in text
+    assert "p2-architecture-resource-pareto.svg" in text
     assert "expected_reference_aggregate_sha256" in text
     assert "expected_reference_verification_sha256" in text
     assert "p2_reference_root_hash_mismatch" in text
