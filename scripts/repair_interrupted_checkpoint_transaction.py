@@ -90,7 +90,9 @@ def main() -> int:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     script_path = Path(__file__).resolve()
     training_path = repository / "avgaussianv2/benchmark/training.py"
-    identity = repository_identity(repository)
+    identity = repository_identity()
+    if Path(str(identity.get("root"))).resolve() != repository:
+        raise RuntimeError("recovery tool repository identity mismatch")
 
     with BenchmarkOutputLock(worker) as pinned:
         before = _snapshot(pinned)
