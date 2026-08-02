@@ -5,10 +5,10 @@
 当前状态：P2 的 32/32 个 5k run、8/8 个 test-retest run 和 P3 的 8/8 个 10k
 continuation 均已完成并独立复核。P3 10k 门禁保留
 `cross_attention_masks/lambda_lre=0.01` 与
-`query_dependent_p1/lambda_lre=0.02`。首条 30k continuation 已训练、发布、评测并由
-冻结 verifier 独立复核；第二条
-`cross_attention_masks/Scene7playing/seed42/lambda_lre=0` 在 2026-08-03 06:31 达到
-精确 22k，其余六条保持精确 10k continuation。GPU 所有权 watchdog 与污染恢复
+`query_dependent_p1/lambda_lre=0.02`。前两条 30k continuation（cross-attention 的
+lambda=0、两个场景）均已训练、发布、评测并由冻结 verifier 独立复核；第三条
+`cross_attention_masks/scene1_opera/seed42/lambda_lre=0.01` 正从精确 10k 续训，
+其余五条保持精确 10k continuation。GPU 所有权 watchdog 与污染恢复
 supervisor 持续运行：GPU 1 当前承担正式训练，GPU 2 被外部任务高利用率占用时不抢占、
 不混跑。
 本文同时保留最初预注册规则与执行后修订，不能把探索性扩展事后表述成预注册实验。
@@ -164,10 +164,10 @@ evaluator 现在也会在昂贵计算前创建输出父目录。
 | 正式主评测 DPAM | 双运行时 130 样本 smoke 通过 | 全量测试复核 |
 | P1 自动化筛选 | fail-closed selector 与生成器绑定已实现 | 全量测试复核 |
 | frozen 正式代码质量 | 400 项 pytest、全仓 Ruff、diff-check 通过 | 已完成 |
-| post-freeze 流水线修复 | 最新 446/446 pytest、全仓 Ruff、diff-check 通过 | P3 后再做最终合并 review |
+| post-freeze 流水线修复 | 最新 448/448 pytest、全仓 Ruff、format、zsh、diff-check 通过 | P3 后再做最终合并 review |
 | P2 主矩阵 | 32/32 5k + 8/8 test-retest，均独立复核 | 已完成 |
 | P3 10k | 8/8 continuation，门禁与独立复核通过 | 已完成 |
-| P3 30k / causal / seeds | 1/8 完整验证；第二条精确 22k；其余六条精确 10k | 依门禁顺序继续 |
+| P3 30k / causal / seeds | 2/8 完整验证；第三条正在从 10k 续训；其余五条精确 10k | 依门禁顺序继续 |
 | update-matched Audio-only 闭环 | 2-run confirmation 与 4-run robustness manifest 已生成并由 frozen loader 验证 | P3 候选链结束后自动执行 |
 
 正式训练 Python 没有 `cdpam`；已有 CDPAM 环境又没有 `gsplat/tinycudann`。主评测因此
@@ -547,3 +547,7 @@ verify-only 的 14MiB/数十秒误作训练成本。
 不能仅凭一个场景、一个 5k 波动或 CI 跨零的均值差自动淘汰。最终交付必须包含冻结
 manifest、逐样本结果、per-scene/macro/micro/跨 seed 统计、横向表、纵向曲线、Pareto
 图、资源报告、淘汰原因和一条命令可复核的 verifier 入口。
+
+逐要求状态、证据路径与完成判定维护在
+`docs/2026-08-03-experiment-completion-audit.zh-CN.md`；该审计是目标完成声明的前置证据，
+不得用局部阶段成功替代。
