@@ -72,3 +72,11 @@ pending 路径，成功后才提升到正式路径，避免失败尝试覆盖权
 - Zsh 语法：三个 relay 全部通过；
 - Ruff：通过；
 - 完整测试集：446/446 通过。
+
+此外，冻结工具对既有真实
+`query_dependent_p1_no_rgbd / scene1_opera / seed42 / step5k` counterfactual smoke
+执行 strict verify-only：130/130 样本通过；checkpoint SHA-256 为
+`5ba28978b7076c708b20d9827588286c0c72d8597c7da76d4d5869176af3f6eb`，evaluation
+content SHA-256 为
+`8f4262e1bba61f44cf9658a6df3968f13f33a0abee5d44f7c2d20c8c20a95cff`。这验证了严格
+loader 对实际 `no_rgbd` 分支的目录、身份和训练证据映射，而不只是 mock 接口。
