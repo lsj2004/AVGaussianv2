@@ -480,8 +480,11 @@ results/lre_loss_ablation_visual_time_v3/recovery/cross_attention_masks__scene1_
 
 报告 SHA-256 为
 `00699e282b17852b65120e155c4d8fdff4700efbc2be42fd63c55e259a64fb2b`，
-并已由冻结 `98d158e4` verifier 独立复核通过。该 run 仍需在 clean GPU 窗口发布
-`artifact_hashes.json` 并完成 30k evaluation 后，才能计入 30k 的 `1/8`。
+并已由冻结 `98d158e4` verifier 独立复核通过。恢复当时，该 run 仍需在 clean GPU 窗口发布
+`artifact_hashes.json` 并完成 30k evaluation 后，才能计入 30k 的 `1/8`。上述后续步骤
+已于 2026-08-03 05:21 完成：130 个 held-out 样本的 evaluation content SHA-256 为
+`93f3f9e377d45df751ee0cc1709b2683ab688e77c17f3269332cae44be7a733d`，冻结 verifier
+再次独立通过，因此当前正式进度为 `1/8`。
 
 ## 9. 产物与停止规则
 

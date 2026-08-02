@@ -81,5 +81,8 @@ checkpoint；同时原子写留下的临时文件会被严格 output inventory �
 results/lre_loss_ablation_visual_time_v3/recovery/cross_attention_masks__scene1_opera__seed42__lre0000__step030000.json
 ```
 
-该恢复只完成训练事务封装。只有后续 `artifact_hashes.json` 与 30k evaluation 都通过
-verifier 后，该 run 才能计为 P3 30k 完成。
+恢复后的 worker 已发布 `artifact_hashes.json`，并在 GPU1 完成 30k evaluation：130 个
+held-out 样本，content SHA-256 为
+`93f3f9e377d45df751ee0cc1709b2683ab688e77c17f3269332cae44be7a733d`。冻结
+`98d158e4` verifier 独立通过，run result 状态为 `succeeded`，因此该 run 已正式计入
+P3 30k 的 `1/8`。
