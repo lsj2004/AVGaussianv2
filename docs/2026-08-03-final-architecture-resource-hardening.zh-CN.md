@@ -62,5 +62,7 @@ relay 只有在 Audio-only receipt、P3 gate、manifest、P2 reference 根和架
 匹配时才会发布最终 JSON/Markdown。
 
 定向测试覆盖正常验证、架构篡改拒绝、Markdown 架构段、no-finalist 路径和 relay 静态
-合同。正式 relay 的 builder commit/SHA 将在全量测试后重新冻结并部署；部署只替换等待
+合同。全量回归为 `448 passed`，Ruff、格式、zsh 语法和正式产物预检均通过。报告构建器
+冻结于 commit `912b08b12dfeaeda2fa9095c7e7ea0ab0e4cef36`，文件 SHA-256 为
+`bdf2ed0e2838b9866b42194592828d3b7515da8d4919256bce507a031e65c31a`。部署只替换等待
 会话，不影响正在运行的 P3 训练和既有上游 receipt token。

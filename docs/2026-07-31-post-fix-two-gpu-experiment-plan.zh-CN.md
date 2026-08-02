@@ -521,6 +521,9 @@ GPU-hour。资源统计必须明确标注为 5k screening，不能外推为 30k 
 复核 repository、schema、指针哈希、canonical architecture signature、4×2 参数矩阵、
 4×4×2 资源矩阵和聚合算术，finalist/no-finalist 两条路径均 fail closed。实现与验证记录
 见 `docs/2026-08-03-final-architecture-resource-hardening.zh-CN.md`。
+该实现已在 `912b08b12dfeaeda2fa9095c7e7ea0ab0e4cef36` 冻结，builder SHA-256 为
+`bdf2ed0e2838b9866b42194592828d3b7515da8d4919256bce507a031e65c31a`；全量回归
+`448 passed`。
 
 ## 9. 产物与停止规则
 
