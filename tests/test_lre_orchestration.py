@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from avgaussianv2.benchmark.lre_orchestration import (
+    assert_gpu_process_ownership,
     build_lre_pipelines,
     execute_lre_pipelines,
     load_lre_run_manifest,
@@ -84,6 +85,8 @@ def _native_root(tmp_path: Path) -> Path:
 
 
 class _Handle:
+    pid = 100
+
     def poll(self):
         return 0
 
@@ -349,6 +352,92 @@ def test_lre_gpu_preflight_rejects_live_compute_pid_but_ignores_stale_nvml():
     )
     assert accepted[2]["uuid"] == "GPU-2"
     assert accepted[2]["compute_pids"] == []
+
+
+def test_runtime_gpu_ownership_accepts_descendants_and_rejects_foreign_pid():
+    class Handle:
+        pid = 100
+
+    table = {
+        100: (1, "S", 10),
+        101: (100, "S", 11),
+        102: (101, "S", 12),
+        999: (1, "S", 13),
+    }
+
+    def query(stdout):
+        def run(*args, **kwargs):
+            del args, kwargs
+            return subprocess.CompletedProcess([], 0, stdout, "")
+
+        return run
+
+    status = {1: {"uuid": "GPU-1"}}
+    assert_gpu_process_ownership(
+        {1: Handle()},
+        status,
+        command_runner=query("102, GPU-1\n888, GPU-1\n"),
+        process_table_getter=lambda: table,
+    )
+
+    with pytest.raises(OrchestrationError, match="foreign live process"):
+        assert_gpu_process_ownership(
+            {1: Handle()},
+            status,
+            command_runner=query("999, GPU-1\n"),
+            process_table_getter=lambda: table,
+        )
+
+
+def test_runtime_gpu_ownership_failure_terminates_all_active_pipelines(tmp_path):
+    _, manifest = _manifest(tmp_path)
+    pipelines = build_lre_pipelines(
+        manifest,
+        output_root=tmp_path / "runs",
+        native_root=_native_root(tmp_path),
+        python_executable="python",
+        compute_dpam=False,
+        trust_upstream_artifacts=True,
+        resume=False,
+    )
+
+    class PendingHandle(_PendingHandle):
+        def __init__(self, pid):
+            self.pid = pid
+            self.terminate_calls = 0
+            self.kill_calls = 0
+
+        def terminate(self):
+            self.terminate_calls += 1
+
+        def kill(self):
+            self.kill_calls += 1
+
+    class PendingRunner:
+        assignments = []
+
+        def __init__(self):
+            self.handles = []
+
+        def start(self, command, *, env, log_path):
+            del command, env, log_path
+            handle = PendingHandle(200 + len(self.handles))
+            self.handles.append(handle)
+            return handle
+
+    runner = PendingRunner()
+    with pytest.raises(OrchestrationError, match="contamination"):
+        execute_lre_pipelines(
+            pipelines,
+            gpus=(1, 2),
+            runner=runner,
+            poll_seconds=0,
+            ownership_checker=lambda _active: (_ for _ in ()).throw(
+                OrchestrationError("GPU contamination")
+            ),
+        )
+    assert [handle.terminate_calls for handle in runner.handles] == [1, 1]
+    assert [handle.kill_calls for handle in runner.handles] == [1, 1]
 
 
 def test_lre_runner_rejects_manifest_from_another_repository_revision(tmp_path):

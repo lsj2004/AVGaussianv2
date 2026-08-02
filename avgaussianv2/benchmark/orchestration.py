@@ -284,6 +284,9 @@ def _tree_snapshot_sha256(root: Path) -> str:
 
 
 class ProcessHandle(Protocol):
+    @property
+    def pid(self) -> int: ...
+
     def wait(self, timeout: float | None = None) -> int: ...
     def poll(self) -> int | None: ...
     def terminate(self) -> None: ...
@@ -302,6 +305,10 @@ class _Handle:
     def __init__(self, process: subprocess.Popen[bytes], stream) -> None:
         self.process = process
         self.stream = stream
+
+    @property
+    def pid(self) -> int:
+        return self.process.pid
 
     def poll(self) -> int | None:
         value = self.process.poll()

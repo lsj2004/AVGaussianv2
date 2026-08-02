@@ -548,6 +548,88 @@ def sample_gpu_usage(
     return result
 
 
+def _process_table() -> dict[int, tuple[int, str, int]]:
+    result = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "stat").read_text()
+            tail = raw[raw.rfind(")") + 2 :].split()
+            result[int(entry.name)] = (int(tail[1]), tail[0], int(tail[19]))
+        except (FileNotFoundError, PermissionError, ValueError, IndexError, OSError):
+            continue
+    return result
+
+
+def _descendants(
+    table: Mapping[int, tuple[int, str, int]], root: int
+) -> set[int]:
+    owned = {root}
+    changed = True
+    while changed:
+        changed = False
+        for pid, (parent, _, _) in table.items():
+            if parent in owned and pid not in owned:
+                owned.add(pid)
+                changed = True
+    return owned
+
+
+def assert_gpu_process_ownership(
+    active: Mapping[int, ProcessHandle],
+    gpu_status: Mapping[int, Mapping[str, object]],
+    *,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    process_table_getter: Callable[
+        [], Mapping[int, tuple[int, str, int]]
+    ] = _process_table,
+) -> None:
+    completed = command_runner(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=pid,gpu_uuid",
+            "--format=csv,noheader,nounits",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    table = dict(process_table_getter())
+    owned_by_uuid = {}
+    for gpu, handle in active.items():
+        root = getattr(handle, "pid", None)
+        uuid = gpu_status.get(gpu, {}).get("uuid")
+        if not isinstance(root, int) or root <= 0 or root not in table:
+            raise OrchestrationError(
+                f"cannot bind active LRE process identity: gpu={gpu} pid={root}"
+            )
+        if not isinstance(uuid, str) or not uuid:
+            raise OrchestrationError(f"cannot bind active LRE GPU UUID: gpu={gpu}")
+        owned_by_uuid[uuid] = _descendants(table, root)
+    for line in completed.stdout.splitlines():
+        if not line.strip():
+            continue
+        fields = [value.strip() for value in line.split(",")]
+        if len(fields) != 2:
+            raise OrchestrationError("invalid runtime GPU process response")
+        try:
+            pid = int(fields[0])
+        except ValueError as error:
+            raise OrchestrationError("invalid runtime GPU process PID") from error
+        owned = owned_by_uuid.get(fields[1])
+        if owned is None:
+            continue
+        identity = table.get(pid)
+        if identity is None or identity[1] == "Z":
+            continue
+        if pid not in owned:
+            raise OrchestrationError(
+                "foreign live process detected on active LRE GPU: "
+                f"pid={pid} gpu_uuid={fields[1]}"
+            )
+
+
 def execute_lre_pipelines(
     pipelines: Sequence[LREPipeline],
     *,
@@ -555,6 +637,7 @@ def execute_lre_pipelines(
     runner: ProcessRunner | None = None,
     poll_seconds: float = 0.1,
     usage_sampler: Callable[[Sequence[int]], Mapping[int, Mapping[str, int]]] | None = None,
+    ownership_checker: Callable[[Mapping[int, ProcessHandle]], None] | None = None,
 ) -> dict[str, object]:
     runner = runner or SubprocessRunner()
     pending = list(pipelines)
@@ -562,6 +645,7 @@ def execute_lre_pipelines(
     completed = []
     usage: dict[str, dict[str, int]] = {}
     last_sample = 0.0
+    last_ownership_check = 0.0
     try:
         while pending or active:
             free = [gpu for gpu in gpus if gpu not in active]
@@ -583,6 +667,15 @@ def execute_lre_pipelines(
                     "maximum_gpu_utilization_percent": 0,
                 }
             now = time.monotonic()
+            if (
+                ownership_checker is not None
+                and active
+                and now - last_ownership_check >= 1.0
+            ):
+                ownership_checker(
+                    {gpu: item[2] for gpu, item in active.items()}
+                )
+                last_ownership_check = now
             if usage_sampler is not None and active and now - last_sample >= 1.0:
                 snapshot = usage_sampler(tuple(active))
                 for gpu, (pipeline, _, _, _) in active.items():
@@ -748,11 +841,19 @@ def run_lre_manifest(
         dpam_python=dpam_python,
     )
     try:
+        ownership_monitor_enabled = runner is None
         result = execute_lre_pipelines(
             pipelines,
             gpus=devices,
             runner=runner,
             usage_sampler=sample_gpu_usage if runner is None else None,
+            ownership_checker=(
+                lambda active: assert_gpu_process_ownership(
+                    active, gpu_status
+                )
+                if runner is None
+                else None
+            ),
         )
     except BaseException as error:
         failure = {
@@ -768,6 +869,10 @@ def run_lre_manifest(
             "stage": manifest["stage"],
             "gpus": list(devices),
             "gpu_preflight": gpu_status,
+            "gpu_ownership_monitor": {
+                "enabled": ownership_monitor_enabled,
+                "policy": "every live NVML PID must be an active-stage descendant",
+            },
         }
         _publish_runner_result(
             output_root,
@@ -786,6 +891,10 @@ def run_lre_manifest(
         repository=current_repository,
         manifest_repository=manifest_repository,
         repository_relocation=repository_relocation,
+        gpu_ownership_monitor={
+            "enabled": ownership_monitor_enabled,
+            "policy": "every live NVML PID must be an active-stage descendant",
+        },
     )
     _publish_runner_result(
         output_root,
@@ -805,4 +914,5 @@ __all__ = [
     "query_idle_gpus",
     "run_lre_manifest",
     "sample_gpu_usage",
+    "assert_gpu_process_ownership",
 ]
