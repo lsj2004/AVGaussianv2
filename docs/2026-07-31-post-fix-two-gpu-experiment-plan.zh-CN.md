@@ -524,6 +524,9 @@ GPU-hour。资源统计必须明确标注为 5k screening，不能外推为 30k 
 该实现已在 `912b08b12dfeaeda2fa9095c7e7ea0ab0e4cef36` 冻结，builder SHA-256 为
 `bdf2ed0e2838b9866b42194592828d3b7515da8d4919256bce507a031e65c31a`；全量回归
 `448 passed`。
+最终 relay 冻结于 `e6dde5659ef2de875f821637e0da5aa4a7458332`，并以
+`avgf-final-report-after-baseline-v10` 等待同一 Audio-only token；旧等待会话替换没有触碰
+P3 supervisor、训练进程或上游 receipt。
 
 ## 9. 产物与停止规则
 
