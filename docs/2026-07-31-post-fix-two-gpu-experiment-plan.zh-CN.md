@@ -508,6 +508,20 @@ results/lre_loss_ablation_visual_time_v3/recovery/cross_attention_masks__scene1_
 `93f3f9e377d45df751ee0cc1709b2683ab688e77c17f3269332cae44be7a733d`，冻结 verifier
 再次独立通过，因此当前正式进度为 `1/8`。
 
+### 最终架构、参数与资源证据
+
+最终公平报告除两张指标榜外，还必须加载并严格复核 P2 的
+`architecture_config_report.json`、`p2_cuda_parameter_audit.json` 和
+`p2_resource_report.json`。正式报告必须同时给出四架构完整 active hyperparameters、
+架构签名、worker/evaluation identity、两个场景的 total/trainable/optimizer-active/
+dormant/orphan/frozen 参数范围，以及 P2 5k 峰值显存、利用率、平均流水线时长和总
+GPU-hour。资源统计必须明确标注为 5k screening，不能外推为 30k 成本。
+
+三份正式证据根分别为 `dc4bb138...`、`85299ea4...`、`4db3fbc9...`；报告生成器会
+复核 repository、schema、指针哈希、canonical architecture signature、4×2 参数矩阵、
+4×4×2 资源矩阵和聚合算术，finalist/no-finalist 两条路径均 fail closed。实现与验证记录
+见 `docs/2026-08-03-final-architecture-resource-hardening.zh-CN.md`。
+
 ## 9. 产物与停止规则
 
 每个结果必须绑定 clean Git commit、config/manifest/sample-sequence/checkpoint SHA-256、

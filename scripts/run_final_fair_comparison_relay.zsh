@@ -23,9 +23,15 @@ candidate_seeds=$formal_root/configs/generated/lre_loss_ablation_p3/robustness_s
 audio_main=$formal_root/configs/generated/audio_only_final_baseline/confirmation/manifest.json
 audio_seeds=$formal_root/configs/generated/audio_only_final_baseline/robustness/manifest.json
 p2_fair=$result_root/fair_baseline_report.json
+architecture_report=$result_root/architecture_config_report.json
+parameter_audit=$result_root/p2_cuda_parameter_audit.json
+resource_report=$result_root/p2_resource_report.json
 reference_aggregate=$result_root/audio_references/aggregate.json
 reference_verification=$result_root/audio_references/verification.json
 expected_p2_fair_sha256=920364e134896d2e495ba8985936d5798048bc5b4b2ed763604569db3e722eb0
+expected_architecture_report_sha256=dc4bb138457e300098709a7e08757f8c38a0a7261fb5632309faa4a8be6dad6c
+expected_parameter_audit_sha256=85299ea4f04435f05125ed22a10134152fd854651b7bf31e4d962a5819848356
+expected_resource_report_sha256=4db3fbc9ff8dacc848e567fcea5c9462b52bc0c60c681c2fa1fc7f4a67c24cd9
 expected_reference_aggregate_sha256=d10e68a5f90df29c538e66fdc889b4e3be46b01fd4b530af4effdce7dcf3e5e6
 expected_reference_verification_sha256=38aab786429fe56e4d73f163de9e7a1059f0c4d09fd8acd2385b5aeb54fd9958
 audio_receipt=$result_root/audio_only_pipeline_receipt.json
@@ -77,13 +83,17 @@ if [[ ! -f "$audio_receipt" ]] \
   log_event "missing_or_invalid_audio_pipeline_receipt"
   exit 6
 fi
-for required in "$candidate_main" "$audio_main" "$p2_fair"; do
+for required in "$candidate_main" "$audio_main" "$p2_fair" \
+  "$architecture_report" "$parameter_audit" "$resource_report"; do
   if [[ ! -f "$required" ]]; then
     log_event "required_input_missing path=$required"
     exit 7
   fi
 done
 if [[ "$(sha256sum "$p2_fair" | cut -d' ' -f1)" != "$expected_p2_fair_sha256" ]] \
+  || [[ "$(sha256sum "$architecture_report" | cut -d' ' -f1)" != "$expected_architecture_report_sha256" ]] \
+  || [[ "$(sha256sum "$parameter_audit" | cut -d' ' -f1)" != "$expected_parameter_audit_sha256" ]] \
+  || [[ "$(sha256sum "$resource_report" | cut -d' ' -f1)" != "$expected_resource_report_sha256" ]] \
   || [[ "$(sha256sum "$reference_aggregate" | cut -d' ' -f1)" != "$expected_reference_aggregate_sha256" ]] \
   || [[ "$(sha256sum "$reference_verification" | cut -d' ' -f1)" != "$expected_reference_verification_sha256" ]]; then
   log_event "p2_reference_root_hash_mismatch"
@@ -96,6 +106,9 @@ report_args=(
   --audio-main-manifest "$audio_main"
   --run-root "$run_root"
   --p2-fair-report "$p2_fair"
+  --architecture-report "$architecture_report"
+  --parameter-audit "$parameter_audit"
+  --resource-report "$resource_report"
   --output-json "$output_json"
   --output-markdown "$output_markdown"
   --bootstrap-resamples 10000

@@ -26,8 +26,8 @@ def test_post_p3_relay_uses_strict_gate_and_publishes_token_bound_receipt() -> N
     assert "avgf_shard_lre_manifest.py" in text
     assert "avgf_verify_causal_manifest_step.zsh" in text
     assert "p3-pipeline-receipt" in text
-    assert 'run_token:$token' in text
-    assert 'gate_30k_sha256:$gate_sha' in text
+    assert "run_token:$token" in text
+    assert "gate_30k_sha256:$gate_sha" in text
     assert 'mv "$gate_pending" "$gate_30k"' in text
 
 
@@ -54,6 +54,12 @@ def test_final_relay_requires_exact_audio_receipt_token_and_hashes() -> None:
     assert "confirmation_manifest_sha256" in text
     assert "robustness_manifest_sha256" in text
     assert "expected_p2_fair_sha256" in text
+    assert "expected_architecture_report_sha256" in text
+    assert "expected_parameter_audit_sha256" in text
+    assert "expected_resource_report_sha256" in text
+    assert '--architecture-report "$architecture_report"' in text
+    assert '--parameter-audit "$parameter_audit"' in text
+    assert '--resource-report "$resource_report"' in text
     assert "expected_reference_aggregate_sha256" in text
     assert "expected_reference_verification_sha256" in text
     assert "p2_reference_root_hash_mismatch" in text

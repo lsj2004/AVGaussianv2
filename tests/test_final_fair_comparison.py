@@ -116,8 +116,7 @@ def _write_p2_reference_fixture(module, root: Path) -> Path:
     per_sample_path = reference_dir / "metrics_per_sample.jsonl"
     per_sample_path.write_text("{}\n")
     files = {
-        path.name: module._sha256(path)
-        for path in (aggregate_path, per_sample_path)
+        path.name: module._sha256(path) for path in (aggregate_path, per_sample_path)
     }
     verification_path = reference_dir / "verification.json"
     verification_path.write_text(
@@ -137,15 +136,194 @@ def _write_p2_reference_fixture(module, root: Path) -> Path:
                 "repository": REPOSITORY,
                 "evidence": {
                     "reference_aggregate_sha256": module._sha256(aggregate_path),
-                    "reference_verification_sha256": module._sha256(
-                        verification_path
-                    ),
+                    "reference_verification_sha256": module._sha256(verification_path),
                 },
                 "scene_macro": reference_values,
             }
         )
     )
     return p2_path
+
+
+def _architecture_summary_fixture(module):
+    systems = {}
+    for index, system in enumerate(module.ARCHITECTURE_SYSTEMS):
+        systems[system] = {
+            "mechanism": module.ARCHITECTURE_MECHANISMS[system],
+            "architecture_signature_sha256": str(index) * 64,
+            "worker_mode": "audio_only"
+            if system == "audio_only"
+            else "joint_conditioned",
+            "evaluation_system": system,
+            "active_hyperparameters": {
+                "audio_backend": system,
+                "worker_mode": (
+                    "audio_only" if system == "audio_only" else "joint_conditioned"
+                ),
+            },
+            "parameter_elements": {
+                name: {
+                    "min": 100 + index,
+                    "max": 101 + index,
+                    "by_scene": {
+                        "scene1_opera": 100 + index,
+                        "Scene7playing": 101 + index,
+                    },
+                }
+                for name in (
+                    "total",
+                    "declared_trainable",
+                    "optimizer_active",
+                    "optimizer_dormant",
+                    "orphan_trainable",
+                    "frozen",
+                )
+            },
+            "p2_5k_resource": {
+                "run_count": 8,
+                "maximum_peak_memory_used_mib": 1000 + index,
+                "maximum_gpu_utilization_percent": 40 + index,
+                "mean_pipeline_elapsed_seconds": 1200.0 + index,
+                "total_pipeline_gpu_hours": 3.0 + index,
+            },
+        }
+    return {
+        "scope": {
+            "included_systems": list(module.ARCHITECTURE_SYSTEMS),
+            "excluded_before_p2": {"plain_unet": "eliminated"},
+            "resource_boundary": "P2 5k screening only; not final 30k runtime",
+        },
+        "systems": systems,
+    }
+
+
+def _write_architecture_fixture(module, root: Path):
+    resource_path = root / "resources.json"
+    resource_records = []
+    resource_aggregates = []
+    parameter_records = []
+    architectures = {}
+    for system_index, system in enumerate(module.ARCHITECTURE_SYSTEMS):
+        p2_records = []
+        for scene_index, scene in enumerate(module.SCENES):
+            parameter_record = {
+                "system": system,
+                "scene": scene,
+                **{
+                    field: 1000 + 100 * system_index + scene_index
+                    for field in module.PARAMETER_FIELDS
+                },
+            }
+            parameter_records.append(parameter_record)
+            for weight_index, weight in enumerate((0.0, 0.01, 0.02, 0.05)):
+                elapsed = float(100 + 10 * system_index + scene_index + weight_index)
+                p2_records.append(
+                    {
+                        "continuation_id": f"{system}__{scene}__{weight}",
+                        "system": system,
+                        "scene": scene,
+                        "lambda_lre": weight,
+                        "pipeline_elapsed_seconds": elapsed,
+                        "pipeline_gpu_hours": elapsed / 3600.0,
+                        "peak_memory_used_mib": 1000 + system_index + weight_index,
+                        "maximum_gpu_utilization_percent": 40 + weight_index,
+                    }
+                )
+        resource_records.extend(p2_records)
+        resource_aggregates.append(
+            {
+                "system": system,
+                "run_count": 8,
+                "maximum_peak_memory_used_mib": max(
+                    record["peak_memory_used_mib"] for record in p2_records
+                ),
+                "maximum_gpu_utilization_percent": max(
+                    record["maximum_gpu_utilization_percent"] for record in p2_records
+                ),
+                "mean_pipeline_elapsed_seconds": sum(
+                    record["pipeline_elapsed_seconds"] for record in p2_records
+                )
+                / len(p2_records),
+                "total_pipeline_gpu_hours": sum(
+                    record["pipeline_gpu_hours"] for record in p2_records
+                ),
+            }
+        )
+        worker_mode = "audio_only" if system == "audio_only" else "joint_conditioned"
+        architecture = {
+            "active_hyperparameters": {
+                "audio_backend": system,
+                "worker_mode": worker_mode,
+            },
+            "effective_model": {"audio_backend": system},
+            "evaluation_system": system,
+            "worker_mode": worker_mode,
+        }
+        signature = module._canonical_sha256(architecture)
+        records = [record for record in parameter_records if record["system"] == system]
+        architectures[system] = {
+            "architecture": architecture,
+            "architecture_signature_sha256": signature,
+            "scene_records": [
+                {
+                    "system": system,
+                    "scene": record["scene"],
+                    "architecture": architecture,
+                    "architecture_signature_sha256": signature,
+                    "cuda_parameter_audit": {
+                        field: record[field] for field in module.PARAMETER_FIELDS
+                    },
+                }
+                for record in records
+            ],
+        }
+    resource_path.write_text(
+        json.dumps(
+            {
+                "schema": "avgaussianv2.p2-stitched-resource-report",
+                "version": 1,
+                "repository": REPOSITORY,
+                "records": resource_records,
+                "aggregates": resource_aggregates,
+            }
+        )
+    )
+    parameter_path = root / "parameters.json"
+    parameter_path.write_text(
+        json.dumps(
+            {
+                "schema": "avgaussianv2.p2-cuda-parameter-audit",
+                "version": 1,
+                "repository": REPOSITORY,
+                "resource_report": {
+                    "path": str(resource_path.resolve()),
+                    "sha256": module._sha256(resource_path),
+                },
+                "records": parameter_records,
+            }
+        )
+    )
+    architecture_path = root / "architectures.json"
+    architecture_path.write_text(
+        json.dumps(
+            {
+                "schema": "avgaussianv2.p2-architecture-config-report",
+                "version": 1,
+                "repository": REPOSITORY,
+                "systems": list(module.ARCHITECTURE_SYSTEMS),
+                "architectures": architectures,
+                "cuda_parameter_audit": {
+                    "path": str(parameter_path.resolve()),
+                    "sha256": module._sha256(parameter_path),
+                },
+                "resource_report": {
+                    "path": str(resource_path.resolve()),
+                    "sha256": module._sha256(resource_path),
+                },
+            }
+        )
+    )
+    return architecture_path, parameter_path, resource_path
 
 
 def _write_model_run_fixture(root: Path) -> tuple[dict[str, object], Path]:
@@ -231,9 +409,7 @@ def test_load_model_run_requires_strict_evaluation_verification(
         assert path == evaluation_dir
         raise RuntimeError("checkpoint hash mismatch")
 
-    monkeypatch.setattr(
-        module, "verify_evaluation", reject_tampered_training_evidence
-    )
+    monkeypatch.setattr(module, "verify_evaluation", reject_tampered_training_evidence)
 
     with pytest.raises(RuntimeError, match="checkpoint hash mismatch"):
         module._load_model_run(tmp_path, run, REPOSITORY)
@@ -245,8 +421,7 @@ def test_load_model_run_uses_verified_evaluation(
     module = _load_module()
     run, _ = _write_model_run_fixture(tmp_path)
     rows = tuple(
-        {metric: float(index) for metric in module.MODEL_METRICS}
-        for index in range(2)
+        {metric: float(index) for metric in module.MODEL_METRICS} for index in range(2)
     )
     verified = SimpleNamespace(
         identity=SimpleNamespace(
@@ -316,6 +491,7 @@ def test_markdown_has_separate_fair_and_reference_tables() -> None:
                 "audio_only",
             )
         },
+        "architecture_summary": _architecture_summary_fixture(module),
     }
 
     text = module.render_markdown(report)
@@ -326,6 +502,47 @@ def test_markdown_has_separate_fair_and_reference_tables() -> None:
     assert "source_binaural" in text
     assert "mono" in text
     assert "最终候选相对绝对参照的差值" in text
+    assert "架构、参数量与 P2 资源成本" in text
+    assert "完整 active hyperparameters" in text
+
+
+def test_architecture_summary_verifies_signatures_hashes_and_resource_math(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    architecture_path, parameter_path, resource_path = _write_architecture_fixture(
+        module, tmp_path
+    )
+
+    summary = module._architecture_summary(
+        architecture_path, parameter_path, resource_path, REPOSITORY
+    )
+
+    assert list(summary["systems"]) == list(module.ARCHITECTURE_SYSTEMS)
+    assert summary["systems"]["audio_only"]["p2_5k_resource"]["run_count"] == 8
+    assert (
+        summary["systems"]["query_dependent_p1"]["parameter_elements"][
+            "optimizer_active"
+        ]["max"]
+        == 1101
+    )
+
+
+def test_architecture_summary_rejects_tampered_architecture(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    architecture_path, parameter_path, resource_path = _write_architecture_fixture(
+        module, tmp_path
+    )
+    document = json.loads(architecture_path.read_text())
+    document["architectures"]["audio_only"]["architecture"]["worker_mode"] = "tampered"
+    architecture_path.write_text(json.dumps(document))
+
+    with pytest.raises(ValueError, match="architecture signature mismatch"):
+        module._architecture_summary(
+            architecture_path, parameter_path, resource_path, REPOSITORY
+        )
 
 
 def test_reference_macro_rejects_tampered_reference_artifact(
@@ -360,6 +577,7 @@ def test_no_finalist_markdown_reports_rejection_without_multiseed_claim() -> Non
             name: {metric: 0.5 for metric in module.DISPLAY_METRICS}
             for name in ("source_binaural", "mono", "native_audiogs")
         },
+        "architecture_summary": _architecture_summary_fixture(module),
     }
 
     text = module.render_markdown(report)
@@ -368,6 +586,7 @@ def test_no_finalist_markdown_reports_rejection_without_multiseed_claim() -> Non
     assert "causal_gate_failed" in text
     assert "未启动候选多 seed" in text
     assert "Source/Mono/native 绝对参照" in text
+    assert "架构、参数量与 P2 资源成本" in text
 
 
 def test_no_finalist_builder_requires_audio_only_and_preserves_reasons(
@@ -378,6 +597,9 @@ def test_no_finalist_builder_requires_audio_only_and_preserves_reasons(
     audio_path = tmp_path / "audio.json"
     gate_path = tmp_path / "gate.json"
     p2_path = _write_p2_reference_fixture(module, tmp_path)
+    architecture_path, parameter_path, resource_path = _write_architecture_fixture(
+        module, tmp_path
+    )
     candidate_path.write_text("{}\n")
     audio_path.write_text("{}\n")
     gate_path.write_text("{}\n")
@@ -435,6 +657,12 @@ def test_no_finalist_builder_requires_audio_only_and_preserves_reasons(
         audio_main_path=audio_path,
         run_root=tmp_path,
         p2_fair_report_path=p2_path,
+        architecture_summary=module._architecture_summary(
+            architecture_path, parameter_path, resource_path, REPOSITORY
+        ),
+        architecture_report_path=architecture_path,
+        parameter_audit_path=parameter_path,
+        resource_report_path=resource_path,
     )
 
     assert report["status"] == "no_finalist"

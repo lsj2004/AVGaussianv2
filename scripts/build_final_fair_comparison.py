@@ -73,6 +73,26 @@ DIAGNOSTIC_MODEL_METRICS = (
     "diff_lsd",
     "lre_error_db",
 )
+ARCHITECTURE_SYSTEMS = (
+    "audio_only",
+    "query_dependent_p1",
+    "joint_conditioned",
+    "cross_attention_masks",
+)
+ARCHITECTURE_MECHANISMS = {
+    "audio_only": "AudioGS native residual；无视觉条件",
+    "query_dependent_p1": "query-dependent P1 视觉条件残差",
+    "joint_conditioned": "联合优化 AudioGS 与视觉条件器",
+    "cross_attention_masks": "音频 token 与视觉条件 cross-attention mask",
+}
+PARAMETER_FIELDS = (
+    "checkpoint_5k_total_parameter_elements",
+    "checkpoint_5k_declared_trainable_parameter_elements",
+    "checkpoint_5k_optimizer_active_parameter_elements",
+    "checkpoint_5k_optimizer_dormant_parameter_elements",
+    "checkpoint_5k_orphan_trainable_parameter_elements",
+    "checkpoint_5k_frozen_parameter_elements",
+)
 
 
 def _sha256(path: Path) -> str:
@@ -87,6 +107,255 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"expected JSON object: {path}")
     return value
+
+
+def _canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _verify_artifact_pointer(pointer: Any, path: Path, *, label: str) -> None:
+    if not isinstance(pointer, Mapping):
+        raise ValueError(f"{label} artifact pointer is missing")
+    if pointer.get("path") != str(path.resolve()) or pointer.get("sha256") != _sha256(
+        path
+    ):
+        raise ValueError(f"{label} artifact pointer/hash mismatch")
+
+
+def _integer_range(records: Sequence[Mapping[str, Any]], field: str) -> dict[str, Any]:
+    by_scene: dict[str, int] = {}
+    for record in records:
+        scene = record.get("scene")
+        value = record.get(field)
+        if scene not in SCENES or isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"invalid parameter audit field: {field}")
+        if value < 0 or scene in by_scene:
+            raise ValueError(f"invalid parameter audit scene/value: {field}/{scene}")
+        by_scene[str(scene)] = value
+    if set(by_scene) != set(SCENES):
+        raise ValueError(f"parameter audit lacks the exact scene matrix: {field}")
+    values = list(by_scene.values())
+    return {"min": min(values), "max": max(values), "by_scene": by_scene}
+
+
+def _architecture_summary(
+    architecture_report_path: Path,
+    parameter_audit_path: Path,
+    resource_report_path: Path,
+    repository: Mapping[str, Any],
+) -> dict[str, Any]:
+    architecture_report = _load_json(architecture_report_path)
+    parameter_audit = _load_json(parameter_audit_path)
+    resource_report = _load_json(resource_report_path)
+    expected_identities = (
+        (architecture_report, "avgaussianv2.p2-architecture-config-report"),
+        (parameter_audit, "avgaussianv2.p2-cuda-parameter-audit"),
+        (resource_report, "avgaussianv2.p2-stitched-resource-report"),
+    )
+    for document, schema in expected_identities:
+        if (
+            document.get("schema") != schema
+            or document.get("version") != 1
+            or document.get("repository") != repository
+        ):
+            raise ValueError(f"architecture evidence identity mismatch: {schema}")
+
+    if tuple(architecture_report.get("systems", ())) != ARCHITECTURE_SYSTEMS:
+        raise ValueError("architecture report does not contain the exact P2 systems")
+    architectures = architecture_report.get("architectures")
+    if not isinstance(architectures, Mapping) or set(architectures) != set(
+        ARCHITECTURE_SYSTEMS
+    ):
+        raise ValueError("architecture report system mapping mismatch")
+    _verify_artifact_pointer(
+        architecture_report.get("cuda_parameter_audit"),
+        parameter_audit_path,
+        label="parameter audit",
+    )
+    _verify_artifact_pointer(
+        architecture_report.get("resource_report"),
+        resource_report_path,
+        label="resource report",
+    )
+    _verify_artifact_pointer(
+        parameter_audit.get("resource_report"),
+        resource_report_path,
+        label="parameter-audit resource report",
+    )
+
+    raw_parameter_records = parameter_audit.get("records")
+    if not isinstance(raw_parameter_records, list) or len(raw_parameter_records) != 8:
+        raise ValueError("parameter audit must contain four systems x two scenes")
+    parameter_records: dict[str, list[Mapping[str, Any]]] = {
+        system: [] for system in ARCHITECTURE_SYSTEMS
+    }
+    for record in raw_parameter_records:
+        if (
+            not isinstance(record, Mapping)
+            or record.get("system") not in parameter_records
+        ):
+            raise ValueError("invalid parameter audit record")
+        parameter_records[str(record["system"])].append(record)
+
+    raw_resource_records = resource_report.get("records")
+    raw_resource_aggregates = resource_report.get("aggregates")
+    if not isinstance(raw_resource_records, list) or len(raw_resource_records) != 32:
+        raise ValueError("resource report must contain the exact 32-run P2 matrix")
+    if (
+        not isinstance(raw_resource_aggregates, list)
+        or len(raw_resource_aggregates) != 4
+    ):
+        raise ValueError("resource report must contain four system aggregates")
+    resource_records: dict[str, list[Mapping[str, Any]]] = {
+        system: [] for system in ARCHITECTURE_SYSTEMS
+    }
+    for record in raw_resource_records:
+        if (
+            not isinstance(record, Mapping)
+            or record.get("system") not in resource_records
+        ):
+            raise ValueError("invalid P2 resource record")
+        resource_records[str(record["system"])].append(record)
+    resource_aggregates: dict[str, Mapping[str, Any]] = {}
+    for aggregate in raw_resource_aggregates:
+        if (
+            not isinstance(aggregate, Mapping)
+            or aggregate.get("system") not in resource_records
+            or aggregate["system"] in resource_aggregates
+        ):
+            raise ValueError("invalid P2 resource aggregate")
+        resource_aggregates[str(aggregate["system"])] = aggregate
+    if set(resource_aggregates) != set(ARCHITECTURE_SYSTEMS):
+        raise ValueError("P2 resource aggregate system mismatch")
+
+    systems: dict[str, Any] = {}
+    for system in ARCHITECTURE_SYSTEMS:
+        architecture_entry = architectures[system]
+        if not isinstance(architecture_entry, Mapping):
+            raise ValueError(f"invalid architecture entry: {system}")
+        architecture = architecture_entry.get("architecture")
+        if not isinstance(architecture, Mapping):
+            raise ValueError(f"architecture mapping missing: {system}")
+        signature = architecture_entry.get("architecture_signature_sha256")
+        if signature != _canonical_sha256(architecture):
+            raise ValueError(f"architecture signature mismatch: {system}")
+        active_hyperparameters = architecture.get("active_hyperparameters")
+        expected_worker = (
+            "audio_only" if system == "audio_only" else "joint_conditioned"
+        )
+        if (
+            not isinstance(active_hyperparameters, Mapping)
+            or architecture.get("worker_mode") != expected_worker
+            or architecture.get("evaluation_system") != system
+            or active_hyperparameters.get("worker_mode") != expected_worker
+        ):
+            raise ValueError(f"architecture runtime identity mismatch: {system}")
+
+        records = parameter_records[system]
+        if len(records) != 2 or {record.get("scene") for record in records} != set(
+            SCENES
+        ):
+            raise ValueError(f"parameter audit scene matrix mismatch: {system}")
+        embedded_records = architecture_entry.get("scene_records")
+        if not isinstance(embedded_records, list) or len(embedded_records) != 2:
+            raise ValueError(f"architecture scene records mismatch: {system}")
+        embedded_by_scene = {
+            record.get("scene"): record
+            for record in embedded_records
+            if isinstance(record, Mapping)
+        }
+        if set(embedded_by_scene) != set(SCENES):
+            raise ValueError(f"architecture embedded scene matrix mismatch: {system}")
+        for record in records:
+            embedded = embedded_by_scene[record["scene"]]
+            if (
+                embedded.get("architecture_signature_sha256") != signature
+                or embedded.get("architecture") != architecture
+                or any(
+                    embedded.get("cuda_parameter_audit", {}).get(field)
+                    != record.get(field)
+                    for field in PARAMETER_FIELDS
+                )
+            ):
+                raise ValueError(f"architecture/parameter audit mismatch: {system}")
+
+        p2_records = resource_records[system]
+        expected_cells = {
+            (scene, weight) for scene in SCENES for weight in (0.0, 0.01, 0.02, 0.05)
+        }
+        observed_cells = {
+            (record.get("scene"), float(record.get("lambda_lre", -1.0)))
+            for record in p2_records
+        }
+        if len(p2_records) != 8 or observed_cells != expected_cells:
+            raise ValueError(f"P2 resource run matrix mismatch: {system}")
+        aggregate = resource_aggregates[system]
+        elapsed = [float(record["pipeline_elapsed_seconds"]) for record in p2_records]
+        gpu_hours = [float(record["pipeline_gpu_hours"]) for record in p2_records]
+        expected_resource_values = {
+            "run_count": 8,
+            "maximum_peak_memory_used_mib": max(
+                int(record["peak_memory_used_mib"]) for record in p2_records
+            ),
+            "maximum_gpu_utilization_percent": max(
+                int(record["maximum_gpu_utilization_percent"]) for record in p2_records
+            ),
+        }
+        if any(
+            aggregate.get(key) != value
+            for key, value in expected_resource_values.items()
+        ):
+            raise ValueError(f"P2 resource aggregate mismatch: {system}")
+        if not math.isclose(
+            float(aggregate.get("mean_pipeline_elapsed_seconds", math.nan)),
+            statistics.fmean(elapsed),
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ) or not math.isclose(
+            float(aggregate.get("total_pipeline_gpu_hours", math.nan)),
+            sum(gpu_hours),
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(f"P2 resource aggregate arithmetic mismatch: {system}")
+
+        systems[system] = {
+            "mechanism": ARCHITECTURE_MECHANISMS[system],
+            "architecture_signature_sha256": signature,
+            "worker_mode": architecture["worker_mode"],
+            "evaluation_system": architecture["evaluation_system"],
+            "active_hyperparameters": dict(active_hyperparameters),
+            "parameter_elements": {
+                field.removeprefix("checkpoint_5k_").removesuffix(
+                    "_parameter_elements"
+                ): _integer_range(records, field)
+                for field in PARAMETER_FIELDS
+            },
+            "p2_5k_resource": {
+                key: aggregate[key]
+                for key in (
+                    "run_count",
+                    "maximum_peak_memory_used_mib",
+                    "maximum_gpu_utilization_percent",
+                    "mean_pipeline_elapsed_seconds",
+                    "total_pipeline_gpu_hours",
+                )
+            },
+        }
+
+    return {
+        "scope": {
+            "included_systems": list(ARCHITECTURE_SYSTEMS),
+            "excluded_before_p2": {
+                "plain_unet": "eliminated before the formal P2 32-run matrix"
+            },
+            "resource_boundary": "P2 5k screening only; not final 30k runtime",
+        },
+        "systems": systems,
+    }
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -387,6 +656,63 @@ def _format(value: float) -> str:
     return f"{value:.6f}"
 
 
+def _format_integer_range(value: Mapping[str, Any]) -> str:
+    lower = int(value["min"])
+    upper = int(value["max"])
+    return f"{lower:,}" if lower == upper else f"{lower:,}–{upper:,}"
+
+
+def _render_architecture_section(report: Mapping[str, Any], number: int) -> list[str]:
+    summary = report["architecture_summary"]
+    systems = summary["systems"]
+    lines = [
+        f"## {number}. 架构、参数量与 P2 资源成本",
+        "",
+        "参数来自两个正式场景的 5k CUDA checkpoint 审计；资源来自 P2 的 32-run "
+        "screening。资源数字仅描述 5k 筛选成本，不代表最终 30k 运行成本。",
+        "",
+        "| 架构 | 核心机制 | 总参数量 | optimizer-active | orphan-trainable | "
+        "峰值显存 MiB | 平均耗时 s | P2 GPU·h |",
+        "|---|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for system in ARCHITECTURE_SYSTEMS:
+        record = systems[system]
+        parameters = record["parameter_elements"]
+        resource = record["p2_5k_resource"]
+        lines.append(
+            f"| {system} | {record['mechanism']} | "
+            f"{_format_integer_range(parameters['total'])} | "
+            f"{_format_integer_range(parameters['optimizer_active'])} | "
+            f"{_format_integer_range(parameters['orphan_trainable'])} | "
+            f"{int(resource['maximum_peak_memory_used_mib']):,} | "
+            f"{float(resource['mean_pipeline_elapsed_seconds']):.2f} | "
+            f"{float(resource['total_pipeline_gpu_hours']):.3f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "### 完整 active hyperparameters",
+            "",
+        ]
+    )
+    for system in ARCHITECTURE_SYSTEMS:
+        config = json.dumps(
+            systems[system]["active_hyperparameters"],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(", ", ": "),
+        )
+        lines.append(f"- `{system}`：`{config}`")
+        lines.append("")
+    lines.extend(
+        [
+            "`plain_unet` 已在正式 P2 32-run 矩阵前淘汰，不得伪装成 P2 完成架构。",
+            "",
+        ]
+    )
+    return lines
+
+
 def _render_no_finalist_markdown(report: Mapping[str, Any]) -> str:
     audio = report["audio_only_seed42_30k"]
     candidates = report["rejected_candidates"]
@@ -451,6 +777,7 @@ def _render_no_finalist_markdown(report: Mapping[str, Any]) -> str:
             "",
         ]
     )
+    lines.extend(_render_architecture_section(report, 3))
     return "\n".join(lines)
 
 
@@ -591,6 +918,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             "",
         ]
     )
+    lines.extend(_render_architecture_section(report, 3))
     return "\n".join(lines)
 
 
@@ -609,11 +937,9 @@ def _reference_macro(
     reference_dir = p2_fair_report_path.parent / "audio_references"
     aggregate_path = reference_dir / "aggregate.json"
     verification_path = reference_dir / "verification.json"
-    if (
-        evidence.get("reference_aggregate_sha256") != _sha256(aggregate_path)
-        or evidence.get("reference_verification_sha256")
-        != _sha256(verification_path)
-    ):
+    if evidence.get("reference_aggregate_sha256") != _sha256(
+        aggregate_path
+    ) or evidence.get("reference_verification_sha256") != _sha256(verification_path):
         raise ValueError("P2 reference artifact hash mismatch")
     verification = _load_json(verification_path)
     files = verification.get("files")
@@ -635,8 +961,7 @@ def _reference_macro(
             raise ValueError(f"P2 reference verification failed: {name}")
     aggregate = _load_json(aggregate_path)
     if (
-        aggregate.get("schema")
-        != "avgaussianv2.audiogs-paper-reference-baselines"
+        aggregate.get("schema") != "avgaussianv2.audiogs-paper-reference-baselines"
         or aggregate.get("version") != 1
         or aggregate.get("repository") != repository
     ):
@@ -678,6 +1003,10 @@ def _build_no_finalist(
     audio_main_path: Path,
     run_root: Path,
     p2_fair_report_path: Path,
+    architecture_summary: Mapping[str, Any],
+    architecture_report_path: Path,
+    parameter_audit_path: Path,
+    resource_report_path: Path,
 ) -> dict[str, Any]:
     if (
         gate.get("schema") != "avgaussianv2.p3-30k-gate"
@@ -760,6 +1089,7 @@ def _build_no_finalist(
         "audio_only_seed42_30k": audio_macro,
         "rejected_candidates": candidates,
         "absolute_references": references,
+        "architecture_summary": dict(architecture_summary),
         "evidence": {
             "gate_30k": {
                 "path": str(gate_path.resolve()),
@@ -777,6 +1107,18 @@ def _build_no_finalist(
                 "path": str(p2_fair_report_path.resolve()),
                 "sha256": _sha256(p2_fair_report_path),
             },
+            "architecture_report": {
+                "path": str(architecture_report_path.resolve()),
+                "sha256": _sha256(architecture_report_path),
+            },
+            "parameter_audit": {
+                "path": str(parameter_audit_path.resolve()),
+                "sha256": _sha256(parameter_audit_path),
+            },
+            "resource_report": {
+                "path": str(resource_report_path.resolve()),
+                "sha256": _sha256(resource_report_path),
+            },
             "audio_evaluation_content_sha256": {
                 scene: audio_evaluations[scene]["content_sha256"] for scene in SCENES
             },
@@ -793,9 +1135,21 @@ def build(
     audio_seed_path: Path | None,
     run_root: Path,
     p2_fair_report_path: Path,
+    architecture_report_path: Path,
+    parameter_audit_path: Path,
+    resource_report_path: Path,
     resamples: int,
 ) -> dict[str, Any]:
     gate = _load_json(gate_path)
+    repository = gate.get("repository")
+    if not isinstance(repository, Mapping):
+        raise ValueError("30k gate lacks a formal repository identity")
+    architecture_summary = _architecture_summary(
+        architecture_report_path,
+        parameter_audit_path,
+        resource_report_path,
+        repository,
+    )
     if gate.get("selected_finalist") is None:
         return _build_no_finalist(
             gate=gate,
@@ -804,6 +1158,10 @@ def build(
             audio_main_path=audio_main_path,
             run_root=run_root,
             p2_fair_report_path=p2_fair_report_path,
+            architecture_summary=architecture_summary,
+            architecture_report_path=architecture_report_path,
+            parameter_audit_path=parameter_audit_path,
+            resource_report_path=resource_report_path,
         )
     if candidate_seed_path is None or audio_seed_path is None:
         raise ValueError(
@@ -831,7 +1189,6 @@ def build(
         audio_main=audio_main,
         audio_seeds=audio_seeds,
     )
-    repository = gate["repository"]
     evaluations = {
         key: _load_model_run(run_root, run, repository) for key, run in runs.items()
     }
@@ -879,6 +1236,7 @@ def build(
         "paired_comparisons": comparisons,
         "absolute_references": references,
         "candidate_reference_deltas": delta_references,
+        "architecture_summary": architecture_summary,
         "evidence": {
             "gate_30k": {
                 "path": str(gate_path.resolve()),
@@ -904,6 +1262,18 @@ def build(
                 "path": str(p2_fair_report_path.resolve()),
                 "sha256": _sha256(p2_fair_report_path),
             },
+            "architecture_report": {
+                "path": str(architecture_report_path.resolve()),
+                "sha256": _sha256(architecture_report_path),
+            },
+            "parameter_audit": {
+                "path": str(parameter_audit_path.resolve()),
+                "sha256": _sha256(parameter_audit_path),
+            },
+            "resource_report": {
+                "path": str(resource_report_path.resolve()),
+                "sha256": _sha256(resource_report_path),
+            },
             "evaluation_content_sha256": {
                 "/".join((role, str(seed), scene)): value["content_sha256"]
                 for (role, seed, scene), value in evaluations.items()
@@ -921,6 +1291,9 @@ def main() -> None:
     parser.add_argument("--audio-seed-manifest", type=Path)
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--p2-fair-report", type=Path, required=True)
+    parser.add_argument("--architecture-report", type=Path, required=True)
+    parser.add_argument("--parameter-audit", type=Path, required=True)
+    parser.add_argument("--resource-report", type=Path, required=True)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--output-markdown", type=Path, required=True)
     parser.add_argument("--bootstrap-resamples", type=int, default=10_000)
@@ -933,6 +1306,9 @@ def main() -> None:
         audio_seed_path=args.audio_seed_manifest,
         run_root=args.run_root,
         p2_fair_report_path=args.p2_fair_report,
+        architecture_report_path=args.architecture_report,
+        parameter_audit_path=args.parameter_audit,
+        resource_report_path=args.resource_report,
         resamples=args.bootstrap_resamples,
     )
     _atomic_write(
