@@ -457,3 +457,16 @@ class AudioGSBackend(nn.Module):
         if self.complex_renderer is not None:
             return []
         return list(self.conditioned_renderer.base_parameters())
+
+    def audio_only_parameter_groups(self) -> tuple[str, ...]:
+        """Return groups consumed by the actual ``condition=None`` path."""
+        if self.complex_renderer is not None:
+            return ("acoustic",)
+        if self.forward_override is None:
+            return ("acoustic", "audio_unet")
+        if self.render_strategy in {
+            AudioRenderStrategy.PLAIN_UNET,
+            AudioRenderStrategy.DIRECT_CONDITIONED_UNET,
+        }:
+            return ("acoustic", "audio_unet")
+        return ("acoustic",)

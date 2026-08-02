@@ -383,19 +383,19 @@ def configure_benchmark_mode(
     if not hasattr(model, "condition_enabled"):
         raise TypeError("benchmark model must expose condition_enabled")
     model.unfreeze_all()
+    # Parameter groups are an allow-list, not merely a convenient partition.
+    # Freeze the complete module first so saved/legacy parameters omitted from
+    # named_parameter_groups cannot remain accidentally trainable.
+    _set_enabled(tuple(model.parameters()), False)
     groups = model.named_parameter_groups()
     if stage == "warmup":
         if resolved is not BenchmarkMode.JOINT_CONDITIONED:
             raise ValueError("conditioner warmup is only valid for joint_conditioned")
         model.condition_enabled = True
-        for parameters in groups.values():
-            _set_enabled(parameters, False)
         for name in ("condition_encoder", "film"):
             _set_enabled(groups[name], True)
         return
 
-    for parameters in groups.values():
-        _set_enabled(parameters, False)
     if resolved is BenchmarkMode.JOINT_CONDITIONED:
         for parameters in groups.values():
             _set_enabled(parameters, True)

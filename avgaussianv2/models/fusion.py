@@ -111,8 +111,7 @@ class AVGaussianFusionV2(nn.Module):
         }
 
     def audio_only_parameter_groups(self) -> tuple[str, ...]:
-        strategy = getattr(self.audio, "render_strategy", "")
-        strategy = getattr(strategy, "value", strategy)
-        if strategy == "plain_unet":
-            return ("audio_unet",)
+        selected = getattr(self.audio, "audio_only_parameter_groups", None)
+        if callable(selected):
+            return tuple(selected())
         return ("acoustic", "audio_unet")

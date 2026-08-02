@@ -27,7 +27,10 @@ from avgaussianv2.benchmark.training import (
 )
 from avgaussianv2.config import TrainConfig
 from avgaussianv2.contracts import AlignedAVSample, FusionOutput, RGBDRender
-from avgaussianv2.train import DisconnectedAudioVisualGradient
+from avgaussianv2.train import (
+    DisconnectedAudioVisualGradient,
+    build_joint_optimizer,
+)
 
 
 class Scalar(nn.Module):
@@ -46,6 +49,7 @@ class TinyFusion(nn.Module):
         self.condition_encoder = Scalar(0.3)
         self.film = Scalar(0.4)
         self.audio_unet = Scalar(0.5)
+        self.ungrouped = Scalar(0.6)
         self.condition_enabled = True
         self.visual_forward_calls = 0
         self.audio_forward_calls = 0
@@ -171,6 +175,7 @@ def test_benchmark_mode_has_exact_main_trainability(mode, enabled, condition) ->
     configure_benchmark_mode(model, mode, "main")
     assert {name for name, value in flags(model).items() if value} == enabled
     assert model.condition_enabled is condition
+    assert not model.ungrouped.value.requires_grad
 
 
 def test_only_joint_mode_accepts_conditioner_warmup() -> None:
@@ -180,9 +185,94 @@ def test_only_joint_mode_accepts_conditioner_warmup() -> None:
         "condition_encoder",
         "film",
     }
+    assert not model.ungrouped.value.requires_grad
     for mode in (BenchmarkMode.AUDIO_ONLY, BenchmarkMode.VISUAL_ONLY):
         with pytest.raises(ValueError, match="warmup"):
             configure_benchmark_mode(model, mode, "warmup")
+
+
+def _optimizer_for_groups(
+    model: TinyFusion, names: tuple[str, ...]
+) -> torch.optim.Optimizer:
+    model.requires_grad_(False)
+    groups = model.named_parameter_groups()
+    for name in names:
+        for parameter in groups[name]:
+            parameter.requires_grad_(True)
+    return build_joint_optimizer(model, TrainConfig())
+
+
+@pytest.mark.parametrize(
+    ("strategy", "legacy_groups", "corrected_groups", "compatible"),
+    [
+        (
+            "native_residual",
+            ("acoustic", "audio_unet"),
+            ("acoustic",),
+            False,
+        ),
+        (
+            "gated_native_residual",
+            ("acoustic", "audio_unet"),
+            ("acoustic",),
+            False,
+        ),
+        ("plain_unet", ("audio_unet",), ("acoustic", "audio_unet"), False),
+        (
+            "direct_conditioned_unet",
+            ("acoustic", "audio_unet"),
+            ("acoustic", "audio_unet"),
+            True,
+        ),
+        ("query_dependent_p1", ("acoustic",), ("acoustic",), True),
+    ],
+)
+def test_legacy_audio_optimizer_resume_policy_matches_historical_groups(
+    strategy, legacy_groups, corrected_groups, compatible
+) -> None:
+    legacy_model = TinyFusion()
+    corrected_model = copy.deepcopy(legacy_model)
+    legacy_optimizer = _optimizer_for_groups(legacy_model, legacy_groups)
+    corrected_optimizer = _optimizer_for_groups(corrected_model, corrected_groups)
+    legacy_optimizer.zero_grad(set_to_none=True)
+    loss = sum(
+        parameter.square().sum()
+        for group in legacy_optimizer.param_groups
+        for parameter in group["params"]
+    )
+    loss.backward()
+    legacy_optimizer.step()
+    state = legacy_optimizer.state_dict()
+
+    if not compatible:
+        with pytest.raises(
+            BenchmarkResumeError, match="optimizer group count mismatch"
+        ):
+            benchmark_training._validate_optimizer_state(
+                state, corrected_optimizer
+            )
+        return
+
+    benchmark_training._validate_optimizer_state(state, corrected_optimizer)
+    corrected_model.load_state_dict(legacy_model.state_dict())
+    corrected_optimizer.load_state_dict(state)
+    for model, optimizer in (
+        (legacy_model, legacy_optimizer),
+        (corrected_model, corrected_optimizer),
+    ):
+        optimizer.zero_grad(set_to_none=True)
+        next_loss = sum(
+            parameter.square().sum()
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        )
+        next_loss.backward()
+        optimizer.step()
+    for name, expected in legacy_model.state_dict().items():
+        assert torch.equal(corrected_model.state_dict()[name], expected), (
+            strategy,
+            name,
+        )
 
 
 def test_shared_indices_are_exact_deterministic_and_mode_independent() -> None:

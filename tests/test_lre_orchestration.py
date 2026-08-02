@@ -344,22 +344,43 @@ def test_failed_pipeline_publishes_failure_and_peer_abort_evidence(tmp_path):
         resume=False,
     )
 
-    class _FailureHandle(_Handle):
+    class _TrackedHandle(_Handle):
+        def __init__(self):
+            self.terminate_calls = 0
+            self.kill_calls = 0
+
+        def terminate(self):
+            self.terminate_calls += 1
+
+        def kill(self):
+            self.kill_calls += 1
+
+    class _FailureHandle(_TrackedHandle):
         def poll(self):
             return 9
+
+    class _TrackedPendingHandle(_TrackedHandle):
+        def poll(self):
+            return None
 
     class _MixedRunner:
         def __init__(self):
             self.calls = 0
+            self.handles = []
 
         def start(self, command, *, env, log_path):
             del command, env, log_path
             self.calls += 1
-            return _FailureHandle() if self.calls == 1 else _PendingHandle()
+            handle = (
+                _FailureHandle() if self.calls == 1 else _TrackedPendingHandle()
+            )
+            self.handles.append(handle)
+            return handle
 
+    runner = _MixedRunner()
     with pytest.raises(OrchestrationError, match="stage failed"):
         execute_lre_pipelines(
-            pipelines, gpus=(1, 2), runner=_MixedRunner(), poll_seconds=0
+            pipelines, gpus=(1, 2), runner=runner, poll_seconds=0
         )
 
     failed = json.loads(
@@ -373,3 +394,7 @@ def test_failed_pipeline_publishes_failure_and_peer_abort_evidence(tmp_path):
     assert failed["exit_code"] == 9
     assert aborted["status"] == "aborted_due_to_peer_failure"
     assert aborted["peer_failed_run_id"] == pipelines[0].run_id
+    assert [handle.terminate_calls for handle in runner.handles] == [1, 1]
+    assert [handle.kill_calls for handle in runner.handles] == [1, 1]
+    peer_history = pipelines[1].run_dir / "result_history/run_result.screening"
+    assert len(tuple(peer_history.glob("attempt-*.json"))) == 1

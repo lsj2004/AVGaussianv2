@@ -647,7 +647,7 @@ def test_real_fusion_model_parameter_groups_follow_benchmark_mode(
     assert actual == enabled
 
 
-def test_plain_unet_audio_only_mode_freezes_acoustic_gaussians() -> None:
+def test_plain_unet_audio_only_mode_enables_acoustic_and_unet() -> None:
     model = AVGaussianFusionV2(
         visual=nn.Linear(1, 1),
         condition_encoder=RGBDConditionEncoder(embedding_dim=8),
@@ -658,6 +658,6 @@ def test_plain_unet_audio_only_mode_freezes_acoustic_gaussians() -> None:
     configure_benchmark_mode(model, BenchmarkMode.AUDIO_ONLY, "main")
 
     groups = model.named_parameter_groups()
-    assert not any(parameter.requires_grad for parameter in groups["acoustic"])
+    assert all(parameter.requires_grad for parameter in groups["acoustic"])
     assert all(parameter.requires_grad for parameter in groups["audio_unet"])
     assert callable(nn.L1Loss())

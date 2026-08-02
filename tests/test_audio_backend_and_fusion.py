@@ -1,3 +1,4 @@
+import copy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -302,6 +303,141 @@ def _gs_only_backend(strategy: AudioRenderStrategy) -> AudioGSBackend:
         forward_override=TinyGSOnlyAudioModel.inherited_unet_forward,
         render_strategy=strategy,
     )
+
+
+@pytest.mark.parametrize(
+    ("strategy", "expected"),
+    [
+        (AudioRenderStrategy.NATIVE_RESIDUAL, ("acoustic",)),
+        (AudioRenderStrategy.GATED_NATIVE_RESIDUAL, ("acoustic",)),
+        (
+            AudioRenderStrategy.PLAIN_UNET,
+            ("acoustic", "audio_unet"),
+        ),
+        (
+            AudioRenderStrategy.DIRECT_CONDITIONED_UNET,
+            ("acoustic", "audio_unet"),
+        ),
+    ],
+)
+def test_gs_only_audio_groups_follow_condition_none_forward(strategy, expected) -> None:
+    backend = _gs_only_backend(strategy)
+
+    assert backend.audio_only_parameter_groups() == expected
+
+
+def test_non_gs_only_audio_groups_include_acoustic_and_unet() -> None:
+    model = TinyAudioModel()
+    model.renderer = FiLMConditionedAudioUNet(model.renderer, embedding_dim=8)
+    backend = AudioGSBackend(model, source_path=Path("audio.pth"))
+
+    assert backend.audio_only_parameter_groups() == ("acoustic", "audio_unet")
+
+
+def test_query_dependent_audio_only_path_uses_only_acoustic_parameters() -> None:
+    model = TinyGSOnlyAudioModel()
+    complex_renderer = nn.Linear(1, 1)
+    backend = AudioGSBackend(
+        model,
+        source_path=Path("audio.pth"),
+        complex_renderer=complex_renderer,
+    )
+    source = torch.randn(1, 2, 32, generator=torch.Generator().manual_seed(23))
+
+    backend.render(torch.zeros(1, 12), source).square().mean().backward()
+
+    assert backend.audio_only_parameter_groups() == ("acoustic",)
+    assert model.acoustic_gain.grad is not None
+    assert all(parameter.grad is None for parameter in model.renderer.parameters())
+    assert all(parameter.grad is None for parameter in complex_renderer.parameters())
+
+
+@pytest.mark.parametrize(
+    ("strategy", "expect_unet_gradient"),
+    [
+        (AudioRenderStrategy.NATIVE_RESIDUAL, False),
+        (AudioRenderStrategy.GATED_NATIVE_RESIDUAL, False),
+        (AudioRenderStrategy.PLAIN_UNET, True),
+        (AudioRenderStrategy.DIRECT_CONDITIONED_UNET, True),
+    ],
+)
+def test_gs_only_audio_group_selection_matches_real_gradients(
+    strategy, expect_unet_gradient
+) -> None:
+    backend = _gs_only_backend(strategy)
+    source = torch.randn(1, 2, 32, generator=torch.Generator().manual_seed(19))
+
+    backend.render(torch.zeros(1, 12), source).square().mean().backward()
+
+    assert backend.model.acoustic_gain.grad is not None
+    unet_gradients = [
+        parameter.grad for parameter in backend.audio_unet_parameters()
+    ]
+    assert any(gradient is not None for gradient in unet_gradients) is expect_unet_gradient
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        AudioRenderStrategy.NATIVE_RESIDUAL,
+        AudioRenderStrategy.GATED_NATIVE_RESIDUAL,
+    ],
+)
+def test_removing_dormant_gs_only_unet_is_one_step_bitwise_equivalent(
+    strategy,
+) -> None:
+    legacy = _gs_only_backend(strategy)
+    corrected = copy.deepcopy(legacy)
+    legacy_unet = legacy.audio_unet_parameters()
+    legacy_optimizer = torch.optim.Adam(
+        [*legacy.acoustic_parameters(), *legacy_unet], lr=1e-3
+    )
+    corrected_optimizer = torch.optim.Adam(
+        corrected.acoustic_parameters(), lr=1e-3
+    )
+    source = torch.randn(1, 2, 32, generator=torch.Generator().manual_seed(29))
+    pose = torch.zeros(1, 12)
+
+    for backend, optimizer in (
+        (legacy, legacy_optimizer),
+        (corrected, corrected_optimizer),
+    ):
+        optimizer.zero_grad(set_to_none=True)
+        backend.render(pose, source).square().mean().backward()
+        optimizer.step()
+
+    for name, expected in legacy.state_dict().items():
+        assert torch.equal(corrected.state_dict()[name], expected), name
+    assert all(parameter not in legacy_optimizer.state for parameter in legacy_unet)
+
+
+def test_freezing_query_orphan_parameters_is_one_step_bitwise_equivalent() -> None:
+    model = TinyGSOnlyAudioModel()
+    legacy = AudioGSBackend(
+        model,
+        source_path=Path("audio.pth"),
+        complex_renderer=nn.Linear(1, 1),
+    )
+    corrected = copy.deepcopy(legacy)
+    legacy.requires_grad_(True)
+    corrected.requires_grad_(False)
+    for parameter in corrected.acoustic_parameters():
+        parameter.requires_grad_(True)
+    legacy_optimizer = torch.optim.Adam(legacy.acoustic_parameters(), lr=1e-3)
+    corrected_optimizer = torch.optim.Adam(corrected.acoustic_parameters(), lr=1e-3)
+    source = torch.randn(1, 2, 32, generator=torch.Generator().manual_seed(31))
+    pose = torch.zeros(1, 12)
+
+    for backend, optimizer in (
+        (legacy, legacy_optimizer),
+        (corrected, corrected_optimizer),
+    ):
+        optimizer.zero_grad(set_to_none=True)
+        backend.render(pose, source).square().mean().backward()
+        optimizer.step()
+
+    for name, expected in legacy.state_dict().items():
+        assert torch.equal(corrected.state_dict()[name], expected), name
 
 
 def test_direct_conditioned_unet_replaces_gs_only_output() -> None:
