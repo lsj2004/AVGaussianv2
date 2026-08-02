@@ -7,8 +7,8 @@ continuation 均已完成并独立复核。P3 10k 门禁保留
 `cross_attention_masks/lambda_lre=0.01` 与
 `query_dependent_p1/lambda_lre=0.02`。首条 30k continuation 已训练、发布、评测并由
 冻结 verifier 独立复核；第二条
-`cross_attention_masks/Scene7playing/seed42/lambda_lre=0` 在 2026-08-03 05:50 达到
-精确 14.5k，其余六条保持精确 10k continuation。GPU 所有权 watchdog 与污染恢复
+`cross_attention_masks/Scene7playing/seed42/lambda_lre=0` 在 2026-08-03 06:07 达到
+精确 17.5k，其余六条保持精确 10k continuation。GPU 所有权 watchdog 与污染恢复
 supervisor 持续运行：GPU 1 当前承担正式训练，GPU 2 被外部任务高利用率占用时不抢占、
 不混跑。
 本文同时保留最初预注册规则与执行后修订，不能把探索性扩展事后表述成预注册实验。
@@ -167,7 +167,7 @@ evaluator 现在也会在昂贵计算前创建输出父目录。
 | post-freeze 流水线修复 | 最新 446/446 pytest、全仓 Ruff、diff-check 通过 | P3 后再做最终合并 review |
 | P2 主矩阵 | 32/32 5k + 8/8 test-retest，均独立复核 | 已完成 |
 | P3 10k | 8/8 continuation，门禁与独立复核通过 | 已完成 |
-| P3 30k / causal / seeds | 1/8 完整验证；第二条精确 14.5k；其余六条精确 10k | 依门禁顺序继续 |
+| P3 30k / causal / seeds | 1/8 完整验证；第二条精确 17.5k；其余六条精确 10k | 依门禁顺序继续 |
 | update-matched Audio-only 闭环 | 2-run confirmation 与 4-run robustness manifest 已生成并由 frozen loader 验证 | P3 候选链结束后自动执行 |
 
 正式训练 Python 没有 `cdpam`；已有 CDPAM 环境又没有 `gsplat/tinycudann`。主评测因此
@@ -445,6 +445,9 @@ SHA-256 以及 P2 scene-macro 数值，禁止只信任可单独编辑的汇总 J
 P3 后处理、Audio-only、最终报告三段 relay 使用逐次唯一 token 和原子成功 receipt 串联；
 下游必须匹配上游 receipt 的 token、gate/finalist/manifest 哈希，不能再把 PID 消失或旧
 目录残留解释为阶段成功。
+该链路冻结于工具提交 `3c3527a4dbb674af0fb670587167936b18b3abfc`。替换只终止旧的
+等待 relay；30k supervisor 保持 PID `1661222`，训练 commit、manifest、continuation
+和 GPU 进程均未改变。
 若 30k causal 门禁没有 finalist，候选多 seed 按预注册规则不运行，但仍必须完成
 Audio-only seed42/30k，并自动生成包含所有候选淘汰原因、Audio-only 与
 Source/Mono/native 绝对参照的正式 no-finalist 报告，禁止只写日志或选择性不报告。
