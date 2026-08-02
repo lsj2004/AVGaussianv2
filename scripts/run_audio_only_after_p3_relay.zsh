@@ -31,6 +31,14 @@ adaptive_runner=/tmp/avgf_run_adaptive_relocated_manifest.zsh
 adaptive_runner_sha256=1934e0d9a3a13248263d009d670469cec2c49c76aa033052701fdccb92871534
 verify_lre=/tmp/avgf_verify_lre_manifest_step.zsh
 verify_lre_sha256=ce4888d24a53a0a281f7dc518dd7585cc1add024bec99fdf919e1c7939232c42
+verify_causal=/tmp/avgf_verify_causal_manifest_step.zsh
+verify_causal_sha256=82a59c9aaa259458034ca79fc0c5b6f622cc0539b50fad207f1e0d683e787f61
+relocated_runner=/tmp/avgf_benchmark_lre_run_relocated.py
+relocated_runner_sha256=6b7811138c1db48c79deb93cf6440da372ff9005985e08836d31c09a8e78abcd
+gpu_watchdog=/tmp/avgf_gpu_pid_watchdog_logged.zsh
+gpu_watchdog_sha256=d5c824c76da88c0e798aa2aa578ea5730c912c2d585762b285ca5995477f0115
+shard_generator=/tmp/avgf_shard_lre_manifest.py
+shard_generator_sha256=634e0cb0be4aa253f1691f41a7784aa27114f0d20a7a1248362468e362991c85
 log=/tmp/avgf-audio-only-after-p3-versioned.log
 
 log_event() {
@@ -69,6 +77,10 @@ if [[ "$observed_commit" != "$tool_commit" ]] || [[ -n "$observed_dirty" ]]; the
 fi
 if [[ "$(sha256sum "$adaptive_runner" | cut -d' ' -f1)" != "$adaptive_runner_sha256" ]] \
   || [[ "$(sha256sum "$verify_lre" | cut -d' ' -f1)" != "$verify_lre_sha256" ]] \
+  || [[ "$(sha256sum "$verify_causal" | cut -d' ' -f1)" != "$verify_causal_sha256" ]] \
+  || [[ "$(sha256sum "$relocated_runner" | cut -d' ' -f1)" != "$relocated_runner_sha256" ]] \
+  || [[ "$(sha256sum "$gpu_watchdog" | cut -d' ' -f1)" != "$gpu_watchdog_sha256" ]] \
+  || [[ "$(sha256sum "$shard_generator" | cut -d' ' -f1)" != "$shard_generator_sha256" ]] \
   || [[ "$(sha256sum "$confirmation_manifest" | cut -d' ' -f1)" != "$confirmation_sha256" ]] \
   || [[ "$(sha256sum "$robustness_manifest" | cut -d' ' -f1)" != "$robustness_sha256" ]] \
   || ! validate_manifest "$confirmation_manifest" \

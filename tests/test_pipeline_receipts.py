@@ -20,6 +20,10 @@ def test_post_p3_relay_uses_strict_gate_and_publishes_token_bound_receipt() -> N
 
     assert "run_verified_p3_30k_gate.py" in text
     assert "--gate-implementation-sha256" in text
+    assert "avgf_benchmark_lre_run_relocated.py" in text
+    assert "avgf_gpu_pid_watchdog_logged.zsh" in text
+    assert "avgf_shard_lre_manifest.py" in text
+    assert "avgf_verify_causal_manifest_step.zsh" in text
     assert "p3-pipeline-receipt" in text
     assert 'run_token:$token' in text
     assert 'gate_30k_sha256:$gate_sha' in text
@@ -30,6 +34,10 @@ def test_audio_relay_requires_p3_receipt_and_verifies_both_manifests() -> None:
     text = AUDIO_ONLY.read_text()
 
     assert "missing_or_invalid_p3_receipt" in text
+    assert "relocated_runner_sha256" in text
+    assert "gpu_watchdog_sha256" in text
+    assert "shard_generator_sha256" in text
+    assert "verify_causal_sha256" in text
     assert '[[ "$(jq -r .run_token "$p3_receipt")" != "$p3_run_token" ]]' in text
     assert '"$confirmation_manifest" "$run_root" 30000 2' in text
     assert '"$robustness_manifest" "$run_root" 30000 4' in text

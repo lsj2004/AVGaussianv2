@@ -121,6 +121,15 @@ class TinyGSOnlyAudioModel(TinyAudioModel):
         return super().forward(cam_pose, source_audio)
 
 
+def _seeded_film_model(model_type):
+    """Build a non-degenerate test UNet without changing the caller RNG."""
+    with torch.random.fork_rng():
+        torch.manual_seed(0)
+        model = model_type()
+        model.renderer = FiLMConditionedAudioUNet(model.renderer, embedding_dim=8)
+    return model
+
+
 def test_audio_backend_rejects_checkpoint_without_model_state(tmp_path: Path) -> None:
     path = tmp_path / "bad.pth"
     torch.save({"optimizer_state_dict": {}}, path)
@@ -254,8 +263,7 @@ def test_audio_backend_rejects_unimplemented_enhanced_criterion() -> None:
 
 
 def test_audio_backend_applies_condition_only_inside_render_scope() -> None:
-    model = TinyAudioModel()
-    model.renderer = FiLMConditionedAudioUNet(model.renderer, embedding_dim=8)
+    model = _seeded_film_model(TinyAudioModel)
     backend = AudioGSBackend(model, source_path=Path("audio.pth"))
     with torch.no_grad():
         backend.conditioned_renderer.film["e1"].to_scale_shift.weight.fill_(0.02)
@@ -270,14 +278,7 @@ def test_audio_backend_applies_condition_only_inside_render_scope() -> None:
 
 
 def test_gs_only_bridge_forces_inherited_unet_forward() -> None:
-    # The assertion below needs a non-degenerate inherited UNet.  Preserve the
-    # caller RNG while making its randomly initialized weights deterministic;
-    # some valid random initializations attenuate the small FiLM perturbation
-    # below torch.allclose's tolerance and made this test flaky.
-    with torch.random.fork_rng():
-        torch.manual_seed(0)
-        model = TinyGSOnlyAudioModel()
-        model.renderer = FiLMConditionedAudioUNet(model.renderer, embedding_dim=8)
+    model = _seeded_film_model(TinyGSOnlyAudioModel)
     backend = AudioGSBackend(
         model,
         source_path=Path("audio.pth"),
@@ -301,8 +302,7 @@ def test_gs_only_bridge_forces_inherited_unet_forward() -> None:
 
 
 def _gs_only_backend(strategy: AudioRenderStrategy) -> AudioGSBackend:
-    model = TinyGSOnlyAudioModel()
-    model.renderer = FiLMConditionedAudioUNet(model.renderer, embedding_dim=8)
+    model = _seeded_film_model(TinyGSOnlyAudioModel)
     return AudioGSBackend(
         model,
         source_path=Path("audio.pth"),
