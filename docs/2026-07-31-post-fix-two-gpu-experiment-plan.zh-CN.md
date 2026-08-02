@@ -159,7 +159,7 @@ evaluator 现在也会在昂贵计算前创建输出父目录。
 | 正式主评测 DPAM | 双运行时 130 样本 smoke 通过 | 全量测试复核 |
 | P1 自动化筛选 | fail-closed selector 与生成器绑定已实现 | 全量测试复核 |
 | frozen 正式代码质量 | 400 项 pytest、全仓 Ruff、diff-check 通过 | 已完成 |
-| post-freeze 流水线修复 | 419/419 互斥分片、全仓 Ruff、diff-check 通过 | P3 后再做最终合并 review |
+| post-freeze 流水线修复 | 423/423 互斥分片、全仓 Ruff、diff-check 通过 | P3 后再做最终合并 review |
 | P2 主矩阵 | 32/32 5k + 8/8 test-retest，均独立复核 | 已完成 |
 | P3 10k | 8/8 continuation，门禁与独立复核通过 | 已完成 |
 | P3 30k / causal / seeds | 首个 10k→30k continuation 已启动 | 依门禁顺序继续 |
