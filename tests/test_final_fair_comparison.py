@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -170,3 +171,119 @@ def test_markdown_has_separate_fair_and_reference_tables() -> None:
     assert "source_binaural" in text
     assert "mono" in text
     assert "最终候选相对绝对参照的差值" in text
+
+
+def test_no_finalist_markdown_reports_rejection_without_multiseed_claim() -> None:
+    module = _load_module()
+    metrics = {metric: 0.5 for metric in module.MODEL_METRICS}
+    report = {
+        "status": "no_finalist",
+        "audio_only_seed42_30k": metrics,
+        "rejected_candidates": [
+            {
+                "system": "query_dependent_p1",
+                "lambda_lre": 0.02,
+                "passed": False,
+                "reasons": ["causal_gate_failed"],
+                "treatment_macro": metrics,
+            }
+        ],
+        "absolute_references": {
+            name: {metric: 0.5 for metric in module.DISPLAY_METRICS}
+            for name in ("source_binaural", "mono", "native_audiogs")
+        },
+    }
+
+    text = module.render_markdown(report)
+
+    assert "无候选通过 30k 门禁" in text
+    assert "causal_gate_failed" in text
+    assert "未启动候选多 seed" in text
+    assert "Source/Mono/native 绝对参照" in text
+
+
+def test_no_finalist_builder_requires_audio_only_and_preserves_reasons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    candidate_path = tmp_path / "candidate.json"
+    audio_path = tmp_path / "audio.json"
+    gate_path = tmp_path / "gate.json"
+    p2_path = tmp_path / "p2.json"
+    candidate_path.write_text("{}\n")
+    audio_path.write_text("{}\n")
+    gate_path.write_text("{}\n")
+    metrics = {metric: 0.5 for metric in module.MODEL_METRICS}
+    audio_runs = [
+        {
+            "continuation_id": f"audio__{scene}",
+            "stage": "confirmation",
+            "system": "audio_only",
+            "scene": scene,
+            "seed": 42,
+            "lambda_lre": 0.0,
+        }
+        for scene in module.SCENES
+    ]
+    candidate_document = {"repository": REPOSITORY, "runs": []}
+    audio_document = {"repository": REPOSITORY, "runs": audio_runs}
+    monkeypatch.setattr(
+        module,
+        "_manifest",
+        lambda path: candidate_document if path == candidate_path else audio_document,
+    )
+    monkeypatch.setattr(
+        module,
+        "_load_model_run",
+        lambda *_args: {
+            "content_sha256": "a" * 64,
+            "metric_protocol": {"fixed": True},
+            "metrics": metrics,
+        },
+    )
+    p2_path.write_text(
+        json.dumps(
+            {
+                "schema": "avgaussianv2.p2-fair-baseline-report",
+                "repository": REPOSITORY,
+                "scene_macro": {
+                    name: {metric: 0.5 for metric in module.DISPLAY_METRICS}
+                    for name in ("source_binaural", "mono", "native_audiogs")
+                },
+            }
+        )
+    )
+    gate = {
+        "schema": "avgaussianv2.p3-30k-gate",
+        "repository": REPOSITORY,
+        "manifest_30k": {
+            "path": str(candidate_path.resolve()),
+            "sha256": module._sha256(candidate_path),
+        },
+        "selected_finalist": None,
+        "candidates": [
+            {
+                "system": "query_dependent_p1",
+                "lambda_lre": 0.02,
+                "passed": False,
+                "reasons": ["lre_not_improved_in_both_scenes"],
+                "treatment_macro": metrics,
+            }
+        ],
+    }
+
+    report = module._build_no_finalist(
+        gate=gate,
+        gate_path=gate_path,
+        candidate_main_path=candidate_path,
+        audio_main_path=audio_path,
+        run_root=tmp_path,
+        p2_fair_report_path=p2_path,
+    )
+
+    assert report["status"] == "no_finalist"
+    assert report["selected_finalist"] is None
+    assert report["rejected_candidates"][0]["reasons"] == [
+        "lre_not_improved_in_both_scenes"
+    ]
+    assert report["audio_only_seed42_30k"]["paper_lre_db"] == pytest.approx(0.5)

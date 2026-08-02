@@ -384,7 +384,76 @@ def _format(value: float) -> str:
     return f"{value:.6f}"
 
 
+def _render_no_finalist_markdown(report: Mapping[str, Any]) -> str:
+    audio = report["audio_only_seed42_30k"]
+    candidates = report["rejected_candidates"]
+    references = report["absolute_references"]
+    lines = [
+        "# 最终公平比较：无候选通过 30k 门禁",
+        "",
+        "30k、逐场景、causal 与 guardrail 门禁没有选出 finalist；因此未启动候选多 seed，",
+        "也不能把任一候选报告为优于 Audio-only。下表为 seed42、30k 的门禁证据。",
+        "",
+        "## 1. 30k 候选与 Audio-only",
+        "",
+        "| 模型 | "
+        + " | ".join(DISPLAY_LABELS[m] for m in PRIMARY_MODEL_METRICS)
+        + " | 门禁 |",
+        "|---|" + "---:|" * len(PRIMARY_MODEL_METRICS) + "---|",
+        "| audio_only/lambda=0 | "
+        + " | ".join(_format(audio[metric]) for metric in PRIMARY_MODEL_METRICS)
+        + " | 公平主基线 |",
+    ]
+    for candidate in candidates:
+        label = f"{candidate['system']}/lambda={candidate['lambda_lre']}"
+        reasons = ", ".join(candidate["reasons"])
+        lines.append(
+            "| "
+            + label
+            + " | "
+            + " | ".join(
+                _format(candidate["treatment_macro"][metric])
+                for metric in PRIMARY_MODEL_METRICS
+            )
+            + f" | {reasons} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## 2. Source/Mono/native 绝对参照",
+            "",
+            "该表只做 metric-matched 描述，不是 update-/seed-matched 排名。",
+            "",
+            "| 方法 | " + " | ".join(DISPLAY_LABELS[m] for m in DISPLAY_METRICS) + " |",
+            "|---|" + "---:|" * len(DISPLAY_METRICS),
+            "| audio_only/lambda=0，seed42/30k | "
+            + " | ".join(_format(audio[metric]) for metric in DISPLAY_METRICS)
+            + " |",
+        ]
+    )
+    for name in ("source_binaural", "mono", "native_audiogs"):
+        lines.append(
+            "| "
+            + name
+            + " | "
+            + " | ".join(
+                _format(references[name][metric]) for metric in DISPLAY_METRICS
+            )
+            + " |"
+        )
+    lines.extend(
+        [
+            "",
+            "Mono 的低 LRE/ILD/IPD 受通道对称性影响，不能单独证明空间定位正确。",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def render_markdown(report: Mapping[str, Any]) -> str:
+    if report.get("status") == "no_finalist":
+        return _render_no_finalist_markdown(report)
     finalist = report["selected_finalist"]
     models = report["models"]["across_seed"]
     comparison = report["paired_comparisons"]["candidate_vs_audio_only"]
@@ -522,18 +591,168 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _reference_macro(
+    p2_fair_report_path: Path, repository: Mapping[str, Any]
+) -> dict[str, dict[str, float]]:
+    p2 = _load_json(p2_fair_report_path)
+    if (
+        p2.get("schema") != "avgaussianv2.p2-fair-baseline-report"
+        or p2.get("repository") != repository
+    ):
+        raise ValueError("P2 reference report is not bound to the final repository")
+    reference_macro = p2.get("scene_macro")
+    if not isinstance(reference_macro, dict):
+        raise ValueError("P2 reference report lacks scene macro values")
+    references = {}
+    for name in ("source_binaural", "mono", "native_audiogs"):
+        values = reference_macro.get(name)
+        if not isinstance(values, dict) or any(
+            metric not in values for metric in DISPLAY_METRICS
+        ):
+            raise ValueError(f"P2 reference metrics missing: {name}")
+        references[name] = {metric: float(values[metric]) for metric in DISPLAY_METRICS}
+    return references
+
+
+def _build_no_finalist(
+    *,
+    gate: Mapping[str, Any],
+    gate_path: Path,
+    candidate_main_path: Path,
+    audio_main_path: Path,
+    run_root: Path,
+    p2_fair_report_path: Path,
+) -> dict[str, Any]:
+    if (
+        gate.get("schema") != "avgaussianv2.p3-30k-gate"
+        or gate.get("selected_finalist") is not None
+    ):
+        raise ValueError(
+            "no-finalist report requires a completed gate without finalist"
+        )
+    candidate_main = _manifest(candidate_main_path)
+    audio_main = _manifest(audio_main_path)
+    repository = gate.get("repository")
+    if (
+        not isinstance(repository, dict)
+        or candidate_main.get("repository") != repository
+        or audio_main.get("repository") != repository
+        or gate.get("manifest_30k")
+        != {
+            "path": str(candidate_main_path.resolve()),
+            "sha256": _sha256(candidate_main_path),
+        }
+    ):
+        raise ValueError("no-finalist inputs are not bound to one formal repository")
+    audio_runs = {
+        str(run["scene"]): run
+        for run in audio_main["runs"]
+        if run.get("system") == "audio_only"
+        and run.get("seed") == 42
+        and float(run.get("lambda_lre", -1.0)) == 0.0
+    }
+    if set(audio_runs) != set(SCENES) or len(audio_main["runs"]) != 2:
+        raise ValueError(
+            "no-finalist report requires the exact two-scene Audio-only seed42 matrix"
+        )
+    audio_evaluations = {
+        scene: _load_model_run(run_root, audio_runs[scene], repository)
+        for scene in SCENES
+    }
+    protocols = {
+        json.dumps(value["metric_protocol"], sort_keys=True)
+        for value in audio_evaluations.values()
+    }
+    if len(protocols) != 1:
+        raise ValueError("Audio-only metric protocol differs across no-finalist scenes")
+    audio_macro = {
+        metric: statistics.fmean(
+            audio_evaluations[scene]["metrics"][metric] for scene in SCENES
+        )
+        for metric in MODEL_METRICS
+    }
+    raw_candidates = gate.get("candidates")
+    if not isinstance(raw_candidates, list) or not raw_candidates:
+        raise ValueError("no-finalist gate lacks rejected candidate evidence")
+    candidates = []
+    for raw in raw_candidates:
+        if (
+            not isinstance(raw, dict)
+            or raw.get("passed") is not False
+            or not isinstance(raw.get("reasons"), list)
+            or not raw["reasons"]
+            or not isinstance(raw.get("treatment_macro"), dict)
+            or any(
+                metric not in raw["treatment_macro"] for metric in PRIMARY_MODEL_METRICS
+            )
+        ):
+            raise ValueError("no-finalist gate contains an invalid rejected candidate")
+        candidates.append(raw)
+    references = _reference_macro(p2_fair_report_path, repository)
+    return {
+        "schema": SCHEMA,
+        "version": 1,
+        "status": "no_finalist",
+        "repository": repository,
+        "selected_finalist": None,
+        "protocol": {
+            "candidate_boundary": "30k seed42 gate; no candidate passed causal and guardrails",
+            "audio_only_boundary": "30k seed42 x two scenes; scene-equal macro",
+            "multi_seed": "not run because the preregistered 30k gate selected no finalist",
+            "reference_boundary": "Source/Mono/native are metric-matched descriptive references only",
+        },
+        "audio_only_seed42_30k": audio_macro,
+        "rejected_candidates": candidates,
+        "absolute_references": references,
+        "evidence": {
+            "gate_30k": {
+                "path": str(gate_path.resolve()),
+                "sha256": _sha256(gate_path),
+            },
+            "candidate_main_manifest": {
+                "path": str(candidate_main_path.resolve()),
+                "sha256": _sha256(candidate_main_path),
+            },
+            "audio_main_manifest": {
+                "path": str(audio_main_path.resolve()),
+                "sha256": _sha256(audio_main_path),
+            },
+            "p2_fair_report": {
+                "path": str(p2_fair_report_path.resolve()),
+                "sha256": _sha256(p2_fair_report_path),
+            },
+            "audio_evaluation_content_sha256": {
+                scene: audio_evaluations[scene]["content_sha256"] for scene in SCENES
+            },
+        },
+    }
+
+
 def build(
     *,
     gate_path: Path,
     candidate_main_path: Path,
-    candidate_seed_path: Path,
+    candidate_seed_path: Path | None,
     audio_main_path: Path,
-    audio_seed_path: Path,
+    audio_seed_path: Path | None,
     run_root: Path,
     p2_fair_report_path: Path,
     resamples: int,
 ) -> dict[str, Any]:
     gate = _load_json(gate_path)
+    if gate.get("selected_finalist") is None:
+        return _build_no_finalist(
+            gate=gate,
+            gate_path=gate_path,
+            candidate_main_path=candidate_main_path,
+            audio_main_path=audio_main_path,
+            run_root=run_root,
+            p2_fair_report_path=p2_fair_report_path,
+        )
+    if candidate_seed_path is None or audio_seed_path is None:
+        raise ValueError(
+            "finalist report requires candidate and Audio-only seed manifests"
+        )
     candidate_main = _manifest(candidate_main_path)
     candidate_seeds = _manifest(candidate_seed_path)
     audio_main = _manifest(audio_main_path)
@@ -568,23 +787,7 @@ def build(
         raise ValueError("metric protocol mismatch across strict final models")
     models, comparisons = aggregate_final_models(evaluations, resamples=resamples)
 
-    p2 = _load_json(p2_fair_report_path)
-    if (
-        p2.get("schema") != "avgaussianv2.p2-fair-baseline-report"
-        or p2.get("repository") != repository
-    ):
-        raise ValueError("P2 reference report is not bound to the final repository")
-    reference_macro = p2.get("scene_macro")
-    if not isinstance(reference_macro, dict):
-        raise ValueError("P2 reference report lacks scene macro values")
-    references = {}
-    for name in ("source_binaural", "mono", "native_audiogs"):
-        values = reference_macro.get(name)
-        if not isinstance(values, dict) or any(
-            metric not in values for metric in DISPLAY_METRICS
-        ):
-            raise ValueError(f"P2 reference metrics missing: {name}")
-        references[name] = {metric: float(values[metric]) for metric in DISPLAY_METRICS}
+    references = _reference_macro(p2_fair_report_path, repository)
 
     candidate_means = {
         metric: models["across_seed"]["candidate"][metric]["mean"]
@@ -607,6 +810,7 @@ def build(
     return {
         "schema": SCHEMA,
         "version": 1,
+        "status": "finalist",
         "repository": repository,
         "selected_finalist": {"system": system, "lambda_lre": treatment},
         "protocol": {
@@ -656,9 +860,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--gate-30k", type=Path, required=True)
     parser.add_argument("--candidate-main-manifest", type=Path, required=True)
-    parser.add_argument("--candidate-seed-manifest", type=Path, required=True)
+    parser.add_argument("--candidate-seed-manifest", type=Path)
     parser.add_argument("--audio-main-manifest", type=Path, required=True)
-    parser.add_argument("--audio-seed-manifest", type=Path, required=True)
+    parser.add_argument("--audio-seed-manifest", type=Path)
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--p2-fair-report", type=Path, required=True)
     parser.add_argument("--output-json", type=Path, required=True)
