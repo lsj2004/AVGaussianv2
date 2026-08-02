@@ -270,8 +270,14 @@ def test_audio_backend_applies_condition_only_inside_render_scope() -> None:
 
 
 def test_gs_only_bridge_forces_inherited_unet_forward() -> None:
-    model = TinyGSOnlyAudioModel()
-    model.renderer = FiLMConditionedAudioUNet(model.renderer, embedding_dim=8)
+    # The assertion below needs a non-degenerate inherited UNet.  Preserve the
+    # caller RNG while making its randomly initialized weights deterministic;
+    # some valid random initializations attenuate the small FiLM perturbation
+    # below torch.allclose's tolerance and made this test flaky.
+    with torch.random.fork_rng():
+        torch.manual_seed(0)
+        model = TinyGSOnlyAudioModel()
+        model.renderer = FiLMConditionedAudioUNet(model.renderer, embedding_dim=8)
     backend = AudioGSBackend(
         model,
         source_path=Path("audio.pth"),

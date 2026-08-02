@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from avgaussianv2.benchmark.evaluation import load_evaluation  # noqa: E402
+from avgaussianv2.benchmark.evaluation import verify_evaluation  # noqa: E402
 from avgaussianv2.benchmark.lre_orchestration import (  # noqa: E402
     load_lre_run_manifest,
 )
@@ -260,7 +260,10 @@ def _load_model_run(
     if identity.get("repository") != repository:
         raise ValueError(f"continuation repository mismatch: {run_dir.name}")
     _complete_run(run_dir, str(run["stage"]))
-    evaluation = load_evaluation(run_dir / "evaluations/step_030000")
+    # A final report must re-audit the immutable evaluation *and* the bound
+    # training output.  Merely loading the evaluation generation would allow a
+    # checkpoint/runtime-contract mutation after evaluation to go unnoticed.
+    evaluation = verify_evaluation(run_dir / "evaluations/step_030000")
     if (
         evaluation.identity.scene_id != run["scene"]
         or evaluation.identity.system_name != run["system"]
@@ -600,6 +603,44 @@ def _reference_macro(
         or p2.get("repository") != repository
     ):
         raise ValueError("P2 reference report is not bound to the final repository")
+    evidence = p2.get("evidence")
+    if not isinstance(evidence, Mapping):
+        raise ValueError("P2 reference report lacks reference artifact evidence")
+    reference_dir = p2_fair_report_path.parent / "audio_references"
+    aggregate_path = reference_dir / "aggregate.json"
+    verification_path = reference_dir / "verification.json"
+    if (
+        evidence.get("reference_aggregate_sha256") != _sha256(aggregate_path)
+        or evidence.get("reference_verification_sha256")
+        != _sha256(verification_path)
+    ):
+        raise ValueError("P2 reference artifact hash mismatch")
+    verification = _load_json(verification_path)
+    files = verification.get("files")
+    if (
+        verification.get("schema")
+        != "avgaussianv2.audiogs-paper-reference-baselines.verification"
+        or verification.get("version") != 1
+        or not isinstance(files, Mapping)
+        or files.get("aggregate.json") != evidence["reference_aggregate_sha256"]
+    ):
+        raise ValueError("P2 reference verification manifest mismatch")
+    for name, expected_sha256 in files.items():
+        if (
+            not isinstance(name, str)
+            or Path(name).name != name
+            or not isinstance(expected_sha256, str)
+            or _sha256(reference_dir / name) != expected_sha256
+        ):
+            raise ValueError(f"P2 reference verification failed: {name}")
+    aggregate = _load_json(aggregate_path)
+    if (
+        aggregate.get("schema")
+        != "avgaussianv2.audiogs-paper-reference-baselines"
+        or aggregate.get("version") != 1
+        or aggregate.get("repository") != repository
+    ):
+        raise ValueError("P2 reference aggregate identity mismatch")
     reference_macro = p2.get("scene_macro")
     if not isinstance(reference_macro, dict):
         raise ValueError("P2 reference report lacks scene macro values")
@@ -611,6 +652,21 @@ def _reference_macro(
         ):
             raise ValueError(f"P2 reference metrics missing: {name}")
         references[name] = {metric: float(values[metric]) for metric in DISPLAY_METRICS}
+    aggregate_combined = aggregate.get("combined")
+    if not isinstance(aggregate_combined, Mapping):
+        raise ValueError("P2 reference aggregate lacks combined values")
+    for name in ("source_binaural", "mono"):
+        try:
+            aggregate_values = {
+                metric: float(aggregate_combined[name]["scene_macro"][metric]["mean"])
+                for metric in DISPLAY_METRICS
+            }
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"P2 reference aggregate metrics missing: {name}"
+            ) from error
+        if aggregate_values != references[name]:
+            raise ValueError(f"P2 reference report/aggregate mismatch: {name}")
     return references
 
 

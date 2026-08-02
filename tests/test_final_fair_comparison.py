@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -89,6 +90,104 @@ def _evaluations(module):
     return values
 
 
+def _write_p2_reference_fixture(module, root: Path) -> Path:
+    reference_dir = root / "audio_references"
+    reference_dir.mkdir()
+    reference_values = {
+        name: {metric: 0.5 for metric in module.DISPLAY_METRICS}
+        for name in ("source_binaural", "mono", "native_audiogs")
+    }
+    aggregate = {
+        "schema": "avgaussianv2.audiogs-paper-reference-baselines",
+        "version": 1,
+        "repository": REPOSITORY,
+        "combined": {
+            name: {
+                "scene_macro": {
+                    metric: {"mean": value}
+                    for metric, value in reference_values[name].items()
+                }
+            }
+            for name in ("source_binaural", "mono")
+        },
+    }
+    aggregate_path = reference_dir / "aggregate.json"
+    aggregate_path.write_text(json.dumps(aggregate))
+    per_sample_path = reference_dir / "metrics_per_sample.jsonl"
+    per_sample_path.write_text("{}\n")
+    files = {
+        path.name: module._sha256(path)
+        for path in (aggregate_path, per_sample_path)
+    }
+    verification_path = reference_dir / "verification.json"
+    verification_path.write_text(
+        json.dumps(
+            {
+                "schema": "avgaussianv2.audiogs-paper-reference-baselines.verification",
+                "version": 1,
+                "files": files,
+            }
+        )
+    )
+    p2_path = root / "p2.json"
+    p2_path.write_text(
+        json.dumps(
+            {
+                "schema": "avgaussianv2.p2-fair-baseline-report",
+                "repository": REPOSITORY,
+                "evidence": {
+                    "reference_aggregate_sha256": module._sha256(aggregate_path),
+                    "reference_verification_sha256": module._sha256(
+                        verification_path
+                    ),
+                },
+                "scene_macro": reference_values,
+            }
+        )
+    )
+    return p2_path
+
+
+def _write_model_run_fixture(root: Path) -> tuple[dict[str, object], Path]:
+    run: dict[str, object] = {
+        "continuation_id": "candidate__scene1_opera__seed42",
+        "stage": "confirmation",
+        "system": "query_dependent_p1",
+        "scene": "scene1_opera",
+        "seed": 42,
+        "lambda_lre": 0.02,
+    }
+    run_dir = root / str(run["continuation_id"])
+    run_dir.mkdir()
+    (run_dir / "continuation_identity.json").write_text(
+        json.dumps(
+            {
+                **{
+                    field: run[field]
+                    for field in (
+                        "continuation_id",
+                        "scene",
+                        "system",
+                        "seed",
+                        "lambda_lre",
+                    )
+                },
+                "repository": REPOSITORY,
+            }
+        )
+    )
+    (run_dir / "run_result.confirmation.json").write_text(
+        json.dumps(
+            {
+                "status": "succeeded",
+                "completed_stages": ["confirmation"],
+                "planned_stages": ["confirmation"],
+            }
+        )
+    )
+    return run, run_dir
+
+
 def test_select_exact_matrix_accepts_only_three_by_two_by_three() -> None:
     module = _load_module()
     gate, candidate_main, candidate_seeds, audio_main, audio_seeds = _documents()
@@ -119,6 +218,62 @@ def test_select_exact_matrix_rejects_missing_audio_seed() -> None:
             audio_main=audio_main,
             audio_seeds=audio_seeds,
         )
+
+
+def test_load_model_run_requires_strict_evaluation_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    run, run_dir = _write_model_run_fixture(tmp_path)
+    evaluation_dir = run_dir / "evaluations/step_030000"
+
+    def reject_tampered_training_evidence(path: Path):
+        assert path == evaluation_dir
+        raise RuntimeError("checkpoint hash mismatch")
+
+    monkeypatch.setattr(
+        module, "verify_evaluation", reject_tampered_training_evidence
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint hash mismatch"):
+        module._load_model_run(tmp_path, run, REPOSITORY)
+
+
+def test_load_model_run_uses_verified_evaluation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    run, _ = _write_model_run_fixture(tmp_path)
+    rows = tuple(
+        {metric: float(index) for metric in module.MODEL_METRICS}
+        for index in range(2)
+    )
+    verified = SimpleNamespace(
+        identity=SimpleNamespace(
+            scene_id=run["scene"],
+            system_name=run["system"],
+            reporting_step=30_000,
+            expected_sample_ids=("sample/0", "sample/1"),
+        ),
+        provenance={
+            "seed": 42,
+            "checkpoint_step": 30_000,
+            "main_update_matched": True,
+        },
+        summary={
+            metric: {"mean": sum(row[metric] for row in rows) / len(rows)}
+            for metric in module.MODEL_METRICS
+        },
+        rows=rows,
+        metric_protocol={"fixed": True},
+        content_sha256="a" * 64,
+    )
+    monkeypatch.setattr(module, "verify_evaluation", lambda _path: verified)
+
+    loaded = module._load_model_run(tmp_path, run, REPOSITORY)
+
+    assert loaded["content_sha256"] == "a" * 64
+    assert loaded["sample_ids"] == ["sample/0", "sample/1"]
 
 
 def test_aggregation_is_paired_and_bootstrap_is_deterministic() -> None:
@@ -173,6 +328,19 @@ def test_markdown_has_separate_fair_and_reference_tables() -> None:
     assert "最终候选相对绝对参照的差值" in text
 
 
+def test_reference_macro_rejects_tampered_reference_artifact(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    p2_path = _write_p2_reference_fixture(module, tmp_path)
+    (tmp_path / "audio_references/metrics_per_sample.jsonl").write_text(
+        '{"tampered":true}\n'
+    )
+
+    with pytest.raises(ValueError, match="reference verification failed"):
+        module._reference_macro(p2_path, REPOSITORY)
+
+
 def test_no_finalist_markdown_reports_rejection_without_multiseed_claim() -> None:
     module = _load_module()
     metrics = {metric: 0.5 for metric in module.MODEL_METRICS}
@@ -209,7 +377,7 @@ def test_no_finalist_builder_requires_audio_only_and_preserves_reasons(
     candidate_path = tmp_path / "candidate.json"
     audio_path = tmp_path / "audio.json"
     gate_path = tmp_path / "gate.json"
-    p2_path = tmp_path / "p2.json"
+    p2_path = _write_p2_reference_fixture(module, tmp_path)
     candidate_path.write_text("{}\n")
     audio_path.write_text("{}\n")
     gate_path.write_text("{}\n")
@@ -240,18 +408,6 @@ def test_no_finalist_builder_requires_audio_only_and_preserves_reasons(
             "metric_protocol": {"fixed": True},
             "metrics": metrics,
         },
-    )
-    p2_path.write_text(
-        json.dumps(
-            {
-                "schema": "avgaussianv2.p2-fair-baseline-report",
-                "repository": REPOSITORY,
-                "scene_macro": {
-                    name: {metric: 0.5 for metric in module.DISPLAY_METRICS}
-                    for name in ("source_binaural", "mono", "native_audiogs")
-                },
-            }
-        )
     )
     gate = {
         "schema": "avgaussianv2.p3-30k-gate",
