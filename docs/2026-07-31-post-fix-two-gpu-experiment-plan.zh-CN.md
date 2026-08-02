@@ -163,6 +163,7 @@ evaluator 现在也会在昂贵计算前创建输出父目录。
 | P2 主矩阵 | 32/32 5k + 8/8 test-retest，均独立复核 | 已完成 |
 | P3 10k | 8/8 continuation，门禁与独立复核通过 | 已完成 |
 | P3 30k / causal / seeds | 首个 10k→30k continuation 已启动 | 依门禁顺序继续 |
+| update-matched Audio-only 闭环 | 当前只有 seed42/5k 正式结果 | 补齐 seed42 的 10k/30k continuation；最终多 seed 同步纳入 |
 
 正式训练 Python 没有 `cdpam`；已有 CDPAM 环境又没有 `gsplat/tinycudann`。主评测因此
 使用已验证的持久化双运行时，并把解释器、实现、权重哈希写入 metric protocol。禁止
@@ -261,12 +262,31 @@ paired win rate、因果差值和 guardrail 轨迹。
 对照。不能用 Scene7 的 293 样本 micro 均值掩盖 scene1 的失败。
 
 只有出现明确最终候选时，才为“最佳非零权重 + 同架构 lambda=0 control”增加 seed17、
-seed73；新增上限 8 个 30k run，与 seed42 合成 3 seeds。最终报告 across-seed mean/std
-和 95% paired hierarchical bootstrap CI。CI 跨零时结论写为“不确定”。
+seed73；这部分新增上限 8 个 30k run，与 seed42 合成 3 seeds。最终报告 across-seed
+mean/std 和 95% paired hierarchical bootstrap CI。CI 跨零时结论写为“不确定”。
+
+### P3-B：Audio-only 公平基线闭环
+
+P2 的 Audio-only 正式结果停在 5k，而 P3 候选会训练到 10k/30k。跨步数比较只能作为
+描述性参考，不能用于“超过 Audio-only”的主结论。为闭合最终公平主榜，增加以下必跑
+基线，不以候选表现为触发条件：
+
+1. 将 `audio_only/lambda_lre=0/seed42` 的两个 5k checkpoint 原地续训到 10k 和 30k；
+2. 最终进入多 seed 阶段时，同步训练 `audio_only/lambda_lre=0` 的 seed17、seed73，
+   两个场景均达到 30k；
+3. Audio-only 与最终候选必须使用相同 sample inventory、数值环境、evaluator 和 30k
+   main-update 口径；Audio-only 没有条件输入，不伪造 causal 指标；
+4. 最终模型主榜以 3 seeds × 2 scenes 的 30k 结果比较候选、同架构 lambda=0 control
+   和 Audio-only。seed42 的 10k 结果只用于补齐纵向曲线与早期收敛诊断。
+
+该闭环新增 2 个 seed42 continuation 和 4 个新 seed 30k run。它是公平性所必需的
+实验，不是看到结果后的超参数搜索；不得用 Audio-only 5k 数字替代。
 
 10k 门禁已完成：cross-attention/0.01 相对同架构 control 的 scene-macro LRE 改善
 10.07%，query P1/0.02 改善 38.18%，二者均通过 noise-aware guardrail 并进入 30k。
 这些是架构内 treatment/control 结论，不能解释为已经超过 `audio_only`、Source 或 Mono。
+P3 10k 中期报告见
+`docs/2026-08-03-p3-10k-gate-and-reference-report.zh-CN.md`。
 
 ## 7. 指标与横纵向报告
 
@@ -373,6 +393,9 @@ configs/generated/lre_loss_ablation_p3/confirmation_30k/manifest.json
 因原正式 worktree 被另一个开发任务推进，P3 执行迁移到新的 clean detached worktree，
 但仍使用相同 `98d158e4` commit、原 manifest 字节、原 continuation identity 和原输出目录。
 这种迁移必须使用显式 audited relocation；不能手工改 continuation identity 或覆盖旧目录。
+Audio-only 10k/30k 与后续 seed17/73 必须生成独立、内容寻址的 manifest，并沿用
+P2 Audio-only 的稳定 `continuation_id`；manifest 生成和独立 verifier 完成前不得进入
+最终公平主榜。
 
 Source/Mono 参考单独运行，并在正式报告前 verify-only：
 
