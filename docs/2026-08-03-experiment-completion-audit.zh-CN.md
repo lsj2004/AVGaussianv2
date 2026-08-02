@@ -71,7 +71,8 @@ P2 资源只代表 5k screening，不得外推成 30k 最终成本。`plain_unet
 | 横向公平模型榜 | 待执行 | candidate/control/Audio-only 的 30k、3 seeds、2 scenes（若有 finalist） |
 | Source/Mono/native 绝对参照榜 | 生成器完成、最终产物待执行 | 与模型公共指标及逐指标 delta 完整输出 |
 | 5k→10k→30k 纵向曲线 | 进行中 | 当前已记录两个 control；等待其余 P3 与 Audio-only |
-| Pareto 图与资源报告 | P2 资源完成，最终图待执行 | 使用最终严格矩阵，不混入不公平训练预算 |
+| 横向指标图与资源 Pareto 图 | 实现完成、最终执行待完成 | 从最终 verified JSON 自动生成，不混入不公平训练预算 |
+| 5k→10k→30k 纵向图 | 待实现并执行 | 等全部适用 continuation 节点完成后从 verified evaluation 生成 |
 | 淘汰原因 | 进行中 | 30k/causal gate 机器可读 reasons 完整保存 |
 | 一条命令 verifier | 实现完成、最终执行待完成 | 最终 report receipt 与全部根哈希一致 |
 

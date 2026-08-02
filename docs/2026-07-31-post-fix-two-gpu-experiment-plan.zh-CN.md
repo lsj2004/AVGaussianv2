@@ -548,6 +548,11 @@ verify-only 的 14MiB/数十秒误作训练成本。
 manifest、逐样本结果、per-scene/macro/micro/跨 seed 统计、横向表、纵向曲线、Pareto
 图、资源报告、淘汰原因和一条命令可复核的 verifier 入口。
 
+最终横向指标图、绝对参照图与 P2 架构资源 Pareto 图由
+`scripts/render_final_fair_comparison_svg.py` 从 verified final JSON 确定性生成；设计与
+比较边界见 `docs/2026-08-03-final-figure-pipeline-hardening.zh-CN.md`。纵向图仍必须等待
+全部适用的 5k/10k/30k 节点闭环后再生成。
+
 逐要求状态、证据路径与完成判定维护在
 `docs/2026-08-03-experiment-completion-audit.zh-CN.md`；该审计是目标完成声明的前置证据，
 不得用局部阶段成功替代。
