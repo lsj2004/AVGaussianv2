@@ -51,3 +51,7 @@ def test_final_relay_requires_exact_audio_receipt_token_and_hashes() -> None:
     assert '[[ "$(jq -r .run_token "$audio_receipt")" != "$audio_run_token" ]]' in text
     assert "confirmation_manifest_sha256" in text
     assert "robustness_manifest_sha256" in text
+    assert "expected_p2_fair_sha256" in text
+    assert "expected_reference_aggregate_sha256" in text
+    assert "expected_reference_verification_sha256" in text
+    assert "p2_reference_root_hash_mismatch" in text

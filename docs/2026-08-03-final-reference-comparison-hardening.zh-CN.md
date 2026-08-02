@@ -55,3 +55,8 @@ FiLM 扰动压到 `torch.allclose` 容差以内。所有依赖“FiLM 扰动必�
 `reference_verification_sha256=38aab786429fe56e4d73f163de9e7a1059f0c4d09fd8acd2385b5aeb54fd9958`
 均通过，Source Binaural、Mono、native AudioGS 的 3×7 scene-macro 数值成功从严格路径
 读取。最终报告不会在长实验结束后才首次接触这些历史参考产物。
+
+最终 relay 还从冻结工具代码外部固定 P2 报告自身 SHA-256
+`920364e134896d2e495ba8985936d5798048bc5b4b2ed763604569db3e722eb0`，并同时固定上述
+aggregate/verification 哈希。这样不再依赖“P2 JSON 内部自证”，即使正式产物 worktree
+的当前 HEAD 后续变化，也不能用一组彼此一致但非原始的替换文件生成最终报告。

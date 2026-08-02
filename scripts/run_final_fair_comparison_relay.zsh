@@ -23,6 +23,11 @@ candidate_seeds=$formal_root/configs/generated/lre_loss_ablation_p3/robustness_s
 audio_main=$formal_root/configs/generated/audio_only_final_baseline/confirmation/manifest.json
 audio_seeds=$formal_root/configs/generated/audio_only_final_baseline/robustness/manifest.json
 p2_fair=$result_root/fair_baseline_report.json
+reference_aggregate=$result_root/audio_references/aggregate.json
+reference_verification=$result_root/audio_references/verification.json
+expected_p2_fair_sha256=920364e134896d2e495ba8985936d5798048bc5b4b2ed763604569db3e722eb0
+expected_reference_aggregate_sha256=d10e68a5f90df29c538e66fdc889b4e3be46b01fd4b530af4effdce7dcf3e5e6
+expected_reference_verification_sha256=38aab786429fe56e4d73f163de9e7a1059f0c4d09fd8acd2385b5aeb54fd9958
 audio_receipt=$result_root/audio_only_pipeline_receipt.json
 output_json=$result_root/final_fair_comparison.json
 output_markdown=$result_root/FINAL_FAIR_COMPARISON.zh-CN.md
@@ -78,6 +83,12 @@ for required in "$candidate_main" "$audio_main" "$p2_fair"; do
     exit 7
   fi
 done
+if [[ "$(sha256sum "$p2_fair" | cut -d' ' -f1)" != "$expected_p2_fair_sha256" ]] \
+  || [[ "$(sha256sum "$reference_aggregate" | cut -d' ' -f1)" != "$expected_reference_aggregate_sha256" ]] \
+  || [[ "$(sha256sum "$reference_verification" | cut -d' ' -f1)" != "$expected_reference_verification_sha256" ]]; then
+  log_event "p2_reference_root_hash_mismatch"
+  exit 8
+fi
 
 report_args=(
   --gate-30k "$gate_30k"
@@ -93,7 +104,7 @@ if [[ "$(jq -c .selected_finalist "$gate_30k")" != null ]]; then
   if [[ ! -f "$audio_seeds" ]] \
     || [[ "$(jq -r .robustness_manifest_sha256 "$audio_receipt")" != "$(sha256sum "$audio_seeds" | cut -d' ' -f1)" ]]; then
     log_event "audio_robustness_receipt_mismatch"
-    exit 8
+    exit 9
   fi
   for required in "$candidate_seeds" "$audio_seeds"; do
     if [[ ! -f "$required" ]]; then
@@ -114,6 +125,6 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$report_root${PYTHONPATH:+:$PYTHONPATH}" \
 status_code=$?
 if (( status_code != 0 )); then
   log_event "final_report_failed status=$status_code"
-  exit 9
+  exit 10
 fi
 log_event "final_report_complete json_sha256=$(sha256sum "$output_json" | cut -d' ' -f1) markdown_sha256=$(sha256sum "$output_markdown" | cut -d' ' -f1)"
