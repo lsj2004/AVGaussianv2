@@ -456,6 +456,33 @@ uv run --no-project \
   --verify-only
 ```
 
+### P3 中断 checkpoint 事务恢复
+
+首个 30k control 在精确 30,000 updates 后、`final.pt` 原子发布期间被外部 CUDA
+进程触发的 watchdog 中止。旧实现会先把 progress 的 exact step 推进到 30k，再提交
+rolling checkpoint 哈希账本，因此严格 resume 会拒绝这个“checkpoint 完整但 commit
+sidecar 尚未发布”的尾事务。
+
+该问题已由提交 `ca21d2ce38e800e8baf5664c105cbe7a857e714f` 修复：worker 在
+exclusive output lock 内恢复唯一、指纹一致的中断事务；正常/最终 checkpoint 可提升，
+5k/10k pause 边界必须回滚未提交尾部后精确重放。未来 progress 在 checkpoint 提交前
+只记录上一个 durable exact step，避免再次产生超前声明。两类故障注入与全套测试均通过，
+总计 `435 passed`。
+
+本次正式恢复不改变冻结训练提交 `98d158e4` 的模型或优化器状态。30k rolling、milestone
+与重建后的 final 具有相同 SHA-256：
+`e43cb399075e392ceb644c373da66bcc687545458c0e82259fce80aecc3744af`。
+机器可读恢复报告为：
+
+```text
+results/lre_loss_ablation_visual_time_v3/recovery/cross_attention_masks__scene1_opera__seed42__lre0000__step030000.json
+```
+
+报告 SHA-256 为
+`00699e282b17852b65120e155c4d8fdff4700efbc2be42fd63c55e259a64fb2b`，
+并已由冻结 `98d158e4` verifier 独立复核通过。该 run 仍需在 clean GPU 窗口发布
+`artifact_hashes.json` 并完成 30k evaluation 后，才能计入 30k 的 `1/8`。
+
 ## 9. 产物与停止规则
 
 每个结果必须绑定 clean Git commit、config/manifest/sample-sequence/checkpoint SHA-256、
