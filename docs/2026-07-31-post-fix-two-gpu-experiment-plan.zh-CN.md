@@ -423,6 +423,11 @@ results/lre_loss_ablation_visual_time_v3/final_fair_comparison.json
 results/lre_loss_ablation_visual_time_v3/FINAL_FAIR_COMPARISON.zh-CN.md
 ```
 
+最终汇总 relay 使用版本化入口 `scripts/run_final_fair_comparison_relay.zsh`，显式绑定
+报告 worktree commit `ab184f9` 与生成器 SHA-256，并在等待上游时校验 PID 命令身份。
+relay 会分别记录 worktree 脏状态长度、实际 commit 和生成器哈希，避免身份校验失败后
+只留下不可诊断的统一错误。
+
 生成器强制要求精确的 3 systems（final candidate、同架构 lambda=0、Audio-only）×
 3 seeds × 2 scenes × 30k 矩阵，逐样本配对并输出分层 bootstrap 95% CI；任一 manifest、
 repository、config、sample order、metric protocol 或 run completion 不一致都 fail closed。
