@@ -450,6 +450,9 @@ adaptive runner 的 relocated runner、watchdog、shard generator 与 main/causa
 传递依赖。替换只终止旧的
 等待 relay；30k supervisor 保持 PID `1661222`，训练 commit、manifest、continuation
 和 GPU 进程均未改变。
+最终报告等待 relay 另冻结于 `ab4ab11d5a103ddb34687873a75f6e45a1139987`，从代码侧
+固定 P2 fair report、Source/Mono aggregate 与 verification 三个根哈希；当前会话为
+`avgf-final-report-after-baseline-v8`。
 若 30k causal 门禁没有 finalist，候选多 seed 按预注册规则不运行，但仍必须完成
 Audio-only seed42/30k，并自动生成包含所有候选淘汰原因、Audio-only 与
 Source/Mono/native 绝对参照的正式 no-finalist 报告，禁止只写日志或选择性不报告。

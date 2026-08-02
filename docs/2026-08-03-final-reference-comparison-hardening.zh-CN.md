@@ -60,3 +60,6 @@ FiLM 扰动压到 `torch.allclose` 容差以内。所有依赖“FiLM 扰动必�
 `920364e134896d2e495ba8985936d5798048bc5b4b2ed763604569db3e722eb0`，并同时固定上述
 aggregate/verification 哈希。这样不再依赖“P2 JSON 内部自证”，即使正式产物 worktree
 的当前 HEAD 后续变化，也不能用一组彼此一致但非原始的替换文件生成最终报告。
+该 relay 冻结于提交 `ab4ab11d5a103ddb34687873a75f6e45a1139987`，部署会话为
+`avgf-final-report-after-baseline-v8`；上游 Audio-only PID 与 token 保持不变，替换未
+影响候选训练或基线队列。
