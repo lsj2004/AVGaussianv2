@@ -34,6 +34,7 @@ verify_lre=/tmp/avgf_verify_lre_manifest_step.zsh
 verify_causal=/tmp/avgf_verify_causal_manifest_step.zsh
 relocated_runner=/tmp/avgf_benchmark_lre_run_relocated.py
 gpu_watchdog=/tmp/avgf_gpu_pid_watchdog_logged.zsh
+gpu_watchdog_python=/tmp/avgf_gpu_descendant_watchdog.py
 shard_generator=/tmp/avgf_shard_lre_manifest.py
 strict_gate=$tool_root/scripts/run_verified_p3_30k_gate.py
 log=/tmp/avgf-p3-after-30k-versioned.log
@@ -48,6 +49,7 @@ expected_sha256[$verify_lre]=ce4888d24a53a0a281f7dc518dd7585cc1add024bec99fdf919
 expected_sha256[$verify_causal]=82a59c9aaa259458034ca79fc0c5b6f622cc0539b50fad207f1e0d683e787f61
 expected_sha256[$relocated_runner]=6b7811138c1db48c79deb93cf6440da372ff9005985e08836d31c09a8e78abcd
 expected_sha256[$gpu_watchdog]=d5c824c76da88c0e798aa2aa578ea5730c912c2d585762b285ca5995477f0115
+expected_sha256[$gpu_watchdog_python]=6f3dfc6d41f534d5e7ea6c78e713a7d76a4696974f584ec2a082a44679ef0bf7
 expected_sha256[$shard_generator]=634e0cb0be4aa253f1691f41a7784aa27114f0d20a7a1248362468e362991c85
 
 log_event() {

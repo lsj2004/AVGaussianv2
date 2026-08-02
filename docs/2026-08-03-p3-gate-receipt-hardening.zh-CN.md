@@ -43,7 +43,8 @@ relay 必须匹配该 token、gate SHA-256 和 finalist，完成对应 30k manif
 
 adaptive runner 的内容哈希不足以单独代表完整执行闭包，因此 relay 还逐个固定其传递
 依赖：relocated Python runner、GPU PID watchdog、manifest shard generator、main verifier
-和 causal verifier。任一 `/tmp` 依赖字节变化都会在领取 GPU 前失败。
+和 causal verifier。watchdog Zsh 包装器继续调用的 descendant-watchdog Python 实现也
+单独固定；任一 `/tmp` 传递依赖字节变化都会在领取 GPU 前失败。
 
 最终报告 relay 现在必须匹配 Audio-only receipt 的 token、gate SHA-256、finalist 及
 confirmation/robustness manifest SHA-256。上游失败、旧 receipt、旧 gate 或 PID 复用均
