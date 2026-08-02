@@ -164,7 +164,7 @@ evaluator 现在也会在昂贵计算前创建输出父目录。
 | 正式主评测 DPAM | 双运行时 130 样本 smoke 通过 | 全量测试复核 |
 | P1 自动化筛选 | fail-closed selector 与生成器绑定已实现 | 全量测试复核 |
 | frozen 正式代码质量 | 400 项 pytest、全仓 Ruff、diff-check 通过 | 已完成 |
-| post-freeze 流水线修复 | 最新 438/438 pytest、全仓 Ruff、diff-check 通过 | P3 后再做最终合并 review |
+| post-freeze 流水线修复 | 最新 446/446 pytest、全仓 Ruff、diff-check 通过 | P3 后再做最终合并 review |
 | P2 主矩阵 | 32/32 5k + 8/8 test-retest，均独立复核 | 已完成 |
 | P3 10k | 8/8 continuation，门禁与独立复核通过 | 已完成 |
 | P3 30k / causal / seeds | 1/8 完整验证；第二条精确 14.5k；其余六条精确 10k | 依门禁顺序继续 |
@@ -441,6 +441,10 @@ repository、config、sample order、metric protocol 或 run completion 不一�
 每个模型结果还会通过 `verify_evaluation` 重新审计 checkpoint、runtime contract 与严格
 训练证据；Source/Mono 则重新核对原始 aggregate、文件级 verification manifest、全部
 SHA-256 以及 P2 scene-macro 数值，禁止只信任可单独编辑的汇总 JSON。
+30k gate 同样在做出多 seed 续跑决策前执行上述严格 evaluation/training-evidence 审计。
+P3 后处理、Audio-only、最终报告三段 relay 使用逐次唯一 token 和原子成功 receipt 串联；
+下游必须匹配上游 receipt 的 token、gate/finalist/manifest 哈希，不能再把 PID 消失或旧
+目录残留解释为阶段成功。
 若 30k causal 门禁没有 finalist，候选多 seed 按预注册规则不运行，但仍必须完成
 Audio-only seed42/30k，并自动生成包含所有候选淘汰原因、Audio-only 与
 Source/Mono/native 绝对参照的正式 no-finalist 报告，禁止只写日志或选择性不报告。
