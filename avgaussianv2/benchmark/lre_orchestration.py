@@ -423,11 +423,30 @@ def query_idle_gpus(
     gpus: Sequence[int],
     *,
     command_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-) -> dict[int, dict[str, int]]:
+    process_state_getter: Callable[[int], str | None] | None = None,
+) -> dict[int, dict[str, object]]:
+    if process_state_getter is None:
+
+        def process_state_getter(pid: int) -> str | None:
+            try:
+                raw = Path(f"/proc/{pid}/stat").read_text()
+            except FileNotFoundError:
+                return None
+            except OSError as error:
+                raise OrchestrationError(
+                    f"cannot inspect GPU process identity: pid={pid}"
+                ) from error
+            tail = raw[raw.rfind(")") + 2 :].split()
+            if not tail:
+                raise OrchestrationError(
+                    f"cannot parse GPU process identity: pid={pid}"
+                )
+            return tail[0]
+
     completed = command_runner(
         [
             "nvidia-smi",
-            "--query-gpu=index,memory.free,utilization.gpu",
+            "--query-gpu=index,uuid,memory.free,utilization.gpu",
             "--format=csv,noheader,nounits",
         ],
         check=True,
@@ -438,10 +457,48 @@ def query_idle_gpus(
     for line in completed.stdout.splitlines():
         if not line.strip():
             continue
-        index, free_mib, utilization = (
-            int(value.strip()) for value in line.split(",")
-        )
-        status[index] = {"free_mib": free_mib, "utilization_percent": utilization}
+        fields = [value.strip() for value in line.split(",")]
+        if len(fields) != 4:
+            raise OrchestrationError("invalid LRE GPU preflight response")
+        index = int(fields[0])
+        status[index] = {
+            "uuid": fields[1],
+            "free_mib": int(fields[2]),
+            "utilization_percent": int(fields[3]),
+            "compute_pids": [],
+        }
+    processes = command_runner(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=pid,gpu_uuid",
+            "--format=csv,noheader,nounits",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    uuid_to_index = {
+        str(record["uuid"]): index for index, record in status.items()
+    }
+    for line in processes.stdout.splitlines():
+        if not line.strip():
+            continue
+        fields = [value.strip() for value in line.split(",")]
+        if len(fields) != 2:
+            raise OrchestrationError("invalid LRE GPU process response")
+        try:
+            pid = int(fields[0])
+        except ValueError as error:
+            raise OrchestrationError("invalid LRE GPU process PID") from error
+        index = uuid_to_index.get(fields[1])
+        if index is None:
+            continue
+        state = process_state_getter(pid)
+        if state is not None and state != "Z":
+            pids = status[index]["compute_pids"]
+            if not isinstance(pids, list):
+                raise AssertionError("invalid internal GPU process list")
+            pids.append(pid)
     rejected = {
         gpu: status.get(gpu)
         for gpu in gpus
@@ -449,6 +506,7 @@ def query_idle_gpus(
         or status[gpu]["free_mib"] < MIN_GPU_FREE_MIB
         or status[gpu]["utilization_percent"]
         > MAX_IDLE_GPU_UTILIZATION_PERCENT
+        or bool(status[gpu]["compute_pids"])
     }
     if rejected:
         raise OrchestrationError(

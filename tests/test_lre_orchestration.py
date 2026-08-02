@@ -309,11 +309,46 @@ def test_lre_manifest_and_gpu_preflight_fail_closed(tmp_path):
         load_lre_run_manifest(path)
 
     def busy(*args, **kwargs):
-        del args, kwargs
-        return subprocess.CompletedProcess([], 0, "1, 2048, 100\n2, 48000, 0\n", "")
+        del kwargs
+        command = args[0]
+        if "--query-compute-apps=pid,gpu_uuid" in command:
+            return subprocess.CompletedProcess([], 0, "", "")
+        return subprocess.CompletedProcess(
+            [], 0, "1, GPU-1, 2048, 100\n2, GPU-2, 48000, 0\n", ""
+        )
 
     with pytest.raises(OrchestrationError, match="busy"):
         query_idle_gpus((1, 2), command_runner=busy)
+
+
+def test_lre_gpu_preflight_rejects_live_compute_pid_but_ignores_stale_nvml():
+    def query(*args, **kwargs):
+        del kwargs
+        command = args[0]
+        if "--query-compute-apps=pid,gpu_uuid" in command:
+            return subprocess.CompletedProcess(
+                [], 0, "123, GPU-1\n999, GPU-2\n", ""
+            )
+        return subprocess.CompletedProcess(
+            [], 0, "1, GPU-1, 48000, 0\n2, GPU-2, 48000, 0\n", ""
+        )
+
+    with pytest.raises(OrchestrationError, match="busy") as captured:
+        query_idle_gpus(
+            (1, 2),
+            command_runner=query,
+            process_state_getter=lambda pid: "S" if pid == 123 else None,
+        )
+    assert "123" in str(captured.value)
+    assert "999" not in str(captured.value)
+
+    accepted = query_idle_gpus(
+        (2,),
+        command_runner=query,
+        process_state_getter=lambda _pid: None,
+    )
+    assert accepted[2]["uuid"] == "GPU-2"
+    assert accepted[2]["compute_pids"] == []
 
 
 def test_lre_runner_rejects_manifest_from_another_repository_revision(tmp_path):
