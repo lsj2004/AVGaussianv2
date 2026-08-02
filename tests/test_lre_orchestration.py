@@ -332,6 +332,66 @@ def test_lre_runner_rejects_manifest_from_another_repository_revision(tmp_path):
         )
 
 
+def test_lre_runner_allows_only_explicit_same_commit_clean_relocation(tmp_path):
+    path, value = _manifest(tmp_path)
+    relocated = {
+        **value["repository"],
+        "root": str((tmp_path / "relocated-clean-worktree").resolve()),
+    }
+    native_root = _native_root(tmp_path)
+    runner = _Runner()
+
+    with pytest.raises(OrchestrationError, match="repository identity differs"):
+        run_lre_manifest(
+            path,
+            output_root=tmp_path / "strict-runs",
+            native_root=native_root,
+            gpus=(1,),
+            python_executable="python",
+            repository_identity_getter=lambda: relocated,
+            gpu_query=lambda devices: {devices[0]: {}},
+            runner=runner,
+        )
+
+    result = run_lre_manifest(
+        path,
+        output_root=tmp_path / "relocated-runs",
+        native_root=native_root,
+        gpus=(1,),
+        python_executable="python",
+        allow_repository_relocation=True,
+        repository_identity_getter=lambda: relocated,
+        gpu_query=lambda devices: {devices[0]: {}},
+        runner=_Runner(),
+    )
+
+    assert result["repository"] == relocated
+    assert result["manifest_repository"] == value["repository"]
+    assert result["repository_relocation"] == {
+        "manifest_root": value["repository"]["root"],
+        "execution_root": relocated["root"],
+        "same_clean_commit": True,
+    }
+    continuation = json.loads(
+        (tmp_path / "relocated-runs/continuation-0/continuation_identity.json").read_text()
+    )
+    assert continuation["repository"] == value["repository"]
+
+    wrong_revision = {**relocated, "commit": "2" * 40}
+    with pytest.raises(OrchestrationError, match="repository identity differs"):
+        run_lre_manifest(
+            path,
+            output_root=tmp_path / "wrong-revision-runs",
+            native_root=native_root,
+            gpus=(1,),
+            python_executable="python",
+            allow_repository_relocation=True,
+            repository_identity_getter=lambda: wrong_revision,
+            gpu_query=lambda devices: {devices[0]: {}},
+            runner=_Runner(),
+        )
+
+
 def test_failed_pipeline_publishes_failure_and_peer_abort_evidence(tmp_path):
     _, manifest = _manifest(tmp_path)
     pipelines = build_lre_pipelines(

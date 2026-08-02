@@ -32,6 +32,14 @@ def main() -> None:
         help="isolated Python containing cdpam for formal main evaluations",
     )
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--allow-repository-relocation",
+        action="store_true",
+        help=(
+            "allow an absolute worktree-root change only when the manifest and "
+            "execution worktrees are clean at the exact same commit"
+        ),
+    )
     args = parser.parse_args()
     if args.dpam_python and args.skip_dpam:
         parser.error("--dpam-python cannot be combined with --skip-dpam")
@@ -45,6 +53,7 @@ def main() -> None:
         trust_upstream_artifacts=args.trust_upstream_artifacts,
         resume=args.resume,
         dpam_python=args.dpam_python,
+        allow_repository_relocation=args.allow_repository_relocation,
     )
     print(
         json.dumps(

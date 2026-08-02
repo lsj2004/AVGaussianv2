@@ -615,6 +615,7 @@ def run_lre_manifest(
     trust_upstream_artifacts: bool = False,
     resume: bool = False,
     dpam_python: str | None = None,
+    allow_repository_relocation: bool = False,
     runner: ProcessRunner | None = None,
     gpu_query: Callable[[Sequence[int]], Mapping[int, object]] = query_idle_gpus,
     repository_identity_getter: Callable[[], Mapping[str, object]] = (
@@ -624,10 +625,28 @@ def run_lre_manifest(
     manifest_path = Path(manifest_path).resolve()
     manifest = load_lre_run_manifest(manifest_path)
     current_repository = dict(repository_identity_getter())
-    if manifest["repository"] != current_repository:
-        raise OrchestrationError(
-            "LRE manifest repository identity differs from the current clean revision"
+    manifest_repository = dict(manifest["repository"])
+    repository_relocation = None
+    if manifest_repository != current_repository:
+        same_clean_revision = (
+            set(current_repository) == {"root", "commit", "clean"}
+            and isinstance(current_repository.get("root"), str)
+            and Path(current_repository["root"]).is_absolute()
+            and current_repository["root"] != manifest_repository["root"]
+            and manifest_repository.get("commit")
+            == current_repository.get("commit")
+            and manifest_repository.get("clean") is True
+            and current_repository.get("clean") is True
         )
+        if not allow_repository_relocation or not same_clean_revision:
+            raise OrchestrationError(
+                "LRE manifest repository identity differs from the current clean revision"
+            )
+        repository_relocation = {
+            "manifest_root": manifest_repository["root"],
+            "execution_root": current_repository["root"],
+            "same_clean_commit": True,
+        }
     devices = parse_gpus(gpus)
     gpu_status = dict(gpu_query(devices))
     pipelines = build_lre_pipelines(
@@ -656,6 +675,8 @@ def run_lre_manifest(
             "source_manifest": str(manifest_path),
             "source_manifest_sha256": _sha256(manifest_path),
             "repository": current_repository,
+            "manifest_repository": manifest_repository,
+            "repository_relocation": repository_relocation,
             "stage": manifest["stage"],
             "gpus": list(devices),
             "gpu_preflight": gpu_status,
@@ -673,6 +694,8 @@ def run_lre_manifest(
         gpus=list(devices),
         gpu_preflight=gpu_status,
         repository=current_repository,
+        manifest_repository=manifest_repository,
+        repository_relocation=repository_relocation,
     )
     _publish_result(
         Path(output_root).resolve() / f"runner_result.{manifest['stage']}.json",
