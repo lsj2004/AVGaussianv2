@@ -28,6 +28,17 @@ Source/Mono 图不把绝对参照伪装成 update-/seed-matched 排名。候选�
 finalist 和 no-finalist 两条路径都能生成图表；无 finalist 时，严格图显示 Audio-only 与
 被 30k gate 淘汰的 seed42 候选，不伪造候选多 seed。
 
+## 验证与部署
+
+- 全量回归：`452 passed`；Ruff、format、diff-check 与 relay zsh 语法均通过；
+- 报告工具冻结于 `d39c81e052e4908850bf57455db3a0ea325f4dd5`，builder SHA-256 为
+  `bdf2ed0e2838b9866b42194592828d3b7515da8d4919256bce507a031e65c31a`，renderer
+  SHA-256 为 `be5918bb1cabba9829a6fdc6aa3160f707ef8e2b96c6ffe3d15b5268ddcbb03c`；
+- relay 冻结于 `e907f7d5e055a716aee7ea9d68638a56fdc35e5a`，脚本 SHA-256 为
+  `afb1ed04851ac18fe097edf5587216d70d3493665067f44529f2c9c8461aee72`；
+- 当前等待会话为 `avgf-final-report-after-baseline-v11`。启动日志已核对 Audio-only PID、
+  token、冻结 commit、builder/renderer 哈希和干净 worktree；P3 与上游 relay 未重启。
+
 ## 仍待完成
 
 该流水线补齐最终横向与资源 Pareto 图的自动生成能力。5k→10k→30k 纵向曲线仍必须等

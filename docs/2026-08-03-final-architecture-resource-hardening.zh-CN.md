@@ -62,12 +62,14 @@ relay 只有在 Audio-only receipt、P3 gate、manifest、P2 reference 根和架
 匹配时才会发布最终 JSON/Markdown。
 
 定向测试覆盖正常验证、架构篡改拒绝、Markdown 架构段、no-finalist 路径和 relay 静态
-合同。全量回归为 `448 passed`，Ruff、格式、zsh 语法和正式产物预检均通过。报告构建器
-冻结于 commit `912b08b12dfeaeda2fa9095c7e7ea0ab0e4cef36`，文件 SHA-256 为
-`bdf2ed0e2838b9866b42194592828d3b7515da8d4919256bce507a031e65c31a`。部署只替换等待
-会话，不影响正在运行的 P3 训练和既有上游 receipt token。
+合同。加入最终图表后全量回归为 `452 passed`，Ruff、格式、zsh 语法和正式产物预检均
+通过。builder 内容仍是 commit `912b08b12dfeaeda2fa9095c7e7ea0ab0e4cef36` 引入的
+`bdf2ed0e2838b9866b42194592828d3b7515da8d4919256bce507a031e65c31a`；当前活动报告工具根
+冻结于 `d39c81e052e4908850bf57455db3a0ea325f4dd5`，因为它同时固定图表 renderer。部署只替换
+等待会话，不影响正在运行的 P3 训练和既有上游 receipt token。
 
-最终 relay 代码冻结于 `e6dde5659ef2de875f821637e0da5aa4a7458332`，当前等待会话为
-`avgf-final-report-after-baseline-v10`。启动日志已复核：上游 Audio-only relay PID
-`2090950`、token `5711f4a0-1cc7-43c1-9fdd-4059a113e7f3`、builder commit/SHA 和 clean
-worktree 全部匹配。旧 v9 只包含等待逻辑，已被替换；P3 supervisor 与上游 relay 未重启。
+最终 relay 代码冻结于 `e907f7d5e055a716aee7ea9d68638a56fdc35e5a`，当前等待会话为
+`avgf-final-report-after-baseline-v11`。启动日志已复核：上游 Audio-only relay PID
+`2090950`、token `5711f4a0-1cc7-43c1-9fdd-4059a113e7f3`、builder/renderer 哈希、commit
+和干净 worktree 全部匹配。旧 v10 只包含等待逻辑，已被替换；P3 supervisor 与上游 relay
+未重启。

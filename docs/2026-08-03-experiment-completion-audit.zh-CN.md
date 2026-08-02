@@ -12,9 +12,9 @@
 |---|---|---|
 | 正式训练代码冻结且 clean | 完成 | commit `98d158e4e9f1389aa924422faef901b2673ca3bc` |
 | 两个真实 GPU smoke | 完成 | 计划 §5.1；P1 smoke 含三路 causal、恢复与 verify-only |
-| post-freeze 全量回归 | 完成 | `448 passed`；Ruff、format、zsh、diff-check 通过 |
+| post-freeze 全量回归 | 完成 | `452 passed`；Ruff、format、zsh、diff-check 通过 |
 | P2/P3 continuation 身份与 evaluator 对齐 | 完成 | manifest loader、evaluation verifier、checkpoint/runtime-contract 复核 |
-| 最终报告证据链冻结 | 完成 | builder `912b08b`/`bdf2ed0e...`；relay `e6dde56`；token-bound receipts |
+| 最终报告证据链冻结 | 完成 | report root `d39c81e`；builder `bdf2ed0e...`；renderer `be5918bb...`；relay `e907f7d`；token-bound receipts |
 
 代码门禁完成不等于实验目标完成；下表中的运行与最终产物仍必须闭环。
 

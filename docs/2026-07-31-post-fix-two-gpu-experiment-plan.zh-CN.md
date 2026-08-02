@@ -164,7 +164,7 @@ evaluator 现在也会在昂贵计算前创建输出父目录。
 | 正式主评测 DPAM | 双运行时 130 样本 smoke 通过 | 全量测试复核 |
 | P1 自动化筛选 | fail-closed selector 与生成器绑定已实现 | 全量测试复核 |
 | frozen 正式代码质量 | 400 项 pytest、全仓 Ruff、diff-check 通过 | 已完成 |
-| post-freeze 流水线修复 | 最新 448/448 pytest、全仓 Ruff、format、zsh、diff-check 通过 | P3 后再做最终合并 review |
+| post-freeze 流水线修复 | 最新 452/452 pytest、全仓 Ruff、format、zsh、diff-check 通过 | P3 后再做最终合并 review |
 | P2 主矩阵 | 32/32 5k + 8/8 test-retest，均独立复核 | 已完成 |
 | P3 10k | 8/8 continuation，门禁与独立复核通过 | 已完成 |
 | P3 30k / causal / seeds | 2/8 完整验证；第三条正在从 10k 续训；其余五条精确 10k | 依门禁顺序继续 |
@@ -521,11 +521,13 @@ GPU-hour。资源统计必须明确标注为 5k screening，不能外推为 30k 
 复核 repository、schema、指针哈希、canonical architecture signature、4×2 参数矩阵、
 4×4×2 资源矩阵和聚合算术，finalist/no-finalist 两条路径均 fail closed。实现与验证记录
 见 `docs/2026-08-03-final-architecture-resource-hardening.zh-CN.md`。
-该实现已在 `912b08b12dfeaeda2fa9095c7e7ea0ab0e4cef36` 冻结，builder SHA-256 为
-`bdf2ed0e2838b9866b42194592828d3b7515da8d4919256bce507a031e65c31a`；全量回归
-`448 passed`。
-最终 relay 冻结于 `e6dde5659ef2de875f821637e0da5aa4a7458332`，并以
-`avgf-final-report-after-baseline-v10` 等待同一 Audio-only token；旧等待会话替换没有触碰
+builder 内容由 `912b08b12dfeaeda2fa9095c7e7ea0ab0e4cef36` 引入，SHA-256 为
+`bdf2ed0e2838b9866b42194592828d3b7515da8d4919256bce507a031e65c31a`。包含确定性 SVG
+renderer 的活动报告工具根冻结于 `d39c81e052e4908850bf57455db3a0ea325f4dd5`，renderer
+SHA-256 为 `be5918bb1cabba9829a6fdc6aa3160f707ef8e2b96c6ffe3d15b5268ddcbb03c`；全量回归为
+`452 passed`。
+最终 relay 冻结于 `e907f7d5e055a716aee7ea9d68638a56fdc35e5a`，并以
+`avgf-final-report-after-baseline-v11` 等待同一 Audio-only token；旧等待会话替换没有触碰
 P3 supervisor、训练进程或上游 receipt。
 
 ## 9. 产物与停止规则
