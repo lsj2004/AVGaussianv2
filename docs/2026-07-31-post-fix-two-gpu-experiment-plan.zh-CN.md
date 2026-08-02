@@ -161,7 +161,7 @@ evaluator 现在也会在昂贵计算前创建输出父目录。
 | 正式主评测 DPAM | 双运行时 130 样本 smoke 通过 | 全量测试复核 |
 | P1 自动化筛选 | fail-closed selector 与生成器绑定已实现 | 全量测试复核 |
 | frozen 正式代码质量 | 400 项 pytest、全仓 Ruff、diff-check 通过 | 已完成 |
-| post-freeze 流水线修复 | 427/427 pytest、全仓 Ruff check、新增文件 Ruff format check、diff-check 通过 | P3 后再做最终合并 review |
+| post-freeze 流水线修复 | 431/431 pytest、全仓 Ruff check、新增文件 Ruff format check、diff-check 通过 | P3 后再做最终合并 review |
 | P2 主矩阵 | 32/32 5k + 8/8 test-retest，均独立复核 | 已完成 |
 | P3 10k | 8/8 continuation，门禁与独立复核通过 | 已完成 |
 | P3 30k / causal / seeds | 首条 continuation 精确 18k；污染恢复队列已运行 | 依门禁顺序继续 |
@@ -284,8 +284,8 @@ P2 的 Audio-only 正式结果停在 5k，而 P3 候选会训练到 10k/30k。�
 该闭环新增 2 个 seed42 continuation 和 4 个新 seed 30k run。它是公平性所必需的
 实验，不是看到结果后的超参数搜索；不得用 Audio-only 5k 数字替代。
 
-生成器已在 post-freeze commit `74a8545` 加入，新增与相邻测试 16/16、全量
-pytest 427/427 通过。正式内容寻址产物为：
+生成器已在 post-freeze commit `74a8545` 加入，新增与相邻测试 16/16；最终公平报告
+生成器在 commit `fee48d1` 加入。全量 pytest 431/431 通过。正式内容寻址产物为：
 
 - seed42 confirmation：
   `configs/generated/audio_only_final_baseline/confirmation/manifest.json`，2 runs，
@@ -413,6 +413,18 @@ Audio-only 10k/30k 与后续 seed17/73 已生成独立、内容寻址的 manifes
 P2 Audio-only 的稳定 `continuation_id`。它们在 P3 候选 30k/causal/多 seed 链结束后
 由独立 relay 执行，避免覆盖仍被候选 gate 使用的 legacy stage pointer；完成独立
 verifier 前不得进入最终公平主榜。
+
+候选 seed manifest 与 causal manifest 将直接发布到工作区持久目录，不再只保存在
+`/tmp`。Audio-only relay 完成后，冻结于 `fee48d1` 的报告 worktree 自动生成：
+
+```text
+results/lre_loss_ablation_visual_time_v3/final_fair_comparison.json
+results/lre_loss_ablation_visual_time_v3/FINAL_FAIR_COMPARISON.zh-CN.md
+```
+
+生成器强制要求精确的 3 systems（final candidate、同架构 lambda=0、Audio-only）×
+3 seeds × 2 scenes × 30k 矩阵，逐样本配对并输出分层 bootstrap 95% CI；任一 manifest、
+repository、config、sample order、metric protocol 或 run completion 不一致都 fail closed。
 
 Source/Mono 参考单独运行，并在正式报告前 verify-only：
 
