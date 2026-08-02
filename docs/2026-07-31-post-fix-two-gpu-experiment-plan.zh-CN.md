@@ -1,6 +1,12 @@
 # post-fix 双 48GB GPU 实验计划（执行版）
 
-更新日期：2026-08-01（P1 后修订版）
+更新日期：2026-08-03（P2 完成、P3 10k 门禁后执行版）
+
+当前状态：P2 的 32/32 个 5k run、8/8 个 test-retest run 和 P3 的 8/8 个 10k
+continuation 均已完成并独立复核。P3 10k 门禁保留
+`cross_attention_masks/lambda_lre=0.01` 与
+`query_dependent_p1/lambda_lre=0.02`，当前正在从精确 10k checkpoint 续训到 30k。
+本文同时保留最初预注册规则与执行后修订，不能把探索性扩展事后表述成预注册实验。
 
 ## 1. 本轮要回答的问题
 
@@ -16,6 +22,10 @@
 候选矩阵是计算上限，不是必须跑满的网格。每阶段结束立即聚合、淘汰和续训，禁止
 在架构尚未确定时展开“全部架构 × 全部 LRE 权重 × 全部 seed”。
 
+执行中经用户明确批准增加了一次有边界的 P2 探索性扩展：淘汰 `plain_unet`，对其余
+四个架构统一跑四个 LRE 权重、两个场景和 seed42。该扩展用于回答“空间约束加入后哪个
+架构最好”，不改变 P3 仍只允许最多两个 treatment 继续消耗 10k/30k 预算的原则。
+
 ## 2. 结论边界
 
 cam38 同时用于本轮模型选择和最终数字，因此本轮结论是固定 benchmark 上的
@@ -27,8 +37,8 @@ validation/test 分离协议，并确认 native AudioGS/FTGS++ 也没有使用 v
 
 | 基线 | 比较性质 | 可比较指标 | 不能声称 |
 |---|---|---|---|
-| Source Binaural | 无训练的输入参考 | 音频、paper MAG/ENV/LRE/DPAM | 不是可部署预测模型 |
-| Mono | 无训练的单声道参考 | 音频、paper MAG/ENV/LRE/DPAM | 不代表空间音频模型上限 |
+| Source Binaural | 无训练的输入参考 | waveform、MAG/ENV/DPAM/LRE、ILD/IPD | 不是可部署预测模型；没有训练 loss |
+| Mono | 无训练的通道对称参考 | waveform、MAG/ENV/DPAM/LRE、ILD/IPD | 低 LRE/ILD 不等于空间定位正确；没有训练 loss |
 | native AudioGS | 原生训练参考 | 音频指标 | 与 30k continuation update-matched |
 | `audio_only` | 主 GS-only control | 音频指标；与 continuation update-matched | 不报告无意义的视觉质量 |
 | `plain_unet` | 音频架构对照 | 音频指标；与 `audio_only` update-matched | 不报告视觉因果性 |
@@ -75,14 +85,19 @@ smoke 时 GPU 1 被其他任务占用约 46GB，DPAM smoke 前两张卡均已空
 
 1. 每次启动前查询目标 GPU；空闲显存至少 8GiB、利用率不超过 10%，否则 fail closed；
 2. 当前每张卡最多 1 个活动 pipeline；空闲卡从中央队列领取下一个已满足依赖的任务；
-3. 两卡都空闲时使用 `--gpus 1,2`，只有 GPU 2 空闲时使用 `--gpus 2`，不等待或抢占
-   GPU 1 上的外部任务；
+3. 两卡都空闲时使用 `--gpus 1,2`；只有一张授权卡空闲时使用该卡，不把 GPU 1 或
+   GPU 2 设为必需卡，也不等待或抢占另一张卡上的外部任务；
 4. control/treatment 尽量在同一型号 GPU 上交错调度，两卡任务错开约 60 秒，避免
    500-step checkpoint 同时写盘；
 5. OOM 只降低并发，不修改 batch、crop、模型或指标协议；同一基础设施失败最多自动
    恢复一次，第二次进入审计；
 6. 只有完成单卡 1×/2× pipeline 吞吐 A/B，且总显存低于 38.4GB、无 OOM、总吞吐提升、
    单任务吞吐下降不超过 20%，才允许单卡 2 pipeline。
+
+P3 采用逐 shard 自适应调度：每次资源选择要求连续三次 clean sample；双卡均 clean
+时领取两个 run，否则任一 clean 卡领取一个 run；每个 shard 完成后重新选择。GPU
+所有权按 UUID 和 PID/starttime 后代树监控，忽略已经没有 `/proc` 身份的 stale NVML
+记录，但对真实外来 PID fail closed。OOM 或资源变化只改变并发，不改变科学配置。
 
 FiLM/P1 训练期间人工观测的设备占用约 2.9/2.3GiB；P1 三路评测的首个完整 runner
 attempt 用时 836.22 秒，采样到的设备占用峰值 1,033MiB、利用率峰值 16%。随后
@@ -131,24 +146,28 @@ DPAM smoke 首次诊断命令遗漏 `CUBLAS_WORKSPACE_CONFIG`，第二次在全�
 父目录不存在而无法发布；两项均已修正。正式 runner 原本已强制注入确定性环境，独立
 evaluator 现在也会在昂贵计算前创建输出父目录。
 
-### 5.2 门禁状态与剩余阻塞项
+### 5.2 门禁状态与剩余工作
 
 | 门禁 | 当前状态 | 正式开跑前动作 |
 |---|---|---|
-| clean revision / manifest / continuation identity | 已实现 | 最终提交后重新生成 manifest |
-| success、failure、peer-abort 的不可变 attempt history | 单元测试通过 | 全量测试复核 |
+| clean revision / manifest / continuation identity | 正式 commit `98d158e4` 已冻结 | P3 全程保持该 commit |
+| success、failure、peer-abort 的不可变 attempt history | 已实现并经历真实恢复 | 最终报告汇总所有 attempt |
 | 两场景 visual-time 机器断言 | 已通过 | 最终 commit 再绑定一次审计结果 |
-| Source/Mono 846 行 MAG/ENV/LRE/DPAM | 已通过 verifier | 最终 commit 覆盖重跑并固化 SHA |
+| Source/Mono 846 行完整参考指标 | 已在 frozen commit 覆盖重跑并通过 verifier | 最终表分开标注比较边界 |
 | `lambda_lre=0` 等价于 legacy 更新 | loss、gradient、连续 10 次更新精确一致 | 全量测试复核 |
 | P1 三路真实 GPU smoke | 已完成 | 不再重复训练 |
 | 正式主评测 DPAM | 双运行时 130 样本 smoke 通过 | 全量测试复核 |
 | P1 自动化筛选 | fail-closed selector 与生成器绑定已实现 | 全量测试复核 |
-| 最终代码质量 | 400 项 pytest、全仓 Ruff、diff-check 通过 | P2 提交再次冻结后复核 |
+| frozen 正式代码质量 | 400 项 pytest、全仓 Ruff、diff-check 通过 | 已完成 |
+| post-freeze 流水线修复 | 419/419 互斥分片、全仓 Ruff、diff-check 通过 | P3 后再做最终合并 review |
+| P2 主矩阵 | 32/32 5k + 8/8 test-retest，均独立复核 | 已完成 |
+| P3 10k | 8/8 continuation，门禁与独立复核通过 | 已完成 |
+| P3 30k / causal / seeds | 首个 10k→30k continuation 已启动 | 依门禁顺序继续 |
 
 正式训练 Python 没有 `cdpam`；已有 CDPAM 环境又没有 `gsplat/tinycudann`。主评测因此
 使用已验证的持久化双运行时，并把解释器、实现、权重哈希写入 metric protocol。禁止
-临时给训练环境安装未经锁定的依赖，也禁止因环境问题在正式主表跳过 DPAM。最终代码
-质量及最终 commit 重新绑定未通过前，不启动正式架构队列。
+临时给训练环境安装未经锁定的依赖，也禁止因环境问题在正式主表跳过 DPAM。正式训练
+始终使用冻结 commit；post-freeze 修复分支不得在 P3 中途替换训练代码。
 
 ## 6. 分阶段实验矩阵
 
@@ -202,16 +221,19 @@ P1 实测后，严格门禁唯一胜者是 `audio_only`。`query_dependent_p1` �
 
 ### P2：LRE 权重筛选
 
-只对 P1 的 1–2 个胜出架构运行：
+最初计划只对 P1 的 1–2 个胜出架构运行。为避免把“`lambda=0` 时 audio-only 最稳”
+错误推广为“其他架构加入空间约束后仍不行”，用户批准以下统一探索性矩阵：
 
 ```text
 lambda_lre = 0.00, 0.01, 0.02, 0.05
 seed = 42
 scenes = scene1_opera, Scene7playing
 step = 5k
+systems = audio_only, query_dependent_p1, joint_conditioned, cross_attention_masks
 ```
 
-训练上限 16 个 5k run。由于 selector 修复产生了新的 clean commit，P2 使用新的
+实际规模为 4 架构 × 4 权重 × 2 场景 = 32 个 5k run。由于 selector 修复产生了新的
+clean commit，P2 使用新的
 `RUN_ROOT_V3`，并在新提交下重新训练 `lambda=0` control；禁止跨提交 continuation。
 非零权重晋级要求：
 
@@ -221,6 +243,12 @@ step = 5k
 - 不被更小权重在所有主指标上支配。
 
 每架构最多保留 1–2 个非零权重，允许一个都不保留。
+
+P2 已完成。`audio_only` 的正 lambda 没有稳定收益；四个架构内代表分别是
+`audio_only/0`、`query_dependent_p1/0.02`、`joint_conditioned/0.01`、
+`cross_attention_masks/0.01`。受预注册 P3 最多两个 treatment 的预算约束，10k 只继续
+query P1/0.02、cross-attention/0.01 及各自 lambda=0 control；joint/0.01 保留为有效
+5k Pareto 证据，而不是被描述为“架构失败”。
 
 ### P3：纵向收敛与多种子
 
@@ -235,6 +263,10 @@ paired win rate、因果差值和 guardrail 轨迹。
 只有出现明确最终候选时，才为“最佳非零权重 + 同架构 lambda=0 control”增加 seed17、
 seed73；新增上限 8 个 30k run，与 seed42 合成 3 seeds。最终报告 across-seed mean/std
 和 95% paired hierarchical bootstrap CI。CI 跨零时结论写为“不确定”。
+
+10k 门禁已完成：cross-attention/0.01 相对同架构 control 的 scene-macro LRE 改善
+10.07%，query P1/0.02 改善 38.18%，二者均通过 noise-aware guardrail 并进入 30k。
+这些是架构内 treatment/control 结论，不能解释为已经超过 `audio_only`、Source 或 Mono。
 
 ## 7. 指标与横纵向报告
 
@@ -255,12 +287,26 @@ seed73；新增上限 8 个 30k run，与 seed42 合成 3 seeds。最终报告 a
 任意加权总分：先剔除证据不完整和 guardrail 失败项，再形成音频质量、空间质量、因果性、
 资源成本的 Pareto front。
 
+最终报告固定拆成两张并排表，禁止混成单一排行榜：
+
+1. **严格公平主榜**：只含 update-/seed-/sample-/metric-matched 的模型，报告绝对值、
+   `Delta vs audio_only`、逐样本胜率和 Pareto 状态，用于模型选择；
+2. **绝对参照榜**：含 Source Binaural、Mono、native AudioGS、audio-only 和最终候选，
+   只比较共同定义的 waveform、MAG、ENV、DPAM、LRE、ILD、IPD，并分别给出
+   `Delta vs Source`、`Delta vs Mono`、`Delta vs audio_only`。Source/Mono 缺失的
+   `audio_total/audio_mono/audio_diff` 保持缺失，禁止补零。
+
+Mono 左右通道对称会天然压低部分能量比误差；若 Mono 的 LRE/ILD 低于双耳模型，只能
+陈述该数值事实，不能据此宣称其空间定位更好。Source/Mono 的 DPAM 若相同，也必须明确
+标注该指标对两种参照缺乏区分力，不能用它单独支持空间结论。
+
 ## 8. 统一命令与复用关系
 
 ```bash
 PRODUCTION_PYTHON=/mnt/sda/lisujing/Dataset/FreeTimeGSPlusPlus/.venv/bin/python
 STRICT_RUN_ROOT=/mnt/sda/lisujing/Dataset/AVGaussianFusionv2/.worktrees/scene1-pilot/runs/cam38_strict
 GENERATED_ROOT=configs/generated/lre_loss_ablation
+P3_GENERATED_ROOT=configs/generated/lre_loss_ablation_p3
 RUN_ROOT=runs/lre_loss_ablation_visual_time_v2
 RUN_ROOT_V3=runs/lre_loss_ablation_visual_time_v3
 
@@ -311,9 +357,22 @@ $PRODUCTION_PYTHON -m avgaussianv2.cli.benchmark_lre_run \
   --trust-upstream-artifacts
 ```
 
-若 GPU 1 未通过预检，将 `--gpus 1,2` 改为 `--gpus 2`；禁止关闭预检。selection、
+若双卡未通过预检，改为当前唯一通过连续三次 clean sample 的授权卡；禁止关闭预检。selection、
 confirmation、robustness 继续使用 `benchmark_lre_select` 和同一 `RUN_ROOT`，确保稳定
 `continuation_id` 原地恢复。
+
+当前 P3 10k/30k 权威 manifest 分别为：
+
+```text
+configs/generated/lre_loss_ablation_p3/confirmation_10k/manifest.json
+configs/generated/lre_loss_ablation_p3/confirmation_30k/manifest.json
+```
+
+30k manifest SHA-256 为
+`002a74dedd07d658c63516a2d60b93d5057bd3cbb18faaabe88547a4414b2a2d`。
+因原正式 worktree 被另一个开发任务推进，P3 执行迁移到新的 clean detached worktree，
+但仍使用相同 `98d158e4` commit、原 manifest 字节、原 continuation identity 和原输出目录。
+这种迁移必须使用显式 audited relocation；不能手工改 continuation identity 或覆盖旧目录。
 
 Source/Mono 参考单独运行，并在正式报告前 verify-only：
 
@@ -325,14 +384,14 @@ uv run --no-project \
   --with tomli python -m avgaussianv2.cli.evaluate_audio_references \
   --config configs/benchmark_cam38/scene1_opera.yaml \
   --config configs/benchmark_cam38/Scene7playing.yaml \
-  --output-dir results/lre_loss_ablation_visual_time_v2/audio_references
+  --output-dir results/lre_loss_ablation_visual_time_v3/audio_references
 
 CUDA_VISIBLE_DEVICES=2 PYTHONPATH="$PWD" \
 UV_CACHE_DIR=/tmp/avgaussianfusion-uv-cache \
 uv run --no-project \
   --python /home/lisujing/miniconda3/envs/avcloud/bin/python \
   --with tomli python -m avgaussianv2.cli.evaluate_audio_references \
-  --output-dir results/lre_loss_ablation_visual_time_v2/audio_references \
+  --output-dir results/lre_loss_ablation_visual_time_v3/audio_references \
   --verify-only
 ```
 
