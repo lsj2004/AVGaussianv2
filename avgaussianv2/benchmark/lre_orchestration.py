@@ -63,6 +63,35 @@ def _publish_result(path: Path, value: object) -> Path:
     return immutable
 
 
+def _manifest_result_path(
+    output_root: Path, *, stage: str, manifest_sha256: str
+) -> Path:
+    return (
+        Path(output_root).resolve()
+        / "runner_results"
+        / stage
+        / manifest_sha256
+        / "runner_result.json"
+    )
+
+
+def _publish_runner_result(
+    output_root: Path,
+    *,
+    stage: str,
+    manifest_sha256: str,
+    value: dict[str, object],
+) -> None:
+    manifest_result = _manifest_result_path(
+        output_root, stage=stage, manifest_sha256=manifest_sha256
+    )
+    value["manifest_result"] = str(manifest_result)
+    _publish_result(manifest_result, value)
+    _publish_result(
+        Path(output_root).resolve() / f"runner_result.{stage}.json", value
+    )
+
+
 def load_lre_run_manifest(path: Path) -> dict[str, object]:
     path = Path(path).resolve()
     try:
@@ -624,6 +653,7 @@ def run_lre_manifest(
 ) -> dict[str, object]:
     manifest_path = Path(manifest_path).resolve()
     manifest = load_lre_run_manifest(manifest_path)
+    manifest_sha256 = _sha256(manifest_path)
     current_repository = dict(repository_identity_getter())
     manifest_repository = dict(manifest["repository"])
     repository_relocation = None
@@ -673,7 +703,7 @@ def run_lre_manifest(
             "status": "failed",
             "error": {"type": type(error).__name__, "message": str(error)},
             "source_manifest": str(manifest_path),
-            "source_manifest_sha256": _sha256(manifest_path),
+            "source_manifest_sha256": manifest_sha256,
             "repository": current_repository,
             "manifest_repository": manifest_repository,
             "repository_relocation": repository_relocation,
@@ -681,15 +711,17 @@ def run_lre_manifest(
             "gpus": list(devices),
             "gpu_preflight": gpu_status,
         }
-        _publish_result(
-            Path(output_root).resolve() / f"runner_result.{manifest['stage']}.json",
-            failure,
+        _publish_runner_result(
+            output_root,
+            stage=str(manifest["stage"]),
+            manifest_sha256=manifest_sha256,
+            value=failure,
         )
         raise
     result.update(
         status="succeeded",
         source_manifest=str(manifest_path),
-        source_manifest_sha256=_sha256(manifest_path),
+        source_manifest_sha256=manifest_sha256,
         stage=manifest["stage"],
         gpus=list(devices),
         gpu_preflight=gpu_status,
@@ -697,9 +729,11 @@ def run_lre_manifest(
         manifest_repository=manifest_repository,
         repository_relocation=repository_relocation,
     )
-    _publish_result(
-        Path(output_root).resolve() / f"runner_result.{manifest['stage']}.json",
-        result,
+    _publish_runner_result(
+        output_root,
+        stage=str(manifest["stage"]),
+        manifest_sha256=manifest_sha256,
+        value=result,
     )
     return result
 

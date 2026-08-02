@@ -376,6 +376,24 @@ def test_lre_runner_allows_only_explicit_same_commit_clean_relocation(tmp_path):
         (tmp_path / "relocated-runs/continuation-0/continuation_identity.json").read_text()
     )
     assert continuation["repository"] == value["repository"]
+    manifest_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    manifest_result_path = (
+        tmp_path
+        / "relocated-runs"
+        / "runner_results"
+        / "screening"
+        / manifest_sha256
+        / "runner_result.json"
+    )
+    manifest_result = json.loads(manifest_result_path.read_text())
+    stage_pointer = json.loads(
+        (tmp_path / "relocated-runs/runner_result.screening.json").read_text()
+    )
+    assert manifest_result == stage_pointer
+    assert manifest_result["source_manifest_sha256"] == manifest_sha256
+    assert manifest_result["manifest_result"] == str(manifest_result_path)
+    manifest_history = manifest_result_path.parent / "result_history/runner_result"
+    assert len(tuple(manifest_history.glob("attempt-*.json"))) == 1
 
     wrong_revision = {**relocated, "commit": "2" * 40}
     with pytest.raises(OrchestrationError, match="repository identity differs"):
@@ -390,6 +408,61 @@ def test_lre_runner_allows_only_explicit_same_commit_clean_relocation(tmp_path):
             gpu_query=lambda devices: {devices[0]: {}},
             runner=_Runner(),
         )
+
+
+def test_failed_manifest_run_publishes_manifest_specific_failure(tmp_path):
+    path, value = _manifest(tmp_path)
+
+    class FailedHandle:
+        def poll(self):
+            return 7
+
+        def wait(self, timeout=None):
+            del timeout
+            return 7
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+    class FailedRunner:
+        assignments = []
+
+        def start(self, command, *, env, log_path):
+            del command, env, log_path
+            return FailedHandle()
+
+    with pytest.raises(OrchestrationError, match="stage failed"):
+        run_lre_manifest(
+            path,
+            output_root=tmp_path / "failed-runs",
+            native_root=_native_root(tmp_path),
+            gpus=(1,),
+            python_executable="python",
+            repository_identity_getter=lambda: value["repository"],
+            gpu_query=lambda devices: {devices[0]: {}},
+            runner=FailedRunner(),
+        )
+
+    manifest_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    specific = json.loads(
+        (
+            tmp_path
+            / "failed-runs"
+            / "runner_results"
+            / "screening"
+            / manifest_sha256
+            / "runner_result.json"
+        ).read_text()
+    )
+    stage_pointer = json.loads(
+        (tmp_path / "failed-runs/runner_result.screening.json").read_text()
+    )
+    assert specific == stage_pointer
+    assert specific["status"] == "failed"
+    assert specific["error"]["type"] == "OrchestrationError"
 
 
 def test_failed_pipeline_publishes_failure_and_peer_abort_evidence(tmp_path):
