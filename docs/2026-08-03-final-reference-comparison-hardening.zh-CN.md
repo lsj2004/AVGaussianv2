@@ -48,3 +48,10 @@ LRE/ILD/IPD 可能由左右声道相同机械地产生，不能单独解释为�
 FiLM 扰动压到 `torch.allclose` 容差以内。所有依赖“FiLM 扰动必须可观测”的 GS-only
 测试现统一通过共享构造器，在不污染调用者 RNG 的 `torch.random.fork_rng` 作用域内固定
 初始化种子；三个相关测试并行重复 5 轮与完整测试均通过。
+
+冻结最终生成器 `9fa1302` 已在正式 P2 目录执行真实 reference preflight：
+`reference_aggregate_sha256=d10e68a5f90df29c538e66fdc889b4e3be46b01fd4b530af4effdce7dcf3e5e6`
+与
+`reference_verification_sha256=38aab786429fe56e4d73f163de9e7a1059f0c4d09fd8acd2385b5aeb54fd9958`
+均通过，Source Binaural、Mono、native AudioGS 的 3×7 scene-macro 数值成功从严格路径
+读取。最终报告不会在长实验结束后才首次接触这些历史参考产物。
